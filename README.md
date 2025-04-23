@@ -1,4 +1,4 @@
-# TaystJK
+# DevotJK
 [![build](https://github.com/taysta/TaystJK/actions/workflows/build.yml/badge.svg)](https://github.com/taysta/TaystJK/actions/workflows/build.yml)
 ### To see a list of new features, check the [wiki](https://taysta.github.io/TaystJK/)
 
