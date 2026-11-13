@@ -37,7 +37,7 @@ This file is part of DevoJK, licensed under GPLv2.
 #include <thread>
 #include <vector>
 
-#define DEVOGI_VERSION		9
+#define DEVOGI_VERSION		10
 #define DEVOGI_BSP_LM_SIZE	128			// lightmap page size stored in the BSP
 #define DEVOGI_LM_SIZE		gi_lmSize	// page size being baked (BSP size * r_devoGI_scale)
 
@@ -87,7 +87,7 @@ void R_DevoGI_Register( void )
 	r_devoGI_aoDistance		= ri.Cvar_Get( "r_devoGI_aoDistance",	"64",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI ambient occlusion range in game units" );
 	r_devoGI_relight		= ri.Cvar_Get( "r_devoGI_relight",		"1",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI: recompute the direct light from the map's own light sources at high resolution with soft shadows, replacing the old lightmap (only its brightness is kept)\n 0: keep the old lightmap's direct light" );
 	r_devoGI_progress		= ri.Cvar_Get( "r_devoGI_progress",	"1",	CVAR_ARCHIVE, "DevoGI: show a progress screen with a percentage while a map is being baked" );
-	r_devoLights_glow		= ri.Cvar_Get( "r_devoLights_glow",	"500",	CVAR_ARCHIVE | CVAR_LATCH, "DevoLights: light strength given to glowing shaders without q3map_surfacelight (lamp textures and models whose light entities are gone); 0 = off" );
+	r_devoLights_glow		= ri.Cvar_Get( "r_devoLights_glow",	"4000",	CVAR_ARCHIVE | CVAR_LATCH, "DevoLights: light strength given to glowing shaders without q3map_surfacelight (lamp textures and models whose light entities are gone); 0 = off" );
 	r_devoGI_exposure		= ri.Cvar_Get( "r_devoGI_exposure",		"1.0",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI: overall brightness of relit maps (1 = match the original map's brightness)" );
 	r_devoLights			= ri.Cvar_Get( "r_devoLights",			"0",	CVAR_ARCHIVE, "DevoLights: light the map in real time from its own light sources (surface lights, sun, light entities)\n 0: off\n 1: preview through the dynamic light path (no shadows yet)" );
 	r_devoLights_max		= ri.Cvar_Get( "r_devoLights_max",		"48",	CVAR_ARCHIVE, "DevoLights: most map lights used per frame (the nearest and brightest visible ones)" );
@@ -1174,49 +1174,95 @@ static void gi_gather_point( const giBake &bake, const gvec3 &pos, const gvec3 &
 
 static void gi_gather( giBake &bake, int rays ) {
 	bake.indirect.assign( bake.texels.size() * 4, 0.0f );
+	const int N = DEVOGI_LM_SIZE;
 
-	// at 4x and above, bounce light (smooth by nature) is gathered on every other texel in
-	// each direction and filled in from same-surface neighbours: a quarter of the work
-	const bool sparse = DEVOGI_LM_SIZE >= DEVOGI_BSP_LM_SIZE * 4;
+	// bounce light is smooth by nature: it is gathered on a grid of one texel per
+	// stride (stride grows with resolution, so the work stays near 2x density),
+	// denoised on that grid, then interpolated per surface
+	const int stride = Q_max( 1, N / ( DEVOGI_BSP_LM_SIZE * 2 ) );
+	auto isGridTexel = [&]( const giTexel &tx ) { return ( tx.x % stride ) == 0 && ( tx.y % stride ) == 0; };
+	auto ownerAt = [&]( int page, int x, int y ) -> int {
+		if ( x < 0 || y < 0 || x >= N || y >= N )
+			return -1;
+		return bake.owner[( (size_t)page * N + y ) * N + x];
+	};
+	auto compatible = [&]( const giTexel &a, const giTexel &b ) {
+		return a.styleValue == b.styleValue && ( a.surf == b.surf || gdot( a.normal, b.normal ) > 0.9f );
+	};
+
 	std::vector<char> done( bake.texels.size(), 0 );
 	gi_parallel_for( (int)bake.texels.size(), [&]( int i ) {
 		const giTexel &tx = bake.texels[i];
-		if ( sparse && ( ( tx.x | tx.y ) & 1 ) )
+		if ( !isGridTexel( tx ) )
 			return;
 		gi_gather_point( bake, tx.pos, tx.normal, tx.faceNormal, tx.styleValue, (uint32_t)i * 9781u + 1u, rays, &bake.indirect[i * 4] );
 		done[i] = 1;
 	}, true );
-	if ( !sparse )
-		return;
 
+	// texels no grid point covers (thin strips): gather them directly
 	gi_parallel_for( (int)bake.texels.size(), [&]( int i ) {
 		if ( done[i] )
 			return;
 		const giTexel &tx = bake.texels[i];
-		float sum[4] = { 0, 0, 0, 0 }, wsum = 0;
-		for ( int dy = -1; dy <= 1; dy++ ) {
-			for ( int dx = -1; dx <= 1; dx++ ) {
-				const int x = tx.x + dx, y = tx.y + dy;
-				if ( x < 0 || y < 0 || x >= DEVOGI_LM_SIZE || y >= DEVOGI_LM_SIZE )
-					continue;
-				const int o = bake.owner[( (size_t)tx.page * DEVOGI_LM_SIZE + y ) * DEVOGI_LM_SIZE + x];
-				if ( o < 0 || !done[o] )
-					continue;
-				const giTexel &ot = bake.texels[o];
-				if ( ot.styleValue != tx.styleValue || ( ot.surf != tx.surf && gdot( ot.normal, tx.normal ) < 0.9f ) )
-					continue;
-				for ( int k = 0; k < 4; k++ )
-					sum[k] += bake.indirect[o * 4 + k];
-				wsum += 1.0f;
+		const int gx = tx.x - tx.x % stride, gy = tx.y - tx.y % stride;
+		for ( int j = 0; j <= 1; j++ )
+			for ( int k = 0; k <= 1; k++ ) {
+				const int o = ownerAt( tx.page, gx + k * stride, gy + j * stride );
+				if ( o >= 0 && done[o] && compatible( bake.texels[o], tx ) )
+					return;
 			}
-		}
-		if ( wsum > 0 ) {
-			for ( int k = 0; k < 4; k++ )
-				bake.indirect[i * 4 + k] = sum[k] / wsum;
-		} else {
-			// isolated texel (thin strip): gather it directly
-			gi_gather_point( bake, tx.pos, tx.normal, tx.faceNormal, tx.styleValue, (uint32_t)i * 9781u + 1u, rays, &bake.indirect[i * 4] );
-		}
+		gi_gather_point( bake, tx.pos, tx.normal, tx.faceNormal, tx.styleValue, (uint32_t)i * 9781u + 1u, rays, &bake.indirect[i * 4] );
+		done[i] = 2;	// gathered, but not on the grid
+	} );
+
+	// denoise on the grid: 5x5 grid points (edge aware)
+	{
+		std::vector<float> out( bake.indirect );
+		gi_parallel_for( (int)bake.texels.size(), [&]( int i ) {
+			if ( done[i] != 1 )
+				return;
+			const giTexel &tx = bake.texels[i];
+			float sum[4] = { 0, 0, 0, 0 }, wsum = 0;
+			for ( int dy = -2; dy <= 2; dy++ )
+				for ( int dx = -2; dx <= 2; dx++ ) {
+					const int o = ownerAt( tx.page, tx.x + dx * stride, tx.y + dy * stride );
+					if ( o < 0 || done[o] != 1 || !compatible( bake.texels[o], tx ) )
+						continue;
+					const float w = ( 1.0f / ( 1.0f + dx * dx + dy * dy ) ) * Q_max( 0.0f, gdot( bake.texels[o].normal, tx.normal ) );
+					for ( int c = 0; c < 4; c++ )
+						sum[c] += bake.indirect[o * 4 + c] * w;
+					wsum += w;
+				}
+			if ( wsum > 0 )
+				for ( int c = 0; c < 4; c++ )
+					out[i * 4 + c] = sum[c] / wsum;
+		} );
+		bake.indirect.swap( out );
+	}
+	if ( stride == 1 )
+		return;
+
+	// interpolate everything else from the 4 surrounding grid points (bilinear, per surface)
+	gi_parallel_for( (int)bake.texels.size(), [&]( int i ) {
+		if ( done[i] )
+			return;
+		const giTexel &tx = bake.texels[i];
+		const int gx = tx.x - tx.x % stride, gy = tx.y - tx.y % stride;
+		const float fx = ( tx.x - gx ) / (float)stride, fy = ( tx.y - gy ) / (float)stride;
+		float sum[4] = { 0, 0, 0, 0 }, wsum = 0;
+		for ( int j = 0; j <= 1; j++ )
+			for ( int k = 0; k <= 1; k++ ) {
+				const int o = ownerAt( tx.page, gx + k * stride, gy + j * stride );
+				if ( o < 0 || !done[o] || !compatible( bake.texels[o], tx ) )
+					continue;
+				const float w = ( k ? fx : 1.0f - fx ) * ( j ? fy : 1.0f - fy ) + 1e-4f;
+				for ( int c = 0; c < 4; c++ )
+					sum[c] += bake.indirect[o * 4 + c] * w;
+				wsum += w;
+			}
+		if ( wsum > 0 )
+			for ( int c = 0; c < 4; c++ )
+				bake.indirect[i * 4 + c] = sum[c] / wsum;
 	} );
 }
 
@@ -1284,7 +1330,7 @@ static void gi_dilate( giBake &bake, std::vector<float> &img ) {
 	std::vector<char> filled( bake.owner.size() );
 	for ( size_t i = 0; i < bake.owner.size(); i++ )
 		filled[i] = bake.owner[i] >= 0;
-	for ( int pass = 0; pass < 2; pass++ ) {
+	for ( int pass = 0, passes = Q_max( 2, DEVOGI_LM_SIZE / DEVOGI_BSP_LM_SIZE / 2 ); pass < passes; pass++ ) {
 		std::vector<char> next = filled;
 		for ( int p = 0; p < bake.numPages; p++ ) {
 			for ( int y = 0; y < DEVOGI_LM_SIZE; y++ ) {
@@ -1424,35 +1470,52 @@ static void gi_direct_point( const giBake &bake, const giLightGrid &grid, const 
 					gi_basis( lt.normal, et, eb );
 				// area light: every sample point has its own distance and angles (a patch is
 				// not a point at its centre - that made checkerboard hot spots under lamps)
-				float sum = 0;
-				const int strata = (int)ceilf( sqrtf( (float)samples ) );
 				// the lamp's own fixture right around the emitter must not shadow its light
 				const float emitterClearance = 4.0f + lt.size * 0.25f;
-				for ( int s = 0; s < samples; s++ ) {
+				// one shadow sample at (jx, jy) across the patch: adds to sum if visible
+				auto lampSample = [&]( float jx, float jy, float &sum, int &vis, int &tested ) {
 					gvec3 target = lt.origin;
-					if ( lt.size > 0 && samples > 1 ) {
-						// stratified across the patch
-						const float jx = ( ( s % strata ) + gi_rand( rng ) ) / strata - 0.5f;
-						const float jy = ( ( ( s / strata ) % strata ) + gi_rand( rng ) ) / strata - 0.5f;
+					if ( lt.size > 0 )
 						target += et * ( jx * lt.size ) + eb * ( jy * lt.size );
-					}
 					gvec3 Ls = target - o;
 					const float ds2 = gdot( Ls, Ls );
 					if ( ds2 < 1.0f )
-						continue;
+						return;
 					const float ds = sqrtf( ds2 );
 					Ls = Ls * ( 1.0f / ds );
 					const float cr = gdot( normal, Ls );
 					const float ce = lt.size > 0 ? -gdot( lt.normal, Ls ) : 1.0f;
 					if ( cr <= 0 || ce <= 0 )
-						continue;
+						return;
+					tested++;
 					const float contrib = lt.photons * cr * ce / Q_max( ds2, 16.0f );
 					giHit hit;
 					if ( ds - emitterClearance <= DEVOGI_RAY_TMIN
-						|| !gi_trace( scene, o, Ls, ds - emitterClearance, hit, true, DEVOGI_RAY_TMIN ) )
+						|| !gi_trace( scene, o, Ls, ds - emitterClearance, hit, true, DEVOGI_RAY_TMIN ) ) {
 						sum += contrib;
+						vis++;
+					}
+				};
+
+				// adaptive: 4 probes first (2x2 strata); only a penumbra, where they
+				// disagree, pays for the full stratified set
+				float sum = 0;
+				int vis = 0, tested = 0, taken = 0;
+				const int probes = ( lt.size > 0 && samples > 4 ) ? 4 : samples;
+				for ( int s = 0; s < probes; s++, taken++ ) {
+					const float jx = lt.size > 0 ? ( ( s & 1 ) + gi_rand( rng ) ) * 0.5f - 0.5f : 0.0f;
+					const float jy = lt.size > 0 ? ( ( s >> 1 ) + gi_rand( rng ) ) * 0.5f - 0.5f : 0.0f;
+					lampSample( jx, jy, sum, vis, tested );
 				}
-				lightsOut += lt.color * ( sum / (float)samples );
+				if ( probes < samples && vis > 0 && vis < tested ) {
+					const int strata = (int)ceilf( sqrtf( (float)samples ) );
+					for ( int s = 0; s < samples; s++, taken++ ) {
+						const float jx = ( ( s % strata ) + gi_rand( rng ) ) / strata - 0.5f;
+						const float jy = ( ( ( s / strata ) % strata ) + gi_rand( rng ) ) / strata - 0.5f;
+						lampSample( jx, jy, sum, vis, tested );
+					}
+				}
+				lightsOut += lt.color * ( sum / (float)Q_max( 1, taken ) );
 			}
 		}
 	}
@@ -1463,16 +1526,26 @@ static void gi_direct_point( const giBake &bake, const giLightGrid &grid, const 
 			// soft sun: jitter within ~1.5 degrees
 			gvec3 st, sb;
 			gi_basis( gi_sunDir, st, sb );
-			// stratified 5x5 over the sun disc: smooth penumbra instead of speckle
-			const int grid = 5, samples = grid * grid;
-			int visible = 0;
-			for ( int s = 0; s < samples; s++ ) {
-				const float jx = ( ( s % grid ) + gi_rand( rng ) ) / grid - 0.5f;
-				const float jy = ( ( s / grid ) + gi_rand( rng ) ) / grid - 0.5f;
+			auto sunVisible = [&]( float jx, float jy ) {
 				const gvec3 dir = gnorm( gi_sunDir + st * ( jx * 0.05f ) + sb * ( jy * 0.05f ) );
 				giHit hit;
-				if ( !gi_trace( scene, o, dir, 16384.0f, hit, false, DEVOGI_RAY_TMIN ) || scene.surfs[scene.tris[hit.tri].surf].sky )
-					visible++;	// reached the sky
+				return !gi_trace( scene, o, dir, 16384.0f, hit, false, DEVOGI_RAY_TMIN ) || scene.surfs[scene.tris[hit.tri].surf].sky;
+			};
+			// adaptive: 4 probes at the edges of the sun disc; fully lit or fully shadowed
+			// texels stop there, penumbra texels take a stratified 6x6 set
+			int visible = 0, samples = 4;
+			const float px[4] = { -0.45f, 0.45f, -0.45f, 0.45f }, py[4] = { -0.45f, -0.45f, 0.45f, 0.45f };
+			for ( int s = 0; s < 4; s++ )
+				visible += sunVisible( px[s], py[s] ) ? 1 : 0;
+			if ( visible > 0 && visible < 4 ) {
+				const int grid = 6;
+				visible = 0;
+				samples = grid * grid;
+				for ( int s = 0; s < samples; s++ ) {
+					const float jx = ( ( s % grid ) + gi_rand( rng ) ) / grid - 0.5f;
+					const float jy = ( ( s / grid ) + gi_rand( rng ) ) / grid - 0.5f;
+					visible += sunVisible( jx, jy ) ? 1 : 0;
+				}
 			}
 			sunOut = gi_sunColor * ( gi_sunIntensity * cosS * visible / (float)samples );
 		}
@@ -1480,6 +1553,19 @@ static void gi_direct_point( const giBake &bake, const giLightGrid &grid, const 
 }
 
 static inline float gi_luma( const gvec3 &c ) { return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z; }
+
+// soft shoulder: light above ~170 rolls off smoothly towards 255 instead of blowing out,
+// then colour-normalize so nothing clips to white
+static inline float gi_shoulder( float c[3] ) {
+	const float knee = 170.0f, room = 255.0f - knee;
+	const float m = Q_max( c[0], Q_max( c[1], c[2] ) );
+	if ( m > knee ) {
+		const float mm = knee + room * ( 1.0f - expf( -( m - knee ) / room ) );
+		const float s = mm / m;
+		c[0] *= s; c[1] *= s; c[2] *= s;
+	}
+	return 1.0f;
+}
 
 // fraction of the hemisphere above a point that reaches the sky: smooth across shadows,
 // so it tells outdoors from indoors without the sun's own shadow edges
@@ -1489,7 +1575,7 @@ static float gi_sky_fraction( const giBake &bake, const gvec3 &pos, const gvec3 
 	gi_basis( normal, t, b );
 	uint32_t rng = gi_hash( seed ^ 0x5bd1e995u );
 	const gvec3 o = pos + faceNormal * 1.0f;
-	const int rays = 24;
+	const int rays = 12;
 	int sky = 0;
 	for ( int r = 0; r < rays; r++ ) {
 		const float u1 = gi_rand( rng ), u2 = gi_rand( rng );
@@ -1764,7 +1850,7 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 				skyVis[i].x = gi_sky_fraction( bake, tx.pos, tx.normal, tx.faceNormal, (uint32_t)i * 2246822519u );
 		}, true );
 		// two smoothing passes (~5x5): soft, noise-free penumbras
-		for ( int pass = 0; pass < 2; pass++ ) {
+		for ( int pass = 0, passes = Q_max( 2, DEVOGI_LM_SIZE / DEVOGI_BSP_LM_SIZE / 2 ); pass < passes; pass++ ) {
 			gi_smooth_texels( bake, lightPart );
 			gi_smooth_texels( bake, sunPart );
 			gi_smooth_texels( bake, skyVis );
@@ -1827,7 +1913,7 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 	for ( int b = 0; b < bounces; b++ ) {
 		Com_sprintf( bounceStage, sizeof( bounceStage ), "Bounce light %d of %d", b + 1, bounces );
 		gi_progress_stage( bounceStage, bounceBase + bounceSpan * b / bounces, bounceSpan / bounces );
-		gi_gather( bake, rays );
+		gi_gather( bake, b == 0 ? rays : Q_max( 16, rays / 2 ) );
 		gi_denoise( bake );
 		gi_compose( bake, intensity );
 		ri.Printf( PRINT_ALL, "DevoGI: bounce %d/%d done (%.1fs)\n", b + 1, bounces, ( ri.Milliseconds() - startTime ) / 1000.0f );
@@ -1849,8 +1935,8 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 			oS += origLuma[i] * wS; fS += fin * wS;
 			oL += origLuma[i] * ( 1.0f - wS ); fL += fin * ( 1.0f - wS );
 		}
-		const float rL = fL > 0 ? Com_Clamp( 0.25f, 8.0f, (float)( oL / fL ) ) : 1.0f;
-		const float rS = fS > 0 ? Com_Clamp( 0.25f, 8.0f, (float)( oS / fS ) ) : 1.0f;
+		const float rL = fL > 0 ? Com_Clamp( 0.5f, 2.5f, (float)( oL / fL ) ) : 1.0f;
+		const float rS = fS > 0 ? Com_Clamp( 0.5f, 2.0f, (float)( oS / fS ) ) : 1.0f;
 		const float exposure = Q_max( 0.0f, r_devoGI_exposure->value );
 		exposureLights = rL * exposure;
 		exposureSun = rS * exposure;
@@ -1922,8 +2008,7 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 				float c[3];
 				for ( int k = 0; k < 3; k++ )
 					c[k] = ( at( x0, y0, k ) * ( 1 - ax ) + at( x1, y0, k ) * ax ) * ( 1 - ay ) + ( at( x0, y1, k ) * ( 1 - ax ) + at( x1, y1, k ) * ax ) * ay;
-				const float m = Q_max( c[0], Q_max( c[1], c[2] ) );
-				const float s = m > 255.0f ? 255.0f / m : 1.0f;
+				const float s = gi_shoulder( c );
 				for ( int k = 0; k < 3; k++ )
 					gi_vertexColors[(size_t)v * 4 + k] = (byte)Com_Clampi( 0, 255, (int)( c[k] * s + 0.5f ) );
 			} );
@@ -1960,8 +2045,7 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 					for ( int k = 0; k < 3; k++ )
 						c[k] *= f;
 				}
-				const float m = Q_max( c[0], Q_max( c[1], c[2] ) );
-				const float s = m > 255.0f ? 255.0f / m : 1.0f;
+				const float s = gi_shoulder( c );
 				for ( int k = 0; k < 3; k++ )
 					gi_vertexColors[(size_t)v * 4 + k] = (byte)Com_Clampi( 0, 255, (int)( c[k] * s + 0.5f ) );
 			}, true );
@@ -1973,9 +2057,9 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 	// 3. back to lightmap bytes; colour-normalize instead of clipping to white
 	byte *out = (byte *)Z_Malloc( outBytes, TAG_BSP, qfalse );
 	for ( size_t pix = 0; pix < bake.owner.size(); pix++ ) {
-		float r = bake.light[pix * 3], g = bake.light[pix * 3 + 1], bl = bake.light[pix * 3 + 2];
-		const float m = Q_max( r, Q_max( g, bl ) );
-		if ( m > 255.0f ) { const float s = 255.0f / m; r *= s; g *= s; bl *= s; }
+		float rgb[3] = { bake.light[pix * 3], bake.light[pix * 3 + 1], bake.light[pix * 3 + 2] };
+		gi_shoulder( rgb );
+		const float r = rgb[0], g = rgb[1], bl = rgb[2];
 		out[pix * 3 + 0] = (byte)Com_Clampi( 0, 255, (int)( r + 0.5f ) );
 		out[pix * 3 + 1] = (byte)Com_Clampi( 0, 255, (int)( g + 0.5f ) );
 		out[pix * 3 + 2] = (byte)Com_Clampi( 0, 255, (int)( bl + 0.5f ) );
@@ -2215,8 +2299,8 @@ static bool gi_parse_light_shader( const char *shaderName, giLightShader &ls ) {
 	if ( ls.value <= 0 && glowMap[0] && !autosprite && r_devoLights_glow->value > 0 && ( glowKeyword || hasLightmapStage ) ) {
 		float brightness = 0;
 		gvec3 c;
-		if ( gi_image_color( glowMap, c, &brightness ) && brightness > 0.15f ) {
-			ls.value = r_devoLights_glow->value * brightness;
+		if ( gi_image_color( glowMap, c, &brightness ) && brightness > 0.01f ) {
+			ls.value = r_devoLights_glow->value * brightness;	// glow maps are mostly black: average brightness is the emitting share
 			ls.subdivide = 32.0f;	// small fixtures
 			ls.color = c;
 			return true;
