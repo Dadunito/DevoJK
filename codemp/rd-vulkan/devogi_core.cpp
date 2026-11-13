@@ -2191,7 +2191,7 @@ static uint64_t gi_bsp_hash( const byte *fileBase, const dheader_t *header ) {
 static uint64_t gi_settings_hash( int scale ) {
 	char buf[320];
 	Com_sprintf( buf, sizeof( buf ), "aa%g sh%g v%d ex%g r%d b%d i%g s%g e%d ao%g aod%g aor%g sat%g x%d rl%d gl%g lh%llx", g_set.aa, g_set.sheen, DEVOGI_VERSION, g_set.exposure,
-		Com_Clampi( 8, 1024, g_set.rays ), Com_Clampi( 1, 8, g_set.bounces ),
+		Com_Clampi( 8, 1024, g_set.rays ), Com_Clampi( 1, 16, g_set.bounces ),
 		g_set.intensity, g_set.sky, g_set.entityLights,
 		g_set.ao, g_set.aoDirect, g_set.aoDistance, g_set.saturation, scale,
 		g_set.relight, g_set.glow, (unsigned long long)( g_set.relight ? gi_lightsHash : 0 ) );
@@ -2231,7 +2231,7 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 	// ---- 2. bake ----
 	const int startTime = dg_ms();
 	const int rays = Com_Clampi( 8, 1024, g_set.rays );
-	const int bounces = Com_Clampi( 1, 8, g_set.bounces );
+	const int bounces = Com_Clampi( 1, 16, g_set.bounces );
 	const float intensity = Q_max( 0.0f, g_set.intensity );
 
 	giBake *bakePtr = new giBake();

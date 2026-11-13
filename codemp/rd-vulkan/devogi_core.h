@@ -31,7 +31,7 @@ Part of DevoJK by Devoted, licensed under GPLv2.
 struct dgSettings {
 	int		scale		= 4;		// lightmap resolution multiplier (1, 2, 4 or 8)
 	int		rays		= 128;		// rays per bounce-light sample
-	int		bounces		= 8;		// light bounces
+	int		bounces		= 8;		// light bounces (1-16)
 	float	aa			= 2.0f;		// shadow anti-aliasing width, in texels
 	float	sheen		= 0.12f;	// baked glossy sheen
 	float	intensity	= 1.0f;		// bounce light strength
