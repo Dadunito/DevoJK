@@ -36,7 +36,7 @@ This file is part of DevoJK, licensed under GPLv2.
 #include <thread>
 #include <vector>
 
-#define DEVOGI_VERSION		7
+#define DEVOGI_VERSION		8
 #define DEVOGI_BSP_LM_SIZE	128			// lightmap page size stored in the BSP
 #define DEVOGI_LM_SIZE		gi_lmSize	// page size being baked (BSP size * r_devoGI_scale)
 
@@ -63,6 +63,7 @@ static cvar_t *r_devoGI_aoDistance;
 static cvar_t *r_devoGI_saturation;
 static cvar_t *r_devoGI_scale;
 static cvar_t *r_devoGI_relight;
+static cvar_t *r_devoGI_exposure;
 static cvar_t *r_devoLights;
 static cvar_t *r_devoLights_max;
 static cvar_t *r_devoLights_intensity;
@@ -71,8 +72,8 @@ static cvar_t *r_devoLights_range;
 void R_DevoGI_Register( void )
 {
 	r_devoGI				= ri.Cvar_Get( "r_devoGI",				"1",	CVAR_ARCHIVE | CVAR_LATCH, "Baked global illumination: bounce light is baked into the lightmaps on level load and cached in maps/<name>.devogi\n 0: off\n 1: on" );
-	r_devoGI_rays			= ri.Cvar_Get( "r_devoGI_rays",			"64",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI rays per lightmap texel and bounce (8-1024). More is smoother but bakes slower" );
-	r_devoGI_bounces		= ri.Cvar_Get( "r_devoGI_bounces",		"2",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI light bounces (1-4)" );
+	r_devoGI_rays			= ri.Cvar_Get( "r_devoGI_rays",			"128",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI rays per lightmap texel and bounce (8-1024). More is smoother but bakes slower" );
+	r_devoGI_bounces		= ri.Cvar_Get( "r_devoGI_bounces",		"4",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI light bounces (1-8)" );
 	r_devoGI_intensity		= ri.Cvar_Get( "r_devoGI_intensity",	"1.0",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI bounce light strength" );
 	r_devoGI_sky			= ri.Cvar_Get( "r_devoGI_sky",			"0.5",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI ambient light from visible sky (0 = none)" );
 	r_devoGI_entityLights	= ri.Cvar_Get( "r_devoGI_entityLights",	"1",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI uses light entities kept in the BSP as extra light sources" );
@@ -82,11 +83,12 @@ void R_DevoGI_Register( void )
 	r_devoGI_aoDirect		= ri.Cvar_Get( "r_devoGI_aoDirect",		"0.15",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI ambient occlusion on the original lightmap light, for contact shadows (0 = off, 1 = full)" );
 	r_devoGI_aoDistance		= ri.Cvar_Get( "r_devoGI_aoDistance",	"64",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI ambient occlusion range in game units" );
 	r_devoGI_relight		= ri.Cvar_Get( "r_devoGI_relight",		"1",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI: recompute the direct light from the map's own light sources at high resolution with soft shadows, replacing the old lightmap (only its brightness is kept)\n 0: keep the old lightmap's direct light" );
+	r_devoGI_exposure		= ri.Cvar_Get( "r_devoGI_exposure",		"1.0",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI: overall brightness of relit maps (1 = match the original map's brightness)" );
 	r_devoLights			= ri.Cvar_Get( "r_devoLights",			"0",	CVAR_ARCHIVE, "DevoLights: light the map in real time from its own light sources (surface lights, sun, light entities)\n 0: off\n 1: preview through the dynamic light path (no shadows yet)" );
 	r_devoLights_max		= ri.Cvar_Get( "r_devoLights_max",		"48",	CVAR_ARCHIVE, "DevoLights: most map lights used per frame (the nearest and brightest visible ones)" );
 	r_devoLights_intensity	= ri.Cvar_Get( "r_devoLights_intensity","1.0",	CVAR_ARCHIVE, "DevoLights: brightness of map lights" );
 	r_devoLights_range		= ri.Cvar_Get( "r_devoLights_range",	"1.0",	CVAR_ARCHIVE, "DevoLights: reach of map lights" );
-	r_devoGI_scale			= ri.Cvar_Get( "r_devoGI_scale",		"2",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI lightmap resolution multiplier (1, 2 or 4). Higher gives smoother, sharper corners but bakes slower; limited by the GPU's max texture size" );
+	r_devoGI_scale			= ri.Cvar_Get( "r_devoGI_scale",		"4",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI lightmap resolution multiplier (1, 2, 4 or 8). Higher gives sharper shadows and corners but bakes slower and uses more video memory" );
 	r_devoGI_saturation		= ri.Cvar_Get( "r_devoGI_saturation",	"1.6",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI colour bleeding strength: saturation of light reflected off surfaces (1 = texture average colour)" );
 }
 
@@ -1069,9 +1071,49 @@ static void gi_gather_point( const giBake &bake, const gvec3 &pos, const gvec3 &
 
 static void gi_gather( giBake &bake, int rays ) {
 	bake.indirect.assign( bake.texels.size() * 4, 0.0f );
+
+	// at 4x and above, bounce light (smooth by nature) is gathered on every other texel in
+	// each direction and filled in from same-surface neighbours: a quarter of the work
+	const bool sparse = DEVOGI_LM_SIZE >= DEVOGI_BSP_LM_SIZE * 4;
+	std::vector<char> done( bake.texels.size(), 0 );
 	gi_parallel_for( (int)bake.texels.size(), [&]( int i ) {
 		const giTexel &tx = bake.texels[i];
+		if ( sparse && ( ( tx.x | tx.y ) & 1 ) )
+			return;
 		gi_gather_point( bake, tx.pos, tx.normal, tx.faceNormal, tx.styleValue, (uint32_t)i * 9781u + 1u, rays, &bake.indirect[i * 4] );
+		done[i] = 1;
+	} );
+	if ( !sparse )
+		return;
+
+	gi_parallel_for( (int)bake.texels.size(), [&]( int i ) {
+		if ( done[i] )
+			return;
+		const giTexel &tx = bake.texels[i];
+		float sum[4] = { 0, 0, 0, 0 }, wsum = 0;
+		for ( int dy = -1; dy <= 1; dy++ ) {
+			for ( int dx = -1; dx <= 1; dx++ ) {
+				const int x = tx.x + dx, y = tx.y + dy;
+				if ( x < 0 || y < 0 || x >= DEVOGI_LM_SIZE || y >= DEVOGI_LM_SIZE )
+					continue;
+				const int o = bake.owner[( (size_t)tx.page * DEVOGI_LM_SIZE + y ) * DEVOGI_LM_SIZE + x];
+				if ( o < 0 || !done[o] )
+					continue;
+				const giTexel &ot = bake.texels[o];
+				if ( ot.styleValue != tx.styleValue || ( ot.surf != tx.surf && gdot( ot.normal, tx.normal ) < 0.9f ) )
+					continue;
+				for ( int k = 0; k < 4; k++ )
+					sum[k] += bake.indirect[o * 4 + k];
+				wsum += 1.0f;
+			}
+		}
+		if ( wsum > 0 ) {
+			for ( int k = 0; k < 4; k++ )
+				bake.indirect[i * 4 + k] = sum[k] / wsum;
+		} else {
+			// isolated texel (thin strip): gather it directly
+			gi_gather_point( bake, tx.pos, tx.normal, tx.faceNormal, tx.styleValue, (uint32_t)i * 9781u + 1u, rays, &bake.indirect[i * 4] );
+		}
 	} );
 }
 
@@ -1398,8 +1440,8 @@ static uint64_t gi_bsp_hash( const byte *fileBase, const dheader_t *header ) {
 
 static uint64_t gi_settings_hash( int scale ) {
 	char buf[256];
-	Com_sprintf( buf, sizeof( buf ), "v%d r%d b%d i%g s%g e%d ao%g aod%g aor%g sat%g x%d rl%d lh%llx", DEVOGI_VERSION,
-		Com_Clampi( 8, 1024, r_devoGI_rays->integer ), Com_Clampi( 1, 4, r_devoGI_bounces->integer ),
+	Com_sprintf( buf, sizeof( buf ), "v%d ex%g r%d b%d i%g s%g e%d ao%g aod%g aor%g sat%g x%d rl%d lh%llx", DEVOGI_VERSION, r_devoGI_exposure->value,
+		Com_Clampi( 8, 1024, r_devoGI_rays->integer ), Com_Clampi( 1, 8, r_devoGI_bounces->integer ),
 		r_devoGI_intensity->value, r_devoGI_sky->value, r_devoGI_entityLights->integer,
 		r_devoGI_ao->value, r_devoGI_aoDirect->value, r_devoGI_aoDistance->value, r_devoGI_saturation->value, scale,
 		r_devoGI_relight->integer, (unsigned long long)( r_devoGI_relight->integer ? gi_lightsHash : 0 ) );
@@ -1441,7 +1483,7 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 
 	// bake resolution: r_devoGI_scale rounded down to 1, 2 or 4, within the GPU limit
 	int scale = 1;
-	while ( scale * 2 <= Com_Clampi( 1, 4, r_devoGI_scale->integer ) && scale * 2 <= maxScale )
+	while ( scale * 2 <= Com_Clampi( 1, 8, r_devoGI_scale->integer ) && scale * 2 <= maxScale )
 		scale *= 2;
 	const int pageSize = DEVOGI_BSP_LM_SIZE * scale;
 	const int pageBytes = pageSize * pageSize * 3;
@@ -1484,7 +1526,7 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 	// 2. bake
 	const int startTime = ri.Milliseconds();
 	const int rays = Com_Clampi( 8, 1024, r_devoGI_rays->integer );
-	const int bounces = Com_Clampi( 1, 4, r_devoGI_bounces->integer );
+	const int bounces = Com_Clampi( 1, 8, r_devoGI_bounces->integer );
 	const float intensity = Q_max( 0.0f, r_devoGI_intensity->value );
 
 	giBake *bakePtr = new giBake();
@@ -1548,10 +1590,20 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 	gi_relit = relight;
 	giLightGrid lightGrid;
 	float relightScaleLights = 1.0f, relightScaleSun = 1.0f;
+	std::vector<gvec3> lightPart, sunPart;	// traced direct light per texel (kept for the exposure match)
+	std::vector<float> origLuma;			// brightness of the original lightmap per texel
+	float exposureLights = 1.0f, exposureSun = 1.0f;	// exposure match, also applied to vertex colours
 	if ( relight ) {
 		gi_build_light_grid( lightGrid );
 		const size_t n = bake.texels.size();
-		std::vector<gvec3> lightPart( n ), sunPart( n );
+		lightPart.assign( n, gvec3() );
+		sunPart.assign( n, gvec3() );
+		origLuma.assign( n, 0.0f );
+		for ( size_t i = 0; i < n; i++ ) {
+			const giTexel &tx = bake.texels[i];
+			const float *px = &bake.direct[( ( (size_t)tx.page * DEVOGI_LM_SIZE + tx.y ) * DEVOGI_LM_SIZE + tx.x ) * 3];
+			origLuma[i] = gi_luma( gvec3( px[0], px[1], px[2] ) );
+		}
 		gi_parallel_for( (int)n, [&]( int i ) {
 			const giTexel &tx = bake.texels[i];
 			if ( tx.styleValue != 0 )
@@ -1619,6 +1671,39 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 		gi_compose( bake, intensity );
 		ri.Printf( PRINT_ALL, "DevoGI: bounce %d/%d done (%.1fs)\n", b + 1, bounces, ( ri.Milliseconds() - startTime ) / 1000.0f );
 	}
+	// exposure match: the old lightmaps also held q3map2's own bounce and ambient light, so
+	// after our bounces, lamp-lit and sunlit areas are each scaled to the original's
+	// brightness (interiors were coming out too dark), then r_devoGI_exposure on top
+	if ( relight ) {
+		double oL = 0, fL = 0, oS = 0, fS = 0;
+		for ( size_t i = 0; i < bake.texels.size(); i++ ) {
+			const giTexel &tx = bake.texels[i];
+			if ( tx.styleValue != 0 || tx.edge || origLuma[i] < 4.0f )
+				continue;
+			const float *px = &bake.light[( ( (size_t)tx.page * DEVOGI_LM_SIZE + tx.y ) * DEVOGI_LM_SIZE + tx.x ) * 3];
+			const float fin = gi_luma( gvec3( px[0], px[1], px[2] ) );
+			const float a = gi_luma( lightPart[i] ) * relightScaleLights, s = gi_luma( sunPart[i] ) * relightScaleSun;
+			if ( s > a * 2.0f ) { oS += origLuma[i]; fS += fin; }
+			else { oL += origLuma[i]; fL += fin; }
+		}
+		const float rL = fL > 0 ? Com_Clamp( 0.25f, 8.0f, (float)( oL / fL ) ) : 1.0f;
+		const float rS = fS > 0 ? Com_Clamp( 0.25f, 8.0f, (float)( oS / fS ) ) : 1.0f;
+		const float exposure = Q_max( 0.0f, r_devoGI_exposure->value );
+		exposureLights = rL * exposure;
+		exposureSun = rS * exposure;
+		for ( size_t i = 0; i < bake.texels.size(); i++ ) {
+			const giTexel &tx = bake.texels[i];
+			if ( tx.styleValue != 0 )
+				continue;
+			const float a = gi_luma( lightPart[i] ) * relightScaleLights, s = gi_luma( sunPart[i] ) * relightScaleSun;
+			const float wS = ( a + s ) > 1e-3f ? s / ( a + s ) : 0.0f;	// unlit by either: an interior
+			const float f = ( wS * rS + ( 1.0f - wS ) * rL ) * exposure;
+			float *px = &bake.light[( ( (size_t)tx.page * DEVOGI_LM_SIZE + tx.y ) * DEVOGI_LM_SIZE + tx.x ) * 3];
+			px[0] *= f; px[1] *= f; px[2] *= f;
+		}
+		ri.Printf( PRINT_ALL, "DevoGI: exposure match: interiors x%.2f, sunlit x%.2f, r_devoGI_exposure %.2f\n", rL, rS, exposure );
+	}
+
 	gi_dilate( bake, bake.light );
 
 	// vertex-lit surfaces (mostly models baked into the map) get the same bounce
@@ -1630,27 +1715,56 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 		const dsurface_t *ds = (const dsurface_t *)( fileBase + ls.fileofs );
 		const int numSurfs = ls.filelen / sizeof( dsurface_t );
 
-		std::vector<int> list;
+		std::vector<int> list;					// vertices of vertex-lit surfaces: traced
+		std::vector<std::pair<int, int>> lmList;	// (vertex, page) of lightmapped surfaces: sampled
 		std::vector<char> mark( numDrawVerts, 0 );
 		for ( int s = 0; s < numSurfs; s++ ) {
-			if ( LittleLong( ds[s].lightmapNum[0] ) != LIGHTMAP_BY_VERTEX || LittleLong( ds[s].surfaceType ) == MST_FLARE )
+			if ( LittleLong( ds[s].surfaceType ) == MST_FLARE )
 				continue;
 			const int shader = LittleLong( ds[s].shaderNum );
 			if ( shader >= 0 && shader < (int)bake.scene.shaders.size() && ( bake.scene.shaders[shader].surfaceFlags & SURF_SKY ) )
+				continue;
+			const int lmNum = LittleLong( ds[s].lightmapNum[0] );
+			const bool vertexLit = lmNum == LIGHTMAP_BY_VERTEX;
+			// lightmapped surfaces also carry q3map2 vertex colours, used by shader stages
+			// with rgbGen vertex / exactVertex: those must follow the new lightmap too
+			const bool lightmapped = lmNum >= 0 && lmNum < numPages && ds[s].lightmapStyles[0] == 0;
+			if ( !vertexLit && !lightmapped )
 				continue;
 			const int first = LittleLong( ds[s].firstVert ), nv = LittleLong( ds[s].numVerts );
 			for ( int v = first; v < first + nv && v < numDrawVerts; v++ ) {
 				if ( v >= 0 && !mark[v] ) {
 					mark[v] = 1;
-					list.push_back( v );
+					if ( vertexLit )
+						list.push_back( v );
+					else
+						lmList.push_back( std::make_pair( v, lmNum ) );
 				}
 			}
 		}
 
-		if ( !list.empty() ) {
+		if ( !list.empty() || !lmList.empty() ) {
 			gi_vertexColors.resize( (size_t)numDrawVerts * 4 );
 			for ( int v = 0; v < numDrawVerts; v++ )
 				memcpy( &gi_vertexColors[(size_t)v * 4], dv[v].color[0], 4 );
+
+			// lightmapped surfaces: the new lightmap at the vertex (bilinear)
+			gi_parallel_for( (int)lmList.size(), [&]( int i ) {
+				const int v = lmList[i].first, page = lmList[i].second;
+				const float fx = Com_Clamp( 0.0f, (float)( DEVOGI_LM_SIZE - 1 ), LittleFloat( dv[v].lightmap[0][0] ) * DEVOGI_LM_SIZE - 0.5f );
+				const float fy = Com_Clamp( 0.0f, (float)( DEVOGI_LM_SIZE - 1 ), LittleFloat( dv[v].lightmap[0][1] ) * DEVOGI_LM_SIZE - 0.5f );
+				const int x0 = (int)fx, y0 = (int)fy;
+				const int x1 = Q_min( DEVOGI_LM_SIZE - 1, x0 + 1 ), y1 = Q_min( DEVOGI_LM_SIZE - 1, y0 + 1 );
+				const float ax = fx - x0, ay = fy - y0;
+				auto at = [&]( int x, int y, int k ) { return bake.light[( ( (size_t)page * DEVOGI_LM_SIZE + y ) * DEVOGI_LM_SIZE + x ) * 3 + k]; };
+				float c[3];
+				for ( int k = 0; k < 3; k++ )
+					c[k] = ( at( x0, y0, k ) * ( 1 - ax ) + at( x1, y0, k ) * ax ) * ( 1 - ay ) + ( at( x0, y1, k ) * ( 1 - ax ) + at( x1, y1, k ) * ax ) * ay;
+				const float m = Q_max( c[0], Q_max( c[1], c[2] ) );
+				const float s = m > 255.0f ? 255.0f / m : 1.0f;
+				for ( int k = 0; k < 3; k++ )
+					gi_vertexColors[(size_t)v * 4 + k] = (byte)Com_Clampi( 0, 255, (int)( c[k] * s + 0.5f ) );
+			} );
 
 			const float aoIndirect = Com_Clamp( 0.0f, 2.0f, r_devoGI_ao->value );
 			const float aoDirect = Com_Clamp( 0.0f, 1.0f, r_devoGI_aoDirect->value );
@@ -1665,9 +1779,9 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 				const float bounceScale = intensity * powf( ao, aoIndirect * 2.0f );
 				float direct[3] = { (float)dv[v].color[0][0], (float)dv[v].color[0][1], (float)dv[v].color[0][2] };
 				float directScale = 1.0f - aoDirect * ( 1.0f - ao );
+				gvec3 lp, sp;
 				if ( relight ) {
 					// same traced light as the lightmaps, real shadows instead of the fake contact darkening
-					gvec3 lp, sp;
 					gi_direct_point( bake, lightGrid, gv.xyz, gv.normal, gv.normal, (uint32_t)v * 40503u + 7u, lp, sp );
 					const gvec3 c = lp * relightScaleLights + sp * relightScaleSun;
 					direct[0] = c.x; direct[1] = c.y; direct[2] = c.z;
@@ -1676,12 +1790,21 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 				float c[3];
 				for ( int k = 0; k < 3; k++ )
 					c[k] = direct[k] * directScale + g[k] * bounceScale;
+				if ( relight ) {
+					// same exposure match as the lightmaps, weighted by how sunlit the vertex is
+					const float a = gi_luma( lp ) * relightScaleLights, sl = gi_luma( sp ) * relightScaleSun;
+					const float wS = ( a + sl ) > 1e-3f ? sl / ( a + sl ) : 0.0f;
+					const float f = wS * exposureSun + ( 1.0f - wS ) * exposureLights;
+					for ( int k = 0; k < 3; k++ )
+						c[k] *= f;
+				}
 				const float m = Q_max( c[0], Q_max( c[1], c[2] ) );
 				const float s = m > 255.0f ? 255.0f / m : 1.0f;
 				for ( int k = 0; k < 3; k++ )
 					gi_vertexColors[(size_t)v * 4 + k] = (byte)Com_Clampi( 0, 255, (int)( c[k] * s + 0.5f ) );
 			} );
-			ri.Printf( PRINT_ALL, "DevoGI: lit %d vertices of vertex-lit models\n", (int)list.size() );
+			ri.Printf( PRINT_ALL, "DevoGI: lit %d vertices of vertex-lit models, %d vertex colours of lightmapped surfaces\n",
+				(int)list.size(), (int)lmList.size() );
 		}
 	}
 

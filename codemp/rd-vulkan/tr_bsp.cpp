@@ -356,8 +356,9 @@ static	void R_LoadLightmaps( world_t &worldData, lump_t *l, lump_t *surfs ) {
 			numLightmaps++;
 	}
 
-	// DevoGI: bake (or load the cached) bounce light into the lightmap data before upload
-	// it may bake at a higher resolution, as long as the lightmap atlas still fits the GPU
+	// DevoGI: bake (or load the cached) global illumination into the lightmap data before
+	// upload. Pages may be baked larger than 128; when the packed atlas would then exceed
+	// the GPU's texture limit, every page becomes its own image instead
 	byte *devoGILightmaps = NULL;
 	if ( buf ) {
 		const int atlasPages = tr.worldDeluxeMapping ? ( numLightmaps >> 1 ) : numLightmaps;
@@ -365,14 +366,18 @@ static	void R_LoadLightmaps( world_t &worldData, lump_t *l, lump_t *surfs ) {
 		while ( perX < (int)ceilf( sqrtf( (float)atlasPages ) ) )
 			perX *= 2;
 		const int perY = (int)ceilf( (float)atlasPages / perX );
-		const int maxSide = Q_max( perX, perY ) * DEFAULT_LIGHTMAP_SIZE;
-		const int maxScale = Q_max( 1, glConfig.maxTextureSize / Q_max( 1, maxSide ) );
+		const int maxScale = Q_max( 1, glConfig.maxTextureSize / DEFAULT_LIGHTMAP_SIZE );
 
 		int pageSize = DEFAULT_LIGHTMAP_SIZE;
 		devoGILightmaps = R_DevoGI_Process( worldData.name, fileBase, (const dheader_t *)fileBase, maxScale, &pageSize );
 		if ( devoGILightmaps ) {
 			buf = devoGILightmaps;
 			lightmapSize = pageSize;
+			if ( tr.worldInternalLightmapping && Q_max( perX, perY ) * lightmapSize > glConfig.maxTextureSize ) {
+				tr.worldInternalLightmapping = qfalse;	// one image per page
+				ri.Printf( PRINT_ALL, "DevoGI: %dx%d lightmaps exceed one %d atlas, using one image per page\n",
+					lightmapSize, lightmapSize, glConfig.maxTextureSize );
+			}
 		}
 	}
 
@@ -402,6 +407,9 @@ static	void R_LoadLightmaps( world_t &worldData, lump_t *l, lump_t *surfs ) {
 	else
 	{
 		tr.numLightmaps = numLightmaps;
+		// no atlas: surfaces keep their per-page lightmap coordinates
+		tr.lightmapAtlasSize[0] = tr.lightmapAtlasSize[1] = 0;
+		tr.lightmapsPerAtlasSide[0] = tr.lightmapsPerAtlasSide[1] = 1;
 	}
 
 	tr.lightmaps = (image_t **)ri.Hunk_Alloc( tr.numLightmaps * sizeof(image_t *), h_low );
