@@ -2534,6 +2534,11 @@ static const char *FindShaderInShaderText( const char *shadername ) {
 	return NULL;
 }
 
+// DevoGI: read access to a shader's text (after its name)
+const char *R_DevoGI_FindShaderText( const char *shaderName ) {
+	return FindShaderInShaderText( shaderName );
+}
+
 /*
 ==================
 R_FindShaderByName

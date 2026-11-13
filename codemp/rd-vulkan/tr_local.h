@@ -2847,6 +2847,11 @@ void RB_DrawSurfaceSprites(const shaderStage_t *stage, const ss_input *input);
 
 qboolean ShaderHashTableExists(void);
 
+// DevoGI baked global illumination (tr_devogi.cpp)
+void		R_DevoGI_Register( void );
+byte		*R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader_t *header );
+const char	*R_DevoGI_FindShaderText( const char *shaderName );
+
 // Vulkan
 void		RB_AddDrawItem( Pass *pass, const DrawItem& drawItem );
 void		RB_AddDrawItemUniformBinding( DrawItem &item, const trRefEntity_t *refEntity );

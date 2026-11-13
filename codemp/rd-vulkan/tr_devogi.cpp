@@ -1,0 +1,1162 @@
+/*
+===========================================================================
+DevoJK baked global illumination (DevoGI)
+
+While a level loads, the renderer bakes bounced light (global illumination)
+into the map's lightmaps and caches the result next to the map as
+maps/<name>.devogi. The next time the same BSP is loaded the cache is used
+directly; if the BSP changed (its lumps hash differently) or the bake
+settings changed, the bake runs again.
+
+Light sources:
+  - the BSP lightmaps and vertex colours (all static light q3map2 baked:
+    light entities, sun, surface lights), per light style, so switchable
+    and flickering styles get their own bounce light
+  - "light" entities left in the BSP entity lump (static, style 0), traced
+    with shadow rays and merged into the direct light
+  - the sky, as a soft ambient term (r_devoGI_sky)
+
+The result overrides the lightmap data before it is uploaded, so the rest
+of the renderer (and every shader stage that uses $lightmap) picks it up
+with no runtime cost.
+
+Ideas inspired by Berk Emre Saribas' Panko-Renderer (MIT) and Q3Map2's
+radiosity; implementation written for the Q3 BSP format.
+
+This file is part of DevoJK, licensed under GPLv2.
+===========================================================================
+*/
+
+#include "tr_local.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+#include <cstdint>
+#include <thread>
+#include <vector>
+
+#define DEVOGI_VERSION		1
+#define DEVOGI_LM_SIZE		128
+#define DEVOGI_PATCH_STEPS	8
+#define DEVOGI_INF			1e30f
+
+static cvar_t *r_devoGI;
+static cvar_t *r_devoGI_rays;
+static cvar_t *r_devoGI_bounces;
+static cvar_t *r_devoGI_intensity;
+static cvar_t *r_devoGI_sky;
+static cvar_t *r_devoGI_entityLights;
+static cvar_t *r_devoGI_threads;
+static cvar_t *r_devoGI_rebuild;
+
+void R_DevoGI_Register( void )
+{
+	r_devoGI				= ri.Cvar_Get( "r_devoGI",				"1",	CVAR_ARCHIVE | CVAR_LATCH, "Baked global illumination: bounce light is baked into the lightmaps on level load and cached in maps/<name>.devogi\n 0: off\n 1: on" );
+	r_devoGI_rays			= ri.Cvar_Get( "r_devoGI_rays",			"64",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI rays per lightmap texel and bounce (8-1024). More is smoother but bakes slower" );
+	r_devoGI_bounces		= ri.Cvar_Get( "r_devoGI_bounces",		"2",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI light bounces (1-4)" );
+	r_devoGI_intensity		= ri.Cvar_Get( "r_devoGI_intensity",	"1.0",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI bounce light strength" );
+	r_devoGI_sky			= ri.Cvar_Get( "r_devoGI_sky",			"0.5",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI ambient light from visible sky (0 = none)" );
+	r_devoGI_entityLights	= ri.Cvar_Get( "r_devoGI_entityLights",	"1",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI uses light entities kept in the BSP as extra light sources" );
+	r_devoGI_threads		= ri.Cvar_Get( "r_devoGI_threads",		"0",	CVAR_ARCHIVE, "DevoGI bake threads (0 = all CPU cores)" );
+	r_devoGI_rebuild		= ri.Cvar_Get( "r_devoGI_rebuild",		"0",	CVAR_TEMP, "Set to 1 to force DevoGI to rebake the next map that loads" );
+}
+
+/*
+===========================================================================
+Small math helpers
+===========================================================================
+*/
+
+struct gvec3 {
+	float x, y, z;
+	gvec3() : x(0), y(0), z(0) {}
+	gvec3( float a, float b, float c ) : x(a), y(b), z(c) {}
+	explicit gvec3( const float *v ) : x(v[0]), y(v[1]), z(v[2]) {}
+	gvec3 operator+( const gvec3 &o ) const { return gvec3( x + o.x, y + o.y, z + o.z ); }
+	gvec3 operator-( const gvec3 &o ) const { return gvec3( x - o.x, y - o.y, z - o.z ); }
+	gvec3 operator*( float s ) const { return gvec3( x * s, y * s, z * s ); }
+	gvec3 operator*( const gvec3 &o ) const { return gvec3( x * o.x, y * o.y, z * o.z ); }
+	gvec3 &operator+=( const gvec3 &o ) { x += o.x; y += o.y; z += o.z; return *this; }
+	float operator[]( int i ) const { return i == 0 ? x : ( i == 1 ? y : z ); }
+};
+
+static inline float gdot( const gvec3 &a, const gvec3 &b ) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+static inline gvec3 gcross( const gvec3 &a, const gvec3 &b ) { return gvec3( a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x ); }
+static inline gvec3 gnorm( const gvec3 &a ) { float l = sqrtf( gdot( a, a ) ); return l > 1e-12f ? a * ( 1.0f / l ) : gvec3( 0, 0, 1 ); }
+static inline gvec3 gmin( const gvec3 &a, const gvec3 &b ) { return gvec3( Q_min( a.x, b.x ), Q_min( a.y, b.y ), Q_min( a.z, b.z ) ); }
+static inline gvec3 gmax( const gvec3 &a, const gvec3 &b ) { return gvec3( Q_max( a.x, b.x ), Q_max( a.y, b.y ), Q_max( a.z, b.z ) ); }
+
+// stable per-texel random numbers, so a rebake gives the same result
+static inline uint32_t gi_hash( uint32_t x ) {
+	x ^= x >> 16; x *= 0x7feb352dU;
+	x ^= x >> 15; x *= 0x846ca68bU;
+	x ^= x >> 16;
+	return x;
+}
+
+static inline float gi_rand( uint32_t &state ) {
+	state = gi_hash( state + 0x9e3779b9U );
+	return ( state >> 8 ) * ( 1.0f / 16777216.0f );
+}
+
+static void gi_basis( const gvec3 &n, gvec3 &t, gvec3 &b ) {
+	if ( fabsf( n.z ) < 0.999f )
+		t = gnorm( gcross( gvec3( 0, 0, 1 ), n ) );
+	else
+		t = gnorm( gcross( gvec3( 1, 0, 0 ), n ) );
+	b = gcross( n, t );
+}
+
+/*
+===========================================================================
+Geometry
+===========================================================================
+*/
+
+struct giVert {
+	gvec3	xyz;
+	gvec3	normal;
+	float	lm[MAXLIGHTMAPS][2];
+	float	color[MAXLIGHTMAPS][3];
+};
+
+struct giTri {
+	gvec3	v0, e1, e2;		// for ray intersection
+	gvec3	n;				// geometric normal
+	int		surf;
+	int		vert[3];		// into giScene::verts
+};
+
+struct giSurf {
+	int		shader;
+	int		lightmapNum[MAXLIGHTMAPS];
+	int		lightmapStyle[MAXLIGHTMAPS];
+	bool	occluder;
+	bool	sky;
+};
+
+struct giShader {
+	int		surfaceFlags;
+	int		contentFlags;
+	gvec3	albedo;
+};
+
+struct giBVHNode {
+	gvec3	mins, maxs;
+	int		left;		// child index, or first tri for a leaf
+	int		count;		// 0 for inner nodes
+};
+
+struct giScene {
+	std::vector<giVert>		verts;
+	std::vector<giTri>		tris;
+	std::vector<giSurf>		surfs;
+	std::vector<giShader>	shaders;
+	std::vector<giBVHNode>	nodes;
+	std::vector<int>		triIndex;
+};
+
+// biquadratic patch evaluation for one 3x3 control block
+static giVert gi_patch_eval( const giVert *c[9], float u, float v ) {
+	float bu[3] = { ( 1 - u ) * ( 1 - u ), 2 * u * ( 1 - u ), u * u };
+	float bv[3] = { ( 1 - v ) * ( 1 - v ), 2 * v * ( 1 - v ), v * v };
+	giVert out;
+	memset( &out, 0, sizeof( out ) );
+	for ( int j = 0; j < 3; j++ ) {
+		for ( int i = 0; i < 3; i++ ) {
+			const giVert *p = c[j * 3 + i];
+			float w = bu[i] * bv[j];
+			out.xyz += p->xyz * w;
+			out.normal += p->normal * w;
+			for ( int s = 0; s < MAXLIGHTMAPS; s++ ) {
+				out.lm[s][0] += p->lm[s][0] * w;
+				out.lm[s][1] += p->lm[s][1] * w;
+				out.color[s][0] += p->color[s][0] * w;
+				out.color[s][1] += p->color[s][1] * w;
+				out.color[s][2] += p->color[s][2] * w;
+			}
+		}
+	}
+	out.normal = gnorm( out.normal );
+	return out;
+}
+
+static void gi_add_tri( giScene &scene, int surf, int a, int b, int c ) {
+	giTri t;
+	t.v0 = scene.verts[a].xyz;
+	t.e1 = scene.verts[b].xyz - t.v0;
+	t.e2 = scene.verts[c].xyz - t.v0;
+	gvec3 n = gcross( t.e1, t.e2 );
+	if ( gdot( n, n ) < 1e-8f )
+		return;	// degenerate
+	t.n = gnorm( n );
+	t.surf = surf;
+	t.vert[0] = a; t.vert[1] = b; t.vert[2] = c;
+	scene.tris.push_back( t );
+}
+
+static void gi_load_vert( giVert &out, const mapVert_t &in ) {
+	out.xyz = gvec3( LittleFloat( in.xyz[0] ), LittleFloat( in.xyz[1] ), LittleFloat( in.xyz[2] ) );
+	out.normal = gnorm( gvec3( LittleFloat( in.normal[0] ), LittleFloat( in.normal[1] ), LittleFloat( in.normal[2] ) ) );
+	for ( int s = 0; s < MAXLIGHTMAPS; s++ ) {
+		out.lm[s][0] = LittleFloat( in.lightmap[s][0] );
+		out.lm[s][1] = LittleFloat( in.lightmap[s][1] );
+		out.color[s][0] = in.color[s][0];
+		out.color[s][1] = in.color[s][1];
+		out.color[s][2] = in.color[s][2];
+	}
+}
+
+static void gi_build_geometry( giScene &scene, const byte *fileBase, const dheader_t *header ) {
+	const lump_t &ls = header->lumps[LUMP_SURFACES];
+	const lump_t &lv = header->lumps[LUMP_DRAWVERTS];
+	const lump_t &li = header->lumps[LUMP_DRAWINDEXES];
+
+	const dsurface_t *in = (const dsurface_t *)( fileBase + ls.fileofs );
+	const mapVert_t *dv = (const mapVert_t *)( fileBase + lv.fileofs );
+	const int *indexes = (const int *)( fileBase + li.fileofs );
+	const int numSurfs = ls.filelen / sizeof( dsurface_t );
+	const int numVerts = lv.filelen / sizeof( mapVert_t );
+	const int numIndexes = li.filelen / sizeof( int );
+
+	scene.surfs.resize( numSurfs );
+
+	for ( int i = 0; i < numSurfs; i++ ) {
+		const dsurface_t &s = in[i];
+		giSurf &gs = scene.surfs[i];
+		int shaderNum = LittleLong( s.shaderNum );
+		if ( shaderNum < 0 || shaderNum >= (int)scene.shaders.size() )
+			shaderNum = 0;
+		gs.shader = shaderNum;
+		for ( int k = 0; k < MAXLIGHTMAPS; k++ ) {
+			gs.lightmapNum[k] = LittleLong( s.lightmapNum[k] );
+			gs.lightmapStyle[k] = s.lightmapStyles[k];
+		}
+		const giShader &sh = scene.shaders[shaderNum];
+		gs.sky = ( sh.surfaceFlags & SURF_SKY ) != 0;
+		gs.occluder = !( sh.surfaceFlags & SURF_NODRAW )
+			&& !( sh.contentFlags & ( CONTENTS_WATER | CONTENTS_FOG | CONTENTS_TRANSLUCENT | CONTENTS_LAVA | CONTENTS_SLIME ) );
+
+		const int type = LittleLong( s.surfaceType );
+		const int firstVert = LittleLong( s.firstVert );
+		const int nv = LittleLong( s.numVerts );
+		if ( firstVert < 0 || nv <= 0 || firstVert + nv > numVerts )
+			continue;
+
+		if ( type == MST_PLANAR || type == MST_TRIANGLE_SOUP ) {
+			const int firstIndex = LittleLong( s.firstIndex );
+			const int ni = LittleLong( s.numIndexes );
+			if ( firstIndex < 0 || firstIndex + ni > numIndexes )
+				continue;
+			const int base = (int)scene.verts.size();
+			for ( int v = 0; v < nv; v++ ) {
+				giVert gv;
+				gi_load_vert( gv, dv[firstVert + v] );
+				scene.verts.push_back( gv );
+			}
+			for ( int k = 0; k + 2 < ni; k += 3 ) {
+				int a = LittleLong( indexes[firstIndex + k] );
+				int b = LittleLong( indexes[firstIndex + k + 1] );
+				int c = LittleLong( indexes[firstIndex + k + 2] );
+				if ( a < 0 || b < 0 || c < 0 || a >= nv || b >= nv || c >= nv )
+					continue;
+				gi_add_tri( scene, i, base + a, base + b, base + c );
+			}
+		}
+		else if ( type == MST_PATCH ) {
+			const int w = LittleLong( s.patchWidth );
+			const int h = LittleLong( s.patchHeight );
+			if ( w < 3 || h < 3 || w * h > nv || !( w & 1 ) || !( h & 1 ) )
+				continue;
+			std::vector<giVert> ctrl( w * h );
+			for ( int v = 0; v < w * h; v++ )
+				gi_load_vert( ctrl[v], dv[firstVert + v] );
+
+			const int steps = DEVOGI_PATCH_STEPS;
+			for ( int py = 0; py + 2 < h; py += 2 ) {
+				for ( int px = 0; px + 2 < w; px += 2 ) {
+					const giVert *c[9];
+					for ( int j = 0; j < 3; j++ )
+						for ( int k = 0; k < 3; k++ )
+							c[j * 3 + k] = &ctrl[( py + j ) * w + px + k];
+					const int base = (int)scene.verts.size();
+					for ( int j = 0; j <= steps; j++ )
+						for ( int k = 0; k <= steps; k++ )
+							scene.verts.push_back( gi_patch_eval( c, k / (float)steps, j / (float)steps ) );
+					for ( int j = 0; j < steps; j++ ) {
+						for ( int k = 0; k < steps; k++ ) {
+							int v00 = base + j * ( steps + 1 ) + k;
+							int v10 = v00 + 1;
+							int v01 = v00 + steps + 1;
+							int v11 = v01 + 1;
+							// orient like the patch normals
+							gvec3 n = gcross( scene.verts[v10].xyz - scene.verts[v00].xyz, scene.verts[v01].xyz - scene.verts[v00].xyz );
+							if ( gdot( n, scene.verts[v00].normal ) >= 0 ) {
+								gi_add_tri( scene, i, v00, v10, v11 );
+								gi_add_tri( scene, i, v00, v11, v01 );
+							} else {
+								gi_add_tri( scene, i, v00, v11, v10 );
+								gi_add_tri( scene, i, v00, v01, v11 );
+							}
+						}
+					}
+				}
+			}
+		}
+		// flares and bad surfaces have no geometry
+	}
+}
+
+/*
+===========================================================================
+BVH ray tracer
+===========================================================================
+*/
+
+static void gi_tri_bounds( const giTri &t, gvec3 &mins, gvec3 &maxs ) {
+	gvec3 b = t.v0 + t.e1, c = t.v0 + t.e2;
+	mins = gmin( t.v0, gmin( b, c ) );
+	maxs = gmax( t.v0, gmax( b, c ) );
+}
+
+static void gi_build_bvh( giScene &scene ) {
+	const int n = (int)scene.tris.size();
+	scene.triIndex.resize( n );
+	for ( int i = 0; i < n; i++ )
+		scene.triIndex[i] = i;
+	scene.nodes.clear();
+	scene.nodes.reserve( n * 2 + 1 );
+	if ( !n )
+		return;
+
+	std::vector<gvec3> centers( n ), tmins( n ), tmaxs( n );
+	for ( int i = 0; i < n; i++ ) {
+		gi_tri_bounds( scene.tris[i], tmins[i], tmaxs[i] );
+		centers[i] = ( tmins[i] + tmaxs[i] ) * 0.5f;
+	}
+
+	struct buildItem { int node, first, count; };
+	std::vector<buildItem> stack;
+	scene.nodes.push_back( giBVHNode() );
+	stack.push_back( { 0, 0, n } );
+
+	while ( !stack.empty() ) {
+		buildItem it = stack.back();
+		stack.pop_back();
+
+		gvec3 mins( DEVOGI_INF, DEVOGI_INF, DEVOGI_INF ), maxs( -DEVOGI_INF, -DEVOGI_INF, -DEVOGI_INF );
+		gvec3 cmins = mins, cmaxs = maxs;
+		for ( int i = it.first; i < it.first + it.count; i++ ) {
+			int t = scene.triIndex[i];
+			mins = gmin( mins, tmins[t] );
+			maxs = gmax( maxs, tmaxs[t] );
+			cmins = gmin( cmins, centers[t] );
+			cmaxs = gmax( cmaxs, centers[t] );
+		}
+		giBVHNode &node = scene.nodes[it.node];
+		node.mins = mins;
+		node.maxs = maxs;
+
+		if ( it.count <= 4 ) {
+			node.left = it.first;
+			node.count = it.count;
+			continue;
+		}
+
+		gvec3 ext = cmaxs - cmins;
+		int axis = ( ext.x > ext.y && ext.x > ext.z ) ? 0 : ( ext.y > ext.z ? 1 : 2 );
+		int mid = it.first + it.count / 2;
+		std::nth_element( scene.triIndex.begin() + it.first, scene.triIndex.begin() + mid,
+			scene.triIndex.begin() + it.first + it.count,
+			[&]( int a, int b ) { return centers[a][axis] < centers[b][axis]; } );
+
+		int left = (int)scene.nodes.size();
+		scene.nodes.push_back( giBVHNode() );
+		scene.nodes.push_back( giBVHNode() );
+		scene.nodes[it.node].left = left;
+		scene.nodes[it.node].count = 0;
+		stack.push_back( { left, it.first, mid - it.first } );
+		stack.push_back( { left + 1, mid, it.first + it.count - mid } );
+	}
+}
+
+static inline bool gi_ray_box( const gvec3 &o, const gvec3 &inv, const gvec3 &mins, const gvec3 &maxs, float tmax ) {
+	float t0 = 0, t1 = tmax;
+	for ( int a = 0; a < 3; a++ ) {
+		float tn = ( mins[a] - o[a] ) * inv[a];
+		float tf = ( maxs[a] - o[a] ) * inv[a];
+		if ( tn > tf ) std::swap( tn, tf );
+		t0 = tn > t0 ? tn : t0;
+		t1 = tf < t1 ? tf : t1;
+		if ( t0 > t1 )
+			return false;
+	}
+	return true;
+}
+
+struct giHit {
+	float	t;
+	int		tri;
+	float	u, v;
+};
+
+// nearest occluder hit along the ray; anyHit stops at the first one (shadow rays)
+static bool gi_trace( const giScene &scene, const gvec3 &o, const gvec3 &d, float tmax, giHit &hit, bool anyHit ) {
+	if ( scene.nodes.empty() )
+		return false;
+	gvec3 inv( 1.0f / ( fabsf( d.x ) > 1e-9f ? d.x : 1e-9f ),
+			   1.0f / ( fabsf( d.y ) > 1e-9f ? d.y : 1e-9f ),
+			   1.0f / ( fabsf( d.z ) > 1e-9f ? d.z : 1e-9f ) );
+	hit.t = tmax;
+	hit.tri = -1;
+
+	int stack[64];
+	int sp = 0;
+	stack[sp++] = 0;
+	while ( sp ) {
+		const giBVHNode &node = scene.nodes[stack[--sp]];
+		if ( !gi_ray_box( o, inv, node.mins, node.maxs, hit.t ) )
+			continue;
+		if ( node.count ) {
+			for ( int i = node.left; i < node.left + node.count; i++ ) {
+				const int ti = scene.triIndex[i];
+				const giTri &t = scene.tris[ti];
+				if ( !scene.surfs[t.surf].occluder && !scene.surfs[t.surf].sky )
+					continue;
+				// Moller-Trumbore, two sided
+				gvec3 p = gcross( d, t.e2 );
+				float det = gdot( t.e1, p );
+				if ( fabsf( det ) < 1e-9f )
+					continue;
+				float idet = 1.0f / det;
+				gvec3 s = o - t.v0;
+				float u = gdot( s, p ) * idet;
+				if ( u < 0 || u > 1 )
+					continue;
+				gvec3 q = gcross( s, t.e1 );
+				float v = gdot( d, q ) * idet;
+				if ( v < 0 || u + v > 1 )
+					continue;
+				float tt = gdot( t.e2, q ) * idet;
+				if ( tt > 0.01f && tt < hit.t ) {
+					hit.t = tt;
+					hit.tri = ti;
+					hit.u = u;
+					hit.v = v;
+					if ( anyHit )
+						return true;
+				}
+			}
+		}
+		else if ( sp < 62 ) {
+			stack[sp++] = node.left;
+			stack[sp++] = node.left + 1;
+		}
+	}
+	return hit.tri >= 0;
+}
+
+/*
+===========================================================================
+Shaders: albedo from the diffuse texture
+===========================================================================
+*/
+
+const char *R_DevoGI_FindShaderText( const char *shaderName );
+
+// first non-lightmap "map"/"clampmap" stage image of a shader, or the shader name itself
+static void gi_shader_texture( const char *shaderName, char *out, int outSize ) {
+	Q_strncpyz( out, shaderName, outSize );
+	const char *p = R_DevoGI_FindShaderText( shaderName );
+	if ( !p )
+		return;
+	int depth = 0;
+	while ( 1 ) {
+		const char *token = COM_ParseExt( &p, qtrue );
+		if ( !token[0] )
+			break;
+		if ( token[0] == '{' ) { depth++; continue; }
+		if ( token[0] == '}' ) { if ( --depth <= 0 ) break; continue; }
+		if ( depth >= 2 && ( !Q_stricmp( token, "map" ) || !Q_stricmp( token, "clampmap" ) ) ) {
+			token = COM_ParseExt( &p, qfalse );
+			if ( token[0] && token[0] != '$' && token[0] != '*' ) {
+				Q_strncpyz( out, token, outSize );
+				return;
+			}
+		}
+	}
+}
+
+static gvec3 gi_shader_albedo( const char *shaderName ) {
+	char texName[MAX_QPATH];
+	gi_shader_texture( shaderName, texName, sizeof( texName ) );
+	COM_StripExtension( texName, texName, sizeof( texName ) );
+
+	byte *pic = NULL;
+	int w = 0, h = 0;
+	R_LoadImage( texName, &pic, &w, &h );
+	if ( !pic || w <= 0 || h <= 0 ) {
+		if ( pic )
+			Z_Free( pic );
+		return gvec3( 0.5f, 0.5f, 0.5f );
+	}
+
+	double r = 0, g = 0, b = 0, a = 0;
+	const int step = ( w * h > 65536 ) ? 4 : 1;
+	for ( int i = 0; i < w * h; i += step ) {
+		const float al = pic[i * 4 + 3] / 255.0f;
+		r += pic[i * 4 + 0] * al;
+		g += pic[i * 4 + 1] * al;
+		b += pic[i * 4 + 2] * al;
+		a += al;
+	}
+	Z_Free( pic );
+	if ( a < 1 )
+		return gvec3( 0.5f, 0.5f, 0.5f );
+
+	gvec3 c( (float)( r / a / 255.0 ), (float)( g / a / 255.0 ), (float)( b / a / 255.0 ) );
+	// keep energy in check like q3map2 radiosity: albedo never above 0.9
+	float m = Q_max( c.x, Q_max( c.y, c.z ) );
+	if ( m > 0.9f )
+		c = c * ( 0.9f / m );
+	return c;
+}
+
+// normalized sun colour of a sky shader, from its q3map_sun / q3map_sunExt / sun line
+static bool gi_sky_sun_color( const char *shaderName, gvec3 &tint ) {
+	const char *p = R_DevoGI_FindShaderText( shaderName );
+	if ( !p )
+		return false;
+	int depth = 0;
+	while ( 1 ) {
+		const char *token = COM_ParseExt( &p, qtrue );
+		if ( !token[0] )
+			return false;
+		if ( token[0] == '{' ) { depth++; continue; }
+		if ( token[0] == '}' ) { if ( --depth <= 0 ) return false; continue; }
+		if ( !Q_stricmp( token, "q3map_sun" ) || !Q_stricmp( token, "q3map_sunExt" ) || !Q_stricmp( token, "sun" ) ) {
+			float c[3];
+			for ( int i = 0; i < 3; i++ )
+				c[i] = atof( COM_ParseExt( &p, qfalse ) );
+			const float m = Q_max( c[0], Q_max( c[1], c[2] ) );
+			if ( m <= 1e-4f )
+				return false;
+			tint = gvec3( c[0] / m, c[1] / m, c[2] / m );
+			return true;
+		}
+	}
+}
+
+/*
+===========================================================================
+Light entities kept in the BSP
+===========================================================================
+*/
+
+struct giPointLight {
+	gvec3	origin;
+	gvec3	color;		// already scaled by intensity
+	float	radius;
+	bool	linear;
+};
+
+static void gi_parse_lights( const char *ents, int len, std::vector<giPointLight> &lights ) {
+	if ( !ents || len <= 0 )
+		return;
+	std::vector<char> text( ents, ents + len );
+	text.push_back( 0 );
+	const char *p = text.data();
+
+	while ( 1 ) {
+		const char *token = COM_ParseExt( &p, qtrue );
+		if ( !token[0] )
+			break;
+		if ( token[0] != '{' )
+			continue;
+
+		char classname[MAX_QPATH] = "";
+		float origin[3] = { 0, 0, 0 }, color[3] = { 1, 1, 1 };
+		float intensity = 300;
+		int style = 0, spawnflags = 0;
+		bool hasTarget = false;
+
+		while ( 1 ) {
+			char key[MAX_KEY];
+			token = COM_ParseExt( &p, qtrue );
+			if ( !token[0] || token[0] == '}' )
+				break;
+			Q_strncpyz( key, token, sizeof( key ) );
+			token = COM_ParseExt( &p, qtrue );
+			if ( !token[0] )
+				break;
+			if ( !Q_stricmp( key, "classname" ) )
+				Q_strncpyz( classname, token, sizeof( classname ) );
+			else if ( !Q_stricmp( key, "origin" ) )
+				sscanf( token, "%f %f %f", &origin[0], &origin[1], &origin[2] );
+			else if ( !Q_stricmp( key, "light" ) || !Q_stricmp( key, "_light" ) )
+				intensity = atof( token );
+			else if ( !Q_stricmp( key, "_color" ) || !Q_stricmp( key, "color" ) )
+				sscanf( token, "%f %f %f", &color[0], &color[1], &color[2] );
+			else if ( !Q_stricmp( key, "style" ) )
+				style = atoi( token );
+			else if ( !Q_stricmp( key, "spawnflags" ) )
+				spawnflags = atoi( token );
+			else if ( !Q_stricmp( key, "targetname" ) )
+				hasTarget = true;
+		}
+
+		if ( Q_stricmp( classname, "light" ) )
+			continue;
+		// switchable or styled lights only belong to their own light style;
+		// they are not added to the always-on (style 0) direct light
+		if ( style != 0 || hasTarget || intensity <= 0 )
+			continue;
+
+		float m = Q_max( color[0], Q_max( color[1], color[2] ) );
+		if ( m > 1.0f ) { color[0] /= m; color[1] /= m; color[2] /= m; }
+
+		giPointLight l;
+		l.origin = gvec3( origin );
+		l.linear = ( spawnflags & 1 ) != 0;
+		// q3map2 point light: photons = intensity * 7500, falloff 1/d^2
+		const float photons = intensity * ( l.linear ? 1.0f : 7500.0f );
+		l.color = gvec3( color ) * photons;
+		l.radius = l.linear ? intensity * 8.0f : sqrtf( photons );	// where it falls under ~1/255
+		lights.push_back( l );
+	}
+}
+
+/*
+===========================================================================
+Lightmap texels
+===========================================================================
+*/
+
+struct giTexel {
+	gvec3	pos;
+	gvec3	normal;
+	int		page;
+	int		x, y;
+	int		style;		// lightmap style slot of the owning surface (0..3)
+	int		styleValue;	// light style number in that slot (0 = always on)
+	int		surf;
+};
+
+struct giBake {
+	giScene						scene;
+	std::vector<giTexel>		texels;
+	std::vector<int>			owner;		// per page pixel: texel index or -1
+	std::vector<float>			direct;		// per page pixel rgb
+	std::vector<float>			light;		// current total light, per page pixel rgb
+	std::vector<float>			indirect;	// per texel rgb
+	int							numPages;
+	gvec3						skyColor;
+};
+
+static void gi_rasterize_tri( giBake &bake, const giTri &t, int style, int page ) {
+	const giScene &scene = bake.scene;
+	const giVert *v[3] = { &scene.verts[t.vert[0]], &scene.verts[t.vert[1]], &scene.verts[t.vert[2]] };
+	float px[3], py[3];
+	for ( int i = 0; i < 3; i++ ) {
+		px[i] = v[i]->lm[style][0] * DEVOGI_LM_SIZE;
+		py[i] = v[i]->lm[style][1] * DEVOGI_LM_SIZE;
+	}
+	const float area = ( px[1] - px[0] ) * ( py[2] - py[0] ) - ( px[2] - px[0] ) * ( py[1] - py[0] );
+	if ( fabsf( area ) < 1e-6f )
+		return;
+
+	int x0 = Q_max( 0, (int)floorf( Q_min( px[0], Q_min( px[1], px[2] ) ) - 1 ) );
+	int y0 = Q_max( 0, (int)floorf( Q_min( py[0], Q_min( py[1], py[2] ) ) - 1 ) );
+	int x1 = Q_min( DEVOGI_LM_SIZE - 1, (int)ceilf( Q_max( px[0], Q_max( px[1], px[2] ) ) + 1 ) );
+	int y1 = Q_min( DEVOGI_LM_SIZE - 1, (int)ceilf( Q_max( py[0], Q_max( py[1], py[2] ) ) + 1 ) );
+
+	// a little slack (in barycentric units per pixel) so edge texels get covered
+	const float slack = 0.75f / sqrtf( fabsf( area ) );
+
+	for ( int y = y0; y <= y1; y++ ) {
+		for ( int x = x0; x <= x1; x++ ) {
+			const float cx = x + 0.5f, cy = y + 0.5f;
+			float w1 = ( ( cx - px[0] ) * ( py[2] - py[0] ) - ( px[2] - px[0] ) * ( cy - py[0] ) ) / area;
+			float w2 = ( ( px[1] - px[0] ) * ( cy - py[0] ) - ( cx - px[0] ) * ( py[1] - py[0] ) ) / area;
+			float w0 = 1 - w1 - w2;
+			if ( w0 < -slack || w1 < -slack || w2 < -slack )
+				continue;
+			const int pix = ( page * DEVOGI_LM_SIZE + y ) * DEVOGI_LM_SIZE + x;
+			const bool inside = w0 >= 0 && w1 >= 0 && w2 >= 0;
+			if ( bake.owner[pix] >= 0 && !inside )
+				continue;	// already covered; only replace with a texel that is truly inside
+			w0 = Q_max( 0.0f, w0 ); w1 = Q_max( 0.0f, w1 ); w2 = Q_max( 0.0f, w2 );
+			const float ws = w0 + w1 + w2;
+			w0 /= ws; w1 /= ws; w2 /= ws;
+
+			giTexel tx;
+			tx.pos = v[0]->xyz * w0 + v[1]->xyz * w1 + v[2]->xyz * w2;
+			tx.normal = gnorm( v[0]->normal * w0 + v[1]->normal * w1 + v[2]->normal * w2 );
+			if ( gdot( tx.normal, t.n ) < 0.2f )
+				tx.normal = t.n;	// bad smoothing normals: fall back to the face normal
+			tx.page = page;
+			tx.x = x;
+			tx.y = y;
+			tx.style = style;
+			tx.styleValue = scene.surfs[t.surf].lightmapStyle[style];
+			tx.surf = t.surf;
+
+			if ( bake.owner[pix] >= 0 ) {
+				bake.texels[bake.owner[pix]] = tx;
+			} else {
+				bake.owner[pix] = (int)bake.texels.size();
+				bake.texels.push_back( tx );
+			}
+		}
+	}
+}
+
+static void gi_build_texels( giBake &bake ) {
+	const giScene &scene = bake.scene;
+	bake.owner.assign( bake.numPages * DEVOGI_LM_SIZE * DEVOGI_LM_SIZE, -1 );
+	for ( const giTri &t : scene.tris ) {
+		const giSurf &s = scene.surfs[t.surf];
+		if ( s.sky )
+			continue;
+		for ( int k = 0; k < MAXLIGHTMAPS; k++ ) {
+			if ( s.lightmapStyle[k] == LS_LSNONE )
+				continue;
+			const int page = s.lightmapNum[k];
+			if ( page < 0 || page >= bake.numPages )
+				continue;
+			gi_rasterize_tri( bake, t, k, page );
+		}
+	}
+}
+
+/*
+===========================================================================
+Bounce lighting
+===========================================================================
+*/
+
+// radiance leaving a hit point, for one light style (0 = always-on light)
+static gvec3 gi_hit_radiance( const giBake &bake, const giHit &hit, int styleValue ) {
+	const giScene &scene = bake.scene;
+	const giTri &t = scene.tris[hit.tri];
+	const giSurf &s = scene.surfs[t.surf];
+	if ( s.sky )
+		return styleValue == 0 ? bake.skyColor : gvec3();
+
+	const giVert &a = scene.verts[t.vert[0]];
+	const giVert &b = scene.verts[t.vert[1]];
+	const giVert &c = scene.verts[t.vert[2]];
+	const float w0 = 1 - hit.u - hit.v, w1 = hit.u, w2 = hit.v;
+
+	// the slot of the hit surface that carries the same light style
+	int slot = -1;
+	for ( int k = 0; k < MAXLIGHTMAPS; k++ ) {
+		if ( s.lightmapStyle[k] == styleValue ) {
+			slot = k;
+			break;
+		}
+	}
+	if ( slot < 0 )
+		return gvec3();
+
+	gvec3 L;
+	const int page = s.lightmapNum[slot];
+	if ( page >= 0 && page < bake.numPages ) {
+		const float fx = ( a.lm[slot][0] * w0 + b.lm[slot][0] * w1 + c.lm[slot][0] * w2 ) * DEVOGI_LM_SIZE;
+		const float fy = ( a.lm[slot][1] * w0 + b.lm[slot][1] * w1 + c.lm[slot][1] * w2 ) * DEVOGI_LM_SIZE;
+		const int x = Com_Clampi( 0, DEVOGI_LM_SIZE - 1, (int)fx );
+		const int y = Com_Clampi( 0, DEVOGI_LM_SIZE - 1, (int)fy );
+		const float *px = &bake.light[( ( page * DEVOGI_LM_SIZE + y ) * DEVOGI_LM_SIZE + x ) * 3];
+		L = gvec3( px[0], px[1], px[2] );
+	}
+	else if ( page == LIGHTMAP_BY_VERTEX ) {
+		L = gvec3( a.color[slot][0] * w0 + b.color[slot][0] * w1 + c.color[slot][0] * w2,
+				   a.color[slot][1] * w0 + b.color[slot][1] * w1 + c.color[slot][1] * w2,
+				   a.color[slot][2] * w0 + b.color[slot][2] * w1 + c.color[slot][2] * w2 );
+	}
+	return L * scene.shaders[s.shader].albedo;
+}
+
+template<typename F>
+static void gi_parallel_for( int count, F func ) {
+	int threads = r_devoGI_threads->integer;
+	if ( threads <= 0 )
+		threads = (int)std::thread::hardware_concurrency();
+	threads = Com_Clampi( 1, 64, threads );
+
+	std::atomic<int> next( 0 );
+	auto worker = [&]() {
+		while ( 1 ) {
+			const int start = next.fetch_add( 256 );
+			if ( start >= count )
+				break;
+			const int end = Q_min( count, start + 256 );
+			for ( int i = start; i < end; i++ )
+				func( i );
+		}
+	};
+	std::vector<std::thread> pool;
+	for ( int i = 1; i < threads; i++ )
+		pool.emplace_back( worker );
+	worker();
+	for ( std::thread &t : pool )
+		t.join();
+}
+
+static void gi_entity_direct( giBake &bake, const std::vector<giPointLight> &lights ) {
+	const giScene &scene = bake.scene;
+	gi_parallel_for( (int)bake.texels.size(), [&]( int i ) {
+		const giTexel &tx = bake.texels[i];
+		if ( tx.styleValue != 0 )
+			return;
+		gvec3 sum;
+		const gvec3 o = tx.pos + tx.normal * 0.5f;
+		for ( const giPointLight &l : lights ) {
+			gvec3 d = l.origin - o;
+			float dist2 = gdot( d, d );
+			if ( dist2 > l.radius * l.radius || dist2 < 1.0f )
+				continue;
+			float dist = sqrtf( dist2 );
+			d = d * ( 1.0f / dist );
+			float cosT = gdot( d, tx.normal );
+			if ( cosT <= 0 )
+				continue;
+			giHit hit;
+			if ( gi_trace( scene, o, d, dist - 1.0f, hit, true ) )
+				continue;
+			float atten = l.linear ? Q_max( 0.0f, 1.0f - dist / l.radius ) : 1.0f / dist2;
+			sum += l.color * ( atten * cosT );
+		}
+		float *px = &bake.direct[( ( tx.page * DEVOGI_LM_SIZE + tx.y ) * DEVOGI_LM_SIZE + tx.x ) * 3];
+		// the lightmap may already hold these lights: keep the brighter, never add twice
+		px[0] = Q_max( px[0], sum.x );
+		px[1] = Q_max( px[1], sum.y );
+		px[2] = Q_max( px[2], sum.z );
+	} );
+}
+
+static void gi_gather( giBake &bake, int rays ) {
+	const giScene &scene = bake.scene;
+	bake.indirect.assign( bake.texels.size() * 3, 0.0f );
+	gi_parallel_for( (int)bake.texels.size(), [&]( int i ) {
+		const giTexel &tx = bake.texels[i];
+		gvec3 t, b;
+		gi_basis( tx.normal, t, b );
+		uint32_t rng = gi_hash( (uint32_t)i * 9781u + 1u );
+		const gvec3 o = tx.pos + tx.normal * 0.5f;
+		gvec3 sum;
+		for ( int r = 0; r < rays; r++ ) {
+			// cosine weighted hemisphere sample
+			const float u1 = gi_rand( rng ), u2 = gi_rand( rng );
+			const float rr = sqrtf( u1 ), phi = 6.2831853f * u2;
+			const float lx = rr * cosf( phi ), ly = rr * sinf( phi ), lz = sqrtf( Q_max( 0.0f, 1.0f - u1 ) );
+			const gvec3 d = gnorm( t * lx + b * ly + tx.normal * lz );
+			giHit hit;
+			if ( !gi_trace( scene, o, d, 8192.0f, hit, false ) )
+				continue;	// escaped the map
+			const giTri &ht = scene.tris[hit.tri];
+			if ( !scene.surfs[ht.surf].sky && gdot( ht.n, d ) > 0 )
+				continue;	// hit the back of a surface: inside geometry, no light
+			sum += gi_hit_radiance( bake, hit, tx.styleValue );
+		}
+		const float inv = 1.0f / rays;
+		bake.indirect[i * 3 + 0] = sum.x * inv;
+		bake.indirect[i * 3 + 1] = sum.y * inv;
+		bake.indirect[i * 3 + 2] = sum.z * inv;
+	} );
+}
+
+// smooth the noisy bounce light: 5x5 filter over texels of the same surface with similar normals
+static void gi_denoise( giBake &bake ) {
+	std::vector<float> out( bake.indirect.size() );
+	gi_parallel_for( (int)bake.texels.size(), [&]( int i ) {
+		const giTexel &tx = bake.texels[i];
+		gvec3 sum;
+		float wsum = 0;
+		for ( int dy = -2; dy <= 2; dy++ ) {
+			for ( int dx = -2; dx <= 2; dx++ ) {
+				const int x = tx.x + dx, y = tx.y + dy;
+				if ( x < 0 || y < 0 || x >= DEVOGI_LM_SIZE || y >= DEVOGI_LM_SIZE )
+					continue;
+				const int o = bake.owner[( tx.page * DEVOGI_LM_SIZE + y ) * DEVOGI_LM_SIZE + x];
+				if ( o < 0 )
+					continue;
+				const giTexel &ot = bake.texels[o];
+				if ( ot.surf != tx.surf && gdot( ot.normal, tx.normal ) < 0.9f )
+					continue;
+				const float w = ( 1.0f / ( 1.0f + dx * dx + dy * dy ) ) * Q_max( 0.0f, gdot( ot.normal, tx.normal ) );
+				sum += gvec3( &bake.indirect[o * 3] ) * w;
+				wsum += w;
+			}
+		}
+		if ( wsum > 0 )
+			sum = sum * ( 1.0f / wsum );
+		out[i * 3 + 0] = sum.x;
+		out[i * 3 + 1] = sum.y;
+		out[i * 3 + 2] = sum.z;
+	} );
+	bake.indirect.swap( out );
+}
+
+static void gi_compose( giBake &bake, float intensity ) {
+	bake.light = bake.direct;
+	for ( size_t i = 0; i < bake.texels.size(); i++ ) {
+		const giTexel &tx = bake.texels[i];
+		float *px = &bake.light[( ( tx.page * DEVOGI_LM_SIZE + tx.y ) * DEVOGI_LM_SIZE + tx.x ) * 3];
+		px[0] += bake.indirect[i * 3 + 0] * intensity;
+		px[1] += bake.indirect[i * 3 + 1] * intensity;
+		px[2] += bake.indirect[i * 3 + 2] * intensity;
+	}
+}
+
+// spread lit texels 2px into empty neighbours so bilinear filtering does not pull in black
+static void gi_dilate( giBake &bake, std::vector<float> &img ) {
+	std::vector<char> filled( bake.owner.size() );
+	for ( size_t i = 0; i < bake.owner.size(); i++ )
+		filled[i] = bake.owner[i] >= 0;
+	for ( int pass = 0; pass < 2; pass++ ) {
+		std::vector<char> next = filled;
+		for ( int p = 0; p < bake.numPages; p++ ) {
+			for ( int y = 0; y < DEVOGI_LM_SIZE; y++ ) {
+				for ( int x = 0; x < DEVOGI_LM_SIZE; x++ ) {
+					const int pix = ( p * DEVOGI_LM_SIZE + y ) * DEVOGI_LM_SIZE + x;
+					if ( filled[pix] )
+						continue;
+					float s[3] = { 0, 0, 0 };
+					int n = 0;
+					for ( int dy = -1; dy <= 1; dy++ ) {
+						for ( int dx = -1; dx <= 1; dx++ ) {
+							const int xx = x + dx, yy = y + dy;
+							if ( xx < 0 || yy < 0 || xx >= DEVOGI_LM_SIZE || yy >= DEVOGI_LM_SIZE )
+								continue;
+							const int q = ( p * DEVOGI_LM_SIZE + yy ) * DEVOGI_LM_SIZE + xx;
+							if ( !filled[q] )
+								continue;
+							s[0] += img[q * 3]; s[1] += img[q * 3 + 1]; s[2] += img[q * 3 + 2];
+							n++;
+						}
+					}
+					if ( n ) {
+						img[pix * 3] = s[0] / n; img[pix * 3 + 1] = s[1] / n; img[pix * 3 + 2] = s[2] / n;
+						next[pix] = 1;
+					}
+				}
+			}
+		}
+		filled.swap( next );
+	}
+}
+
+/*
+===========================================================================
+Cache file
+===========================================================================
+*/
+
+#pragma pack(push, 1)
+struct devogiHeader_t {
+	char		magic[4];		// "DVGI"
+	int32_t		version;
+	uint64_t	bspHash;
+	uint64_t	settingsHash;
+	int32_t		lightmapBytes;
+};
+#pragma pack(pop)
+
+static uint64_t gi_fnv( uint64_t h, const void *data, size_t len ) {
+	const byte *p = (const byte *)data;
+	for ( size_t i = 0; i < len; i++ ) {
+		h ^= p[i];
+		h *= 1099511628211ULL;
+	}
+	return h;
+}
+
+static uint64_t gi_bsp_hash( const byte *fileBase, const dheader_t *header ) {
+	uint64_t h = 1469598103934665603ULL;
+	for ( int i = 0; i < HEADER_LUMPS; i++ ) {
+		const lump_t &l = header->lumps[i];
+		h = gi_fnv( h, &l.filelen, sizeof( l.filelen ) );
+		if ( l.filelen > 0 )
+			h = gi_fnv( h, fileBase + l.fileofs, l.filelen );
+	}
+	return h;
+}
+
+static uint64_t gi_settings_hash( void ) {
+	char buf[256];
+	Com_sprintf( buf, sizeof( buf ), "v%d r%d b%d i%g s%g e%d", DEVOGI_VERSION,
+		Com_Clampi( 8, 1024, r_devoGI_rays->integer ), Com_Clampi( 1, 4, r_devoGI_bounces->integer ),
+		r_devoGI_intensity->value, r_devoGI_sky->value, r_devoGI_entityLights->integer );
+	return gi_fnv( 1469598103934665603ULL, buf, strlen( buf ) );
+}
+
+static void gi_cache_name( const char *mapName, char *out, int outSize ) {
+	char base[MAX_QPATH];
+	COM_StripExtension( mapName, base, sizeof( base ) );
+	Com_sprintf( out, outSize, "%s.devogi", base );
+}
+
+/*
+===========================================================================
+R_DevoGI_Process
+
+Returns a Z_Malloc'd copy of the lightmap lump with bounce light added
+(same size and layout), or NULL to keep the original lightmaps.
+===========================================================================
+*/
+
+byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader_t *header )
+{
+	if ( !r_devoGI || !r_devoGI->integer )
+		return NULL;
+
+	const lump_t &ll = header->lumps[LUMP_LIGHTMAPS];
+	const int pageBytes = DEVOGI_LM_SIZE * DEVOGI_LM_SIZE * 3;
+	if ( ll.filelen < pageBytes )
+		return NULL;	// external or no lightmaps: not supported yet
+	const int numPages = ll.filelen / pageBytes;
+	const byte *srcLightmaps = fileBase + ll.fileofs;
+
+	char cacheName[MAX_QPATH];
+	gi_cache_name( mapName, cacheName, sizeof( cacheName ) );
+	const uint64_t bspHash = gi_bsp_hash( fileBase, header );
+	const uint64_t settingsHash = gi_settings_hash();
+
+	// 1. cached bake for this exact BSP and these settings?
+	if ( !r_devoGI_rebuild->integer ) {
+		void *cache = NULL;
+		const int len = ri.FS_ReadFile( cacheName, &cache );
+		if ( cache ) {
+			const devogiHeader_t *h = (const devogiHeader_t *)cache;
+			if ( len == (int)sizeof( devogiHeader_t ) + ll.filelen
+				&& !memcmp( h->magic, "DVGI", 4 ) && h->version == DEVOGI_VERSION
+				&& h->bspHash == bspHash && h->settingsHash == settingsHash
+				&& h->lightmapBytes == ll.filelen ) {
+				byte *out = (byte *)Z_Malloc( ll.filelen, TAG_BSP, qfalse );
+				memcpy( out, (const byte *)cache + sizeof( devogiHeader_t ), ll.filelen );
+				ri.FS_FreeFile( cache );
+				ri.Printf( PRINT_ALL, "DevoGI: using baked lighting from %s\n", cacheName );
+				return out;
+			}
+			ri.FS_FreeFile( cache );
+			ri.Printf( PRINT_ALL, "DevoGI: %s is out of date (map or settings changed), rebaking\n", cacheName );
+		}
+	}
+	ri.Cvar_Set( "r_devoGI_rebuild", "0" );
+
+	// 2. bake
+	const int startTime = ri.Milliseconds();
+	const int rays = Com_Clampi( 8, 1024, r_devoGI_rays->integer );
+	const int bounces = Com_Clampi( 1, 4, r_devoGI_bounces->integer );
+	const float intensity = Q_max( 0.0f, r_devoGI_intensity->value );
+
+	giBake *bakePtr = new giBake();
+	giBake &bake = *bakePtr;
+	bake.numPages = numPages;
+
+	// shaders
+	{
+		const lump_t &l = header->lumps[LUMP_SHADERS];
+		const dshader_t *in = (const dshader_t *)( fileBase + l.fileofs );
+		const int count = l.filelen / sizeof( dshader_t );
+		bake.scene.shaders.resize( Q_max( 1, count ) );
+		for ( int i = 0; i < count; i++ ) {
+			giShader &s = bake.scene.shaders[i];
+			s.surfaceFlags = LittleLong( in[i].surfaceFlags );
+			s.contentFlags = LittleLong( in[i].contentFlags );
+			s.albedo = ( s.surfaceFlags & SURF_SKY ) ? gvec3() : gi_shader_albedo( in[i].shader );
+		}
+	}
+
+	// sky: tinted by the sun colour of the sky shader (q3map_sun / q3map_sunExt), if any
+	{
+		gvec3 tint( 1, 1, 1 );
+		const lump_t &l = header->lumps[LUMP_SHADERS];
+		const dshader_t *in = (const dshader_t *)( fileBase + l.fileofs );
+		const int count = l.filelen / sizeof( dshader_t );
+		for ( int i = 0; i < count; i++ ) {
+			if ( !( LittleLong( in[i].surfaceFlags ) & SURF_SKY ) )
+				continue;
+			if ( gi_sky_sun_color( in[i].shader, tint ) )
+				break;
+		}
+		bake.skyColor = tint * ( 64.0f * Q_max( 0.0f, r_devoGI_sky->value ) );
+	}
+
+	gi_build_geometry( bake.scene, fileBase, header );
+	gi_build_bvh( bake.scene );
+	gi_build_texels( bake );
+
+	ri.Printf( PRINT_ALL, "DevoGI: baking %s: %d lightmap pages, %d texels, %d triangles, %d rays x %d bounces...\n",
+		mapName, numPages, (int)bake.texels.size(), (int)bake.scene.tris.size(), rays, bounces );
+
+	// direct light = the original lightmaps
+	bake.direct.resize( numPages * DEVOGI_LM_SIZE * DEVOGI_LM_SIZE * 3 );
+	for ( size_t i = 0; i < bake.direct.size(); i++ )
+		bake.direct[i] = srcLightmaps[i];
+
+	if ( r_devoGI_entityLights->integer ) {
+		std::vector<giPointLight> lights;
+		const lump_t &le = header->lumps[LUMP_ENTITIES];
+		gi_parse_lights( (const char *)( fileBase + le.fileofs ), le.filelen, lights );
+		if ( !lights.empty() ) {
+			ri.Printf( PRINT_ALL, "DevoGI: adding %d light entities from the BSP\n", (int)lights.size() );
+			gi_entity_direct( bake, lights );
+		}
+	}
+
+	bake.light = bake.direct;
+	for ( int b = 0; b < bounces; b++ ) {
+		gi_gather( bake, rays );
+		gi_denoise( bake );
+		gi_compose( bake, intensity );
+		ri.Printf( PRINT_ALL, "DevoGI: bounce %d/%d done (%.1fs)\n", b + 1, bounces, ( ri.Milliseconds() - startTime ) / 1000.0f );
+	}
+	gi_dilate( bake, bake.light );
+
+	// 3. back to lightmap bytes; colour-normalize instead of clipping to white
+	byte *out = (byte *)Z_Malloc( ll.filelen, TAG_BSP, qfalse );
+	memcpy( out, srcLightmaps, ll.filelen );	// keeps deluxemap pages untouched
+	for ( size_t pix = 0; pix < bake.owner.size(); pix++ ) {
+		float r = bake.light[pix * 3], g = bake.light[pix * 3 + 1], bl = bake.light[pix * 3 + 2];
+		const float m = Q_max( r, Q_max( g, bl ) );
+		if ( m > 255.0f ) { const float s = 255.0f / m; r *= s; g *= s; bl *= s; }
+		out[pix * 3 + 0] = (byte)Com_Clampi( 0, 255, (int)( r + 0.5f ) );
+		out[pix * 3 + 1] = (byte)Com_Clampi( 0, 255, (int)( g + 0.5f ) );
+		out[pix * 3 + 2] = (byte)Com_Clampi( 0, 255, (int)( bl + 0.5f ) );
+	}
+
+	// deluxemap pages are never referenced by surfaces; restore them byte-for-byte
+	{
+		std::vector<char> used( numPages, 0 );
+		for ( const giSurf &s : bake.scene.surfs )
+			for ( int k = 0; k < MAXLIGHTMAPS; k++ )
+				if ( s.lightmapNum[k] >= 0 && s.lightmapNum[k] < numPages )
+					used[s.lightmapNum[k]] = 1;
+		for ( int p = 0; p < numPages; p++ )
+			if ( !used[p] )
+				memcpy( out + p * pageBytes, srcLightmaps + p * pageBytes, pageBytes );
+	}
+
+	delete bakePtr;
+
+	// 4. save the cache next to the map (in the home path)
+	{
+		const int fileLen = (int)sizeof( devogiHeader_t ) + ll.filelen;
+		byte *file = (byte *)Z_Malloc( fileLen, TAG_TEMP_WORKSPACE, qfalse );
+		devogiHeader_t *h = (devogiHeader_t *)file;
+		memcpy( h->magic, "DVGI", 4 );
+		h->version = DEVOGI_VERSION;
+		h->bspHash = bspHash;
+		h->settingsHash = settingsHash;
+		h->lightmapBytes = ll.filelen;
+		memcpy( file + sizeof( devogiHeader_t ), out, ll.filelen );
+		ri.FS_WriteFile( cacheName, file, fileLen );
+		Z_Free( file );
+	}
+
+	ri.Printf( PRINT_ALL, "DevoGI: baked %s in %.1fs, saved %s\n", mapName, ( ri.Milliseconds() - startTime ) / 1000.0f, cacheName );
+	return out;
+}

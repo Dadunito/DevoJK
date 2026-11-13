@@ -356,6 +356,14 @@ static	void R_LoadLightmaps( world_t &worldData, lump_t *l, lump_t *surfs ) {
 			numLightmaps++;
 	}
 
+	// DevoGI: bake (or load the cached) bounce light into the lightmap data before upload
+	byte *devoGILightmaps = NULL;
+	if ( buf ) {
+		devoGILightmaps = R_DevoGI_Process( worldData.name, fileBase, (const dheader_t *)fileBase );
+		if ( devoGILightmaps )
+			buf = devoGILightmaps;
+	}
+
 	imageSize = lightmapSize * lightmapSize * 4 * 2;
 	image = (byte *)Z_Malloc( imageSize, TAG_BSP, qfalse );
 
@@ -776,6 +784,9 @@ static	void R_LoadLightmaps( world_t &worldData, lump_t *l, lump_t *surfs ) {
 	}
 
 	Z_Free( image );
+
+	if ( devoGILightmaps )
+		Z_Free( devoGILightmaps );
 
 	if ( tr.deluxemaps )
 		tr.worldDeluxeMapping = qtrue;

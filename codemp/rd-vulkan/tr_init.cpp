@@ -1000,6 +1000,8 @@ void R_Register( void )
 	r_baseParallax						= ri.Cvar_Get("r_baseParallax",						"0.05",						CVAR_ARCHIVE | CVAR_LATCH, "" );	
 	r_baseSpecular						= ri.Cvar_Get("r_baseSpecular",						"0.04",						CVAR_ARCHIVE | CVAR_LATCH, "" );
 #ifdef VK_CUBEMAP
+	R_DevoGI_Register();
+
 	r_cubeMapping						= ri.Cvar_Get("r_cubeMapping",						"0",						CVAR_ARCHIVE | CVAR_LATCH, "" );
 #endif
 #ifdef VK_COMPUTE_NORMALMAP
