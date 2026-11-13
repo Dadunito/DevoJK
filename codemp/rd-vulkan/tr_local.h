@@ -2849,7 +2849,9 @@ qboolean ShaderHashTableExists(void);
 
 /*
 DevoJK: DevoGI (baked global illumination) and DevoLights (the map's own light
-sources), all in tr_devogi.cpp. How they plug into map loading:
+sources). The bake itself is devogi_core.cpp (shared with the DevoQ3Map2
+compiler's -devogi stage); tr_devogi.cpp connects it to the renderer.
+How they plug into map loading:
   RE_LoadWorldMap_Actual -> R_DevoLights_Extract   find the lamps and the sun
   R_LoadLightmaps        -> R_DevoGI_Process       bake (or load) the new lightmaps
   RE_LoadWorldMap_Actual -> R_DevoGI_PatchVertexColors  new vertex colours
