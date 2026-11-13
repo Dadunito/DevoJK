@@ -2849,8 +2849,9 @@ qboolean ShaderHashTableExists(void);
 
 // DevoGI baked global illumination (tr_devogi.cpp)
 void		R_DevoGI_Register( void );
-byte		*R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader_t *header );
+byte		*R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader_t *header, int maxScale, int *outPageSize );
 const char	*R_DevoGI_FindShaderText( const char *shaderName );
+void		R_DevoGI_PatchVertexColors( byte *fileBase, const dheader_t *header );
 
 // Vulkan
 void		RB_AddDrawItem( Pass *pass, const DrawItem& drawItem );

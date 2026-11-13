@@ -277,7 +277,7 @@ static	void R_LoadLightmaps( world_t &worldData, lump_t *l, lump_t *surfs ) {
 	int numColorComponents = 3;
 	int textureInternalFormat = 0;
 
-	const int lightmapSize = DEFAULT_LIGHTMAP_SIZE;
+	int lightmapSize = DEFAULT_LIGHTMAP_SIZE;	// DevoGI may bake larger pages
 	tr.hdrLighting = qfalse;
 	tr.worldInternalLightmapping = qfalse;
 
@@ -357,11 +357,23 @@ static	void R_LoadLightmaps( world_t &worldData, lump_t *l, lump_t *surfs ) {
 	}
 
 	// DevoGI: bake (or load the cached) bounce light into the lightmap data before upload
+	// it may bake at a higher resolution, as long as the lightmap atlas still fits the GPU
 	byte *devoGILightmaps = NULL;
 	if ( buf ) {
-		devoGILightmaps = R_DevoGI_Process( worldData.name, fileBase, (const dheader_t *)fileBase );
-		if ( devoGILightmaps )
+		const int atlasPages = tr.worldDeluxeMapping ? ( numLightmaps >> 1 ) : numLightmaps;
+		int perX = 1;
+		while ( perX < (int)ceilf( sqrtf( (float)atlasPages ) ) )
+			perX *= 2;
+		const int perY = (int)ceilf( (float)atlasPages / perX );
+		const int maxSide = Q_max( perX, perY ) * DEFAULT_LIGHTMAP_SIZE;
+		const int maxScale = Q_max( 1, glConfig.maxTextureSize / Q_max( 1, maxSide ) );
+
+		int pageSize = DEFAULT_LIGHTMAP_SIZE;
+		devoGILightmaps = R_DevoGI_Process( worldData.name, fileBase, (const dheader_t *)fileBase, maxScale, &pageSize );
+		if ( devoGILightmaps ) {
 			buf = devoGILightmaps;
+			lightmapSize = pageSize;
+		}
 	}
 
 	imageSize = lightmapSize * lightmapSize * 4 * 2;
@@ -381,8 +393,8 @@ static	void R_LoadLightmaps( world_t &worldData, lump_t *l, lump_t *surfs ) {
 		tr.lightmapsPerAtlasSide[0] = lightmapsPerX;
 		tr.lightmapsPerAtlasSide[1] = (int)ceilf((float)numLightmaps / lightmapsPerX);
 
-		tr.lightmapAtlasSize[0] = tr.lightmapsPerAtlasSide[0] * LIGHTMAP_WIDTH;
-		tr.lightmapAtlasSize[1] = tr.lightmapsPerAtlasSide[1] * LIGHTMAP_HEIGHT;
+		tr.lightmapAtlasSize[0] = tr.lightmapsPerAtlasSide[0] * lightmapSize;
+		tr.lightmapAtlasSize[1] = tr.lightmapsPerAtlasSide[1] * lightmapSize;
 
 		// FIXME: What happens if we need more?
 		tr.numLightmaps = 1;
@@ -3223,6 +3235,7 @@ void RE_LoadWorldMap_Actual( const char *name, world_t &worldData, int index )
 	R_LoadLightmaps( worldData, &header->lumps[LUMP_LIGHTMAPS], &header->lumps[LUMP_SURFACES] );
 	R_LoadPlanes (&header->lumps[LUMP_PLANES], worldData);
 	R_LoadFogs( &header->lumps[LUMP_FOGS], &header->lumps[LUMP_BRUSHES], &header->lumps[LUMP_BRUSHSIDES], worldData, index );
+	R_DevoGI_PatchVertexColors( fileBase, header );	// baked GI for vertex-lit models
 	R_LoadSurfaces( &header->lumps[LUMP_SURFACES], &header->lumps[LUMP_DRAWVERTS], &header->lumps[LUMP_DRAWINDEXES], worldData, index );
 	R_LoadMarksurfaces (&header->lumps[LUMP_LEAFSURFACES], worldData);
 	R_LoadNodesAndLeafs (&header->lumps[LUMP_NODES], &header->lumps[LUMP_LEAFS], worldData);

@@ -36,9 +36,17 @@ This file is part of DevoJK, licensed under GPLv2.
 #include <thread>
 #include <vector>
 
-#define DEVOGI_VERSION		2
-#define DEVOGI_LM_SIZE		128
-#define DEVOGI_PATCH_STEPS	8
+#define DEVOGI_VERSION		4
+#define DEVOGI_BSP_LM_SIZE	128			// lightmap page size stored in the BSP
+#define DEVOGI_LM_SIZE		gi_lmSize	// page size being baked (BSP size * r_devoGI_scale)
+
+static int gi_lmSize = DEVOGI_BSP_LM_SIZE;
+
+// new style-0 vertex colours (rgba per draw vert) for vertex-lit surfaces, applied by
+// R_DevoGI_PatchVertexColors right before the renderer loads the map surfaces
+static std::vector<byte> gi_vertexColors;
+#define DEVOGI_PATCH_STEPS	16
+#define DEVOGI_RAY_TMIN		1.5f	// ignore hits closer than this: tessellated curves would self-occlude
 #define DEVOGI_INF			1e30f
 
 static cvar_t *r_devoGI;
@@ -53,6 +61,7 @@ static cvar_t *r_devoGI_ao;
 static cvar_t *r_devoGI_aoDirect;
 static cvar_t *r_devoGI_aoDistance;
 static cvar_t *r_devoGI_saturation;
+static cvar_t *r_devoGI_scale;
 
 void R_DevoGI_Register( void )
 {
@@ -65,8 +74,9 @@ void R_DevoGI_Register( void )
 	r_devoGI_threads		= ri.Cvar_Get( "r_devoGI_threads",		"0",	CVAR_ARCHIVE, "DevoGI bake threads (0 = all CPU cores)" );
 	r_devoGI_rebuild		= ri.Cvar_Get( "r_devoGI_rebuild",		"0",	CVAR_TEMP, "Set to 1 to force DevoGI to rebake the next map that loads" );
 	r_devoGI_ao				= ri.Cvar_Get( "r_devoGI_ao",			"1.0",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI ambient occlusion on the bounce light: keeps corners and crevices dark (0 = off, 1 = full, up to 2)" );
-	r_devoGI_aoDirect		= ri.Cvar_Get( "r_devoGI_aoDirect",		"0.3",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI ambient occlusion on the original lightmap light, for contact shadows (0 = off, 1 = full)" );
-	r_devoGI_aoDistance		= ri.Cvar_Get( "r_devoGI_aoDistance",	"96",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI ambient occlusion range in game units" );
+	r_devoGI_aoDirect		= ri.Cvar_Get( "r_devoGI_aoDirect",		"0.15",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI ambient occlusion on the original lightmap light, for contact shadows (0 = off, 1 = full)" );
+	r_devoGI_aoDistance		= ri.Cvar_Get( "r_devoGI_aoDistance",	"64",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI ambient occlusion range in game units" );
+	r_devoGI_scale			= ri.Cvar_Get( "r_devoGI_scale",		"2",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI lightmap resolution multiplier (1, 2 or 4). Higher gives smoother, sharper corners but bakes slower; limited by the GPU's max texture size" );
 	r_devoGI_saturation		= ri.Cvar_Get( "r_devoGI_saturation",	"1.6",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI colour bleeding strength: saturation of light reflected off surfaces (1 = texture average colour)" );
 }
 
@@ -410,7 +420,7 @@ struct giHit {
 };
 
 // nearest occluder hit along the ray; anyHit stops at the first one (shadow rays)
-static bool gi_trace( const giScene &scene, const gvec3 &o, const gvec3 &d, float tmax, giHit &hit, bool anyHit ) {
+static bool gi_trace( const giScene &scene, const gvec3 &o, const gvec3 &d, float tmax, giHit &hit, bool anyHit, float tmin = 0.01f ) {
 	if ( scene.nodes.empty() )
 		return false;
 	gvec3 inv( 1.0f / ( fabsf( d.x ) > 1e-9f ? d.x : 1e-9f ),
@@ -447,7 +457,7 @@ static bool gi_trace( const giScene &scene, const gvec3 &o, const gvec3 &d, floa
 				if ( v < 0 || u + v > 1 )
 					continue;
 				float tt = gdot( t.e2, q ) * idet;
-				if ( tt > 0.01f && tt < hit.t ) {
+				if ( tt > tmin && tt < hit.t ) {
 					hit.t = tt;
 					hit.tri = ti;
 					hit.u = u;
@@ -643,7 +653,9 @@ Lightmap texels
 
 struct giTexel {
 	gvec3	pos;
-	gvec3	normal;
+	gvec3	normal;		// smoothed shading normal
+	gvec3	faceNormal;	// normal of the triangle it lies on (for ray offsets)
+	bool	edge;		// centre lies just outside its triangle (lightmap border)
 	int		page;
 	int		x, y;
 	int		style;		// lightmap style slot of the owning surface (0..3)
@@ -655,6 +667,8 @@ struct giBake {
 	giScene						scene;
 	std::vector<giTexel>		texels;
 	std::vector<int>			owner;		// per page pixel: texel index or -1
+	std::vector<int>			bspSurf;	// per original 128x128 page pixel: owning surface or -1
+												// (-1 also for border texels buried in a wall: q3map2 left them dark)
 	std::vector<float>			direct;		// per page pixel rgb
 	std::vector<float>			light;		// current total light, per page pixel rgb
 	std::vector<float>			indirect;	// per texel rgb + ambient occlusion (4 floats)
@@ -703,6 +717,8 @@ static void gi_rasterize_tri( giBake &bake, const giTri &t, int style, int page 
 			tx.normal = gnorm( v[0]->normal * w0 + v[1]->normal * w1 + v[2]->normal * w2 );
 			if ( gdot( tx.normal, t.n ) < 0.2f )
 				tx.normal = t.n;	// bad smoothing normals: fall back to the face normal
+			tx.faceNormal = t.n;
+			tx.edge = !inside;
 			tx.page = page;
 			tx.x = x;
 			tx.y = y;
@@ -736,6 +752,132 @@ static void gi_build_texels( giBake &bake ) {
 			gi_rasterize_tri( bake, t, k, page );
 		}
 	}
+}
+
+/*
+===========================================================================
+Upsampling the original lightmaps to the bake resolution
+===========================================================================
+*/
+
+template<typename F>
+static void gi_parallel_for( int count, F func );
+
+// plain bilinear sample of an original 128x128 page (clamped at the page edge)
+static void gi_sample_bsp_page( const byte *src, int page, float fx, float fy, float out[3] ) {
+	const int N = DEVOGI_BSP_LM_SIZE;
+	fx = Com_Clamp( 0.0f, (float)( N - 1 ), fx );
+	fy = Com_Clamp( 0.0f, (float)( N - 1 ), fy );
+	const int x0 = (int)fx, y0 = (int)fy;
+	const int x1 = Q_min( N - 1, x0 + 1 ), y1 = Q_min( N - 1, y0 + 1 );
+	const float ax = fx - x0, ay = fy - y0;
+	const byte *p00 = src + ( ( page * N + y0 ) * N + x0 ) * 3;
+	const byte *p10 = src + ( ( page * N + y0 ) * N + x1 ) * 3;
+	const byte *p01 = src + ( ( page * N + y1 ) * N + x0 ) * 3;
+	const byte *p11 = src + ( ( page * N + y1 ) * N + x1 ) * 3;
+	for ( int c = 0; c < 3; c++ )
+		out[c] = ( p00[c] * ( 1 - ax ) + p10[c] * ax ) * ( 1 - ay ) + ( p01[c] * ( 1 - ax ) + p11[c] * ax ) * ay;
+}
+
+// the original 128 owner map: which surface each BSP lightmap texel belongs to
+static void gi_build_bsp_owner( giBake &bake ) {
+	const int saved = gi_lmSize;
+	gi_lmSize = DEVOGI_BSP_LM_SIZE;
+	std::vector<giTexel> savedTexels;
+	savedTexels.swap( bake.texels );
+	gi_build_texels( bake );
+	bake.bspSurf.assign( bake.owner.size(), -1 );
+
+	// a border texel whose centre ended up inside neighbouring geometry was lit as
+	// black by q3map2 (the dark seams along corners): leave those out of the upscale
+	const giScene &scene = bake.scene;
+	std::vector<char> buried( bake.texels.size(), 0 );
+	gi_parallel_for( (int)bake.texels.size(), [&]( int i ) {
+		const giTexel &tx = bake.texels[i];
+		if ( !tx.edge )
+			return;
+		gvec3 t, b;
+		gi_basis( tx.faceNormal, t, b );
+		const gvec3 o = tx.pos + tx.faceNormal * 0.25f;
+		const gvec3 dirs[5] = { tx.faceNormal, t, t * -1.0f, b, b * -1.0f };
+		for ( const gvec3 &d : dirs ) {
+			giHit hit;
+			if ( gi_trace( scene, o, d, 4.0f, hit, false ) && !scene.surfs[scene.tris[hit.tri].surf].sky
+				&& gdot( scene.tris[hit.tri].n, d ) > 0 ) {
+				buried[i] = 1;	// hit the back of a wall from inside it
+				return;
+			}
+		}
+	} );
+
+	for ( size_t i = 0; i < bake.owner.size(); i++ )
+		if ( bake.owner[i] >= 0 && !buried[bake.owner[i]] )
+			bake.bspSurf[i] = bake.texels[bake.owner[i]].surf;
+	bake.texels.swap( savedTexels );
+	bake.owner.clear();
+	gi_lmSize = saved;
+}
+
+// direct light at bake resolution: bilinear over the original texels of the same
+// surface only, so light never bleeds between neighbouring surfaces in the page
+static void gi_upsample_direct( giBake &bake, const byte *src ) {
+	const int N = DEVOGI_BSP_LM_SIZE;
+	const float scale = (float)DEVOGI_LM_SIZE / N;
+	bake.direct.assign( (size_t)bake.numPages * DEVOGI_LM_SIZE * DEVOGI_LM_SIZE * 3, 0.0f );
+
+	gi_parallel_for( bake.numPages * DEVOGI_LM_SIZE, [&]( int row ) {
+		const int page = row / DEVOGI_LM_SIZE;
+		const int y = row % DEVOGI_LM_SIZE;
+		for ( int x = 0; x < DEVOGI_LM_SIZE; x++ ) {
+			const int pix = ( page * DEVOGI_LM_SIZE + y ) * DEVOGI_LM_SIZE + x;
+			float *out = &bake.direct[(size_t)pix * 3];
+			const float fx = ( x + 0.5f ) / scale - 0.5f;
+			const float fy = ( y + 0.5f ) / scale - 0.5f;
+			const int owner = bake.owner[pix];
+			if ( owner < 0 ) {
+				gi_sample_bsp_page( src, page, fx, fy, out );
+				continue;
+			}
+			const int surf = bake.texels[owner].surf;
+			const int x0 = (int)floorf( fx ), y0 = (int)floorf( fy );
+			const float ax = fx - x0, ay = fy - y0;
+			float sum[3] = { 0, 0, 0 }, wsum = 0;
+			for ( int j = 0; j < 2; j++ ) {
+				for ( int i = 0; i < 2; i++ ) {
+					const int sx = Com_Clampi( 0, N - 1, x0 + i ), sy = Com_Clampi( 0, N - 1, y0 + j );
+					if ( bake.bspSurf[( page * N + sy ) * N + sx] != surf )
+						continue;
+					const float w = ( i ? ax : 1 - ax ) * ( j ? ay : 1 - ay ) + 1e-4f;
+					const byte *p = src + ( ( page * N + sy ) * N + sx ) * 3;
+					sum[0] += p[0] * w; sum[1] += p[1] * w; sum[2] += p[2] * w;
+					wsum += w;
+				}
+			}
+			if ( wsum <= 0 ) {
+				// no good texel of this surface in the 2x2: widen to 5x5 (skips buried seams)
+				const int cx = (int)( fx + 0.5f ), cy = (int)( fy + 0.5f );
+				for ( int j = -2; j <= 2; j++ ) {
+					for ( int i = -2; i <= 2; i++ ) {
+						const int sx = Com_Clampi( 0, N - 1, cx + i ), sy = Com_Clampi( 0, N - 1, cy + j );
+						if ( bake.bspSurf[( page * N + sy ) * N + sx] != surf )
+							continue;
+						const float w = 1.0f / ( 1.0f + i * i + j * j );
+						const byte *p = src + ( ( page * N + sy ) * N + sx ) * 3;
+						sum[0] += p[0] * w; sum[1] += p[1] * w; sum[2] += p[2] * w;
+						wsum += w;
+					}
+				}
+			}
+			if ( wsum > 0 ) {
+				out[0] = sum[0] / wsum; out[1] = sum[1] / wsum; out[2] = sum[2] / wsum;
+			} else {
+				// still nothing: take the nearest original texel
+				const int sx = Com_Clampi( 0, N - 1, (int)( fx + 0.5f ) ), sy = Com_Clampi( 0, N - 1, (int)( fy + 0.5f ) );
+				const byte *p = src + ( ( page * N + sy ) * N + sx ) * 3;
+				out[0] = p[0]; out[1] = p[1]; out[2] = p[2];
+			}
+		}
+	} );
 }
 
 /*
@@ -844,41 +986,52 @@ static void gi_entity_direct( giBake &bake, const std::vector<giPointLight> &lig
 	} );
 }
 
-static void gi_gather( giBake &bake, int rays ) {
+// bounce light and ambient occlusion arriving at one point: out[0..2] rgb, out[3] = 1 open .. 0 enclosed
+static void gi_gather_point( const giBake &bake, const gvec3 &pos, const gvec3 &normal, const gvec3 &faceNormal,
+	int styleValue, uint32_t seed, int rays, float out[4] ) {
 	const giScene &scene = bake.scene;
 	const float aoDist = Q_max( 8.0f, r_devoGI_aoDistance->value );
+	gvec3 t, b;
+	gi_basis( normal, t, b );
+	uint32_t rng = gi_hash( seed );
+	// start just off the real face plane; the smoothed normal of a tessellated curve
+	// may point into neighbouring facets, which made striped occlusion on patches
+	const gvec3 o = pos + faceNormal * 1.0f;
+	gvec3 sum;
+	float occlusion = 0;
+	for ( int r = 0; r < rays; r++ ) {
+		// cosine weighted hemisphere sample around the shading normal
+		const float u1 = gi_rand( rng ), u2 = gi_rand( rng );
+		const float rr = sqrtf( u1 ), phi = 6.2831853f * u2;
+		const float lx = rr * cosf( phi ), ly = rr * sinf( phi ), lz = sqrtf( Q_max( 0.0f, 1.0f - u1 ) );
+		gvec3 d = gnorm( t * lx + b * ly + normal * lz );
+		const float below = gdot( d, faceNormal );
+		if ( below < 0 )
+			d = gnorm( d - faceNormal * ( 2.0f * below ) );	// mirror back above the face
+		giHit hit;
+		if ( !gi_trace( scene, o, d, 8192.0f, hit, false, DEVOGI_RAY_TMIN ) )
+			continue;	// escaped the map
+		const giTri &ht = scene.tris[hit.tri];
+		const bool sky = scene.surfs[ht.surf].sky;
+		// nearby geometry blocks light: ambient occlusion, fading out with distance
+		if ( !sky && hit.t < aoDist )
+			occlusion += 1.0f - hit.t / aoDist;
+		if ( !sky && gdot( ht.n, d ) > 0 )
+			continue;	// hit the back of a surface: inside geometry, no light
+		sum += gi_hit_radiance( bake, hit, styleValue );
+	}
+	const float inv = 1.0f / rays;
+	out[0] = sum.x * inv;
+	out[1] = sum.y * inv;
+	out[2] = sum.z * inv;
+	out[3] = 1.0f - occlusion * inv;
+}
+
+static void gi_gather( giBake &bake, int rays ) {
 	bake.indirect.assign( bake.texels.size() * 4, 0.0f );
 	gi_parallel_for( (int)bake.texels.size(), [&]( int i ) {
 		const giTexel &tx = bake.texels[i];
-		gvec3 t, b;
-		gi_basis( tx.normal, t, b );
-		uint32_t rng = gi_hash( (uint32_t)i * 9781u + 1u );
-		const gvec3 o = tx.pos + tx.normal * 0.5f;
-		gvec3 sum;
-		float occlusion = 0;
-		for ( int r = 0; r < rays; r++ ) {
-			// cosine weighted hemisphere sample
-			const float u1 = gi_rand( rng ), u2 = gi_rand( rng );
-			const float rr = sqrtf( u1 ), phi = 6.2831853f * u2;
-			const float lx = rr * cosf( phi ), ly = rr * sinf( phi ), lz = sqrtf( Q_max( 0.0f, 1.0f - u1 ) );
-			const gvec3 d = gnorm( t * lx + b * ly + tx.normal * lz );
-			giHit hit;
-			if ( !gi_trace( scene, o, d, 8192.0f, hit, false ) )
-				continue;	// escaped the map
-			const giTri &ht = scene.tris[hit.tri];
-			const bool sky = scene.surfs[ht.surf].sky;
-			// nearby geometry blocks light: ambient occlusion, fading out with distance
-			if ( !sky && hit.t < aoDist )
-				occlusion += 1.0f - hit.t / aoDist;
-			if ( !sky && gdot( ht.n, d ) > 0 )
-				continue;	// hit the back of a surface: inside geometry, no light
-			sum += gi_hit_radiance( bake, hit, tx.styleValue );
-		}
-		const float inv = 1.0f / rays;
-		bake.indirect[i * 4 + 0] = sum.x * inv;
-		bake.indirect[i * 4 + 1] = sum.y * inv;
-		bake.indirect[i * 4 + 2] = sum.z * inv;
-		bake.indirect[i * 4 + 3] = 1.0f - occlusion * inv;	// 1 = open, 0 = fully enclosed
+		gi_gather_point( bake, tx.pos, tx.normal, tx.faceNormal, tx.styleValue, (uint32_t)i * 9781u + 1u, rays, &bake.indirect[i * 4] );
 	} );
 }
 
@@ -990,6 +1143,8 @@ struct devogiHeader_t {
 	uint64_t	bspHash;
 	uint64_t	settingsHash;
 	int32_t		lightmapBytes;
+	int32_t		pageSize;		// baked page width/height (128 * scale)
+	int32_t		numVertexColors;// rgba entries after the lightmaps (one per draw vert, or 0)
 };
 #pragma pack(pop)
 
@@ -1013,12 +1168,12 @@ static uint64_t gi_bsp_hash( const byte *fileBase, const dheader_t *header ) {
 	return h;
 }
 
-static uint64_t gi_settings_hash( void ) {
+static uint64_t gi_settings_hash( int scale ) {
 	char buf[256];
-	Com_sprintf( buf, sizeof( buf ), "v%d r%d b%d i%g s%g e%d ao%g aod%g aor%g sat%g", DEVOGI_VERSION,
+	Com_sprintf( buf, sizeof( buf ), "v%d r%d b%d i%g s%g e%d ao%g aod%g aor%g sat%g x%d", DEVOGI_VERSION,
 		Com_Clampi( 8, 1024, r_devoGI_rays->integer ), Com_Clampi( 1, 4, r_devoGI_bounces->integer ),
 		r_devoGI_intensity->value, r_devoGI_sky->value, r_devoGI_entityLights->integer,
-		r_devoGI_ao->value, r_devoGI_aoDirect->value, r_devoGI_aoDistance->value, r_devoGI_saturation->value );
+		r_devoGI_ao->value, r_devoGI_aoDirect->value, r_devoGI_aoDistance->value, r_devoGI_saturation->value, scale );
 	return gi_fnv( 1469598103934665603ULL, buf, strlen( buf ) );
 }
 
@@ -1032,27 +1187,41 @@ static void gi_cache_name( const char *mapName, char *out, int outSize ) {
 ===========================================================================
 R_DevoGI_Process
 
-Returns a Z_Malloc'd copy of the lightmap lump with bounce light added
-(same size and layout), or NULL to keep the original lightmaps.
+Returns a Z_Malloc'd lightmap lump with bounce light added, in the BSP's
+page layout but with pages of *outPageSize (128 * scale) pixels, or NULL to
+keep the original lightmaps. maxScale is how far pages may grow before the
+renderer's lightmap atlas would exceed the GPU's texture size limit.
 ===========================================================================
 */
 
-byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader_t *header )
+byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader_t *header, int maxScale, int *outPageSize )
 {
+	*outPageSize = DEVOGI_BSP_LM_SIZE;
+	gi_vertexColors.clear();
 	if ( !r_devoGI || !r_devoGI->integer )
 		return NULL;
 
+	const int numDrawVerts = header->lumps[LUMP_DRAWVERTS].filelen / (int)sizeof( mapVert_t );
+
 	const lump_t &ll = header->lumps[LUMP_LIGHTMAPS];
-	const int pageBytes = DEVOGI_LM_SIZE * DEVOGI_LM_SIZE * 3;
-	if ( ll.filelen < pageBytes )
+	const int srcPageBytes = DEVOGI_BSP_LM_SIZE * DEVOGI_BSP_LM_SIZE * 3;
+	if ( ll.filelen < srcPageBytes )
 		return NULL;	// external or no lightmaps: not supported yet
-	const int numPages = ll.filelen / pageBytes;
+	const int numPages = ll.filelen / srcPageBytes;
 	const byte *srcLightmaps = fileBase + ll.fileofs;
+
+	// bake resolution: r_devoGI_scale rounded down to 1, 2 or 4, within the GPU limit
+	int scale = 1;
+	while ( scale * 2 <= Com_Clampi( 1, 4, r_devoGI_scale->integer ) && scale * 2 <= maxScale )
+		scale *= 2;
+	const int pageSize = DEVOGI_BSP_LM_SIZE * scale;
+	const int pageBytes = pageSize * pageSize * 3;
+	const int outBytes = numPages * pageBytes;
 
 	char cacheName[MAX_QPATH];
 	gi_cache_name( mapName, cacheName, sizeof( cacheName ) );
 	const uint64_t bspHash = gi_bsp_hash( fileBase, header );
-	const uint64_t settingsHash = gi_settings_hash();
+	const uint64_t settingsHash = gi_settings_hash( scale );
 
 	// 1. cached bake for this exact BSP and these settings?
 	if ( !r_devoGI_rebuild->integer ) {
@@ -1060,14 +1229,21 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 		const int len = ri.FS_ReadFile( cacheName, &cache );
 		if ( cache ) {
 			const devogiHeader_t *h = (const devogiHeader_t *)cache;
-			if ( len == (int)sizeof( devogiHeader_t ) + ll.filelen
+			if ( len >= (int)sizeof( devogiHeader_t )
 				&& !memcmp( h->magic, "DVGI", 4 ) && h->version == DEVOGI_VERSION
 				&& h->bspHash == bspHash && h->settingsHash == settingsHash
-				&& h->lightmapBytes == ll.filelen ) {
-				byte *out = (byte *)Z_Malloc( ll.filelen, TAG_BSP, qfalse );
-				memcpy( out, (const byte *)cache + sizeof( devogiHeader_t ), ll.filelen );
+				&& h->lightmapBytes == outBytes && h->pageSize == pageSize
+				&& ( h->numVertexColors == 0 || h->numVertexColors == numDrawVerts )
+				&& len == (int)sizeof( devogiHeader_t ) + outBytes + h->numVertexColors * 4 ) {
+				byte *out = (byte *)Z_Malloc( outBytes, TAG_BSP, qfalse );
+				memcpy( out, (const byte *)cache + sizeof( devogiHeader_t ), outBytes );
+				if ( h->numVertexColors ) {
+					const byte *vc = (const byte *)cache + sizeof( devogiHeader_t ) + outBytes;
+					gi_vertexColors.assign( vc, vc + h->numVertexColors * 4 );
+				}
 				ri.FS_FreeFile( cache );
-				ri.Printf( PRINT_ALL, "DevoGI: using baked lighting from %s\n", cacheName );
+				ri.Printf( PRINT_ALL, "DevoGI: using baked lighting from %s (%dx%d lightmaps)\n", cacheName, pageSize, pageSize );
+				*outPageSize = pageSize;
 				return out;
 			}
 			ri.FS_FreeFile( cache );
@@ -1128,15 +1304,15 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 
 	gi_build_geometry( bake.scene, fileBase, header );
 	gi_build_bvh( bake.scene );
-	gi_build_texels( bake );
+	gi_build_bsp_owner( bake );		// at the BSP's 128 resolution
+	gi_lmSize = pageSize;
+	gi_build_texels( bake );		// at bake resolution
 
-	ri.Printf( PRINT_ALL, "DevoGI: baking %s: %d lightmap pages, %d texels, %d triangles, %d rays x %d bounces...\n",
-		mapName, numPages, (int)bake.texels.size(), (int)bake.scene.tris.size(), rays, bounces );
+	ri.Printf( PRINT_ALL, "DevoGI: baking %s: %d lightmap pages at %dx%d, %d texels, %d triangles, %d rays x %d bounces...\n",
+		mapName, numPages, pageSize, pageSize, (int)bake.texels.size(), (int)bake.scene.tris.size(), rays, bounces );
 
-	// direct light = the original lightmaps
-	bake.direct.resize( numPages * DEVOGI_LM_SIZE * DEVOGI_LM_SIZE * 3 );
-	for ( size_t i = 0; i < bake.direct.size(); i++ )
-		bake.direct[i] = srcLightmaps[i];
+	// direct light = the original lightmaps, smoothly upsampled per surface
+	gi_upsample_direct( bake, srcLightmaps );
 
 	if ( r_devoGI_entityLights->integer ) {
 		std::vector<giPointLight> lights;
@@ -1157,9 +1333,63 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 	}
 	gi_dilate( bake, bake.light );
 
+	// vertex-lit surfaces (mostly models baked into the map) get the same bounce
+	// light and occlusion per vertex, written into their style 0 vertex colours
+	{
+		const lump_t &lv = header->lumps[LUMP_DRAWVERTS];
+		const lump_t &ls = header->lumps[LUMP_SURFACES];
+		const mapVert_t *dv = (const mapVert_t *)( fileBase + lv.fileofs );
+		const dsurface_t *ds = (const dsurface_t *)( fileBase + ls.fileofs );
+		const int numSurfs = ls.filelen / sizeof( dsurface_t );
+
+		std::vector<int> list;
+		std::vector<char> mark( numDrawVerts, 0 );
+		for ( int s = 0; s < numSurfs; s++ ) {
+			if ( LittleLong( ds[s].lightmapNum[0] ) != LIGHTMAP_BY_VERTEX || LittleLong( ds[s].surfaceType ) == MST_FLARE )
+				continue;
+			const int shader = LittleLong( ds[s].shaderNum );
+			if ( shader >= 0 && shader < (int)bake.scene.shaders.size() && ( bake.scene.shaders[shader].surfaceFlags & SURF_SKY ) )
+				continue;
+			const int first = LittleLong( ds[s].firstVert ), nv = LittleLong( ds[s].numVerts );
+			for ( int v = first; v < first + nv && v < numDrawVerts; v++ ) {
+				if ( v >= 0 && !mark[v] ) {
+					mark[v] = 1;
+					list.push_back( v );
+				}
+			}
+		}
+
+		if ( !list.empty() ) {
+			gi_vertexColors.resize( (size_t)numDrawVerts * 4 );
+			for ( int v = 0; v < numDrawVerts; v++ )
+				memcpy( &gi_vertexColors[(size_t)v * 4], dv[v].color[0], 4 );
+
+			const float aoIndirect = Com_Clamp( 0.0f, 2.0f, r_devoGI_ao->value );
+			const float aoDirect = Com_Clamp( 0.0f, 1.0f, r_devoGI_aoDirect->value );
+			gi_parallel_for( (int)list.size(), [&]( int i ) {
+				const int v = list[i];
+				giVert gv;
+				gi_load_vert( gv, dv[v] );
+				float g[4];
+				// twice the rays: a vertex has no neighbours to denoise with
+				gi_gather_point( bake, gv.xyz, gv.normal, gv.normal, 0, (uint32_t)v * 7919u + 13u, rays * 2, g );
+				const float ao = Com_Clamp( 0.0f, 1.0f, g[3] );
+				const float bounceScale = intensity * powf( ao, aoIndirect * 2.0f );
+				const float directScale = 1.0f - aoDirect * ( 1.0f - ao );
+				float c[3];
+				for ( int k = 0; k < 3; k++ )
+					c[k] = dv[v].color[0][k] * directScale + g[k] * bounceScale;
+				const float m = Q_max( c[0], Q_max( c[1], c[2] ) );
+				const float s = m > 255.0f ? 255.0f / m : 1.0f;
+				for ( int k = 0; k < 3; k++ )
+					gi_vertexColors[(size_t)v * 4 + k] = (byte)Com_Clampi( 0, 255, (int)( c[k] * s + 0.5f ) );
+			} );
+			ri.Printf( PRINT_ALL, "DevoGI: lit %d vertices of vertex-lit models\n", (int)list.size() );
+		}
+	}
+
 	// 3. back to lightmap bytes; colour-normalize instead of clipping to white
-	byte *out = (byte *)Z_Malloc( ll.filelen, TAG_BSP, qfalse );
-	memcpy( out, srcLightmaps, ll.filelen );	// keeps deluxemap pages untouched
+	byte *out = (byte *)Z_Malloc( outBytes, TAG_BSP, qfalse );
 	for ( size_t pix = 0; pix < bake.owner.size(); pix++ ) {
 		float r = bake.light[pix * 3], g = bake.light[pix * 3 + 1], bl = bake.light[pix * 3 + 2];
 		const float m = Q_max( r, Q_max( g, bl ) );
@@ -1169,35 +1399,76 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 		out[pix * 3 + 2] = (byte)Com_Clampi( 0, 255, (int)( bl + 0.5f ) );
 	}
 
-	// deluxemap pages are never referenced by surfaces; restore them byte-for-byte
+	// deluxemap pages are never referenced by surfaces: just upsample them
 	{
 		std::vector<char> used( numPages, 0 );
 		for ( const giSurf &s : bake.scene.surfs )
 			for ( int k = 0; k < MAXLIGHTMAPS; k++ )
 				if ( s.lightmapNum[k] >= 0 && s.lightmapNum[k] < numPages )
 					used[s.lightmapNum[k]] = 1;
-		for ( int p = 0; p < numPages; p++ )
-			if ( !used[p] )
-				memcpy( out + p * pageBytes, srcLightmaps + p * pageBytes, pageBytes );
+		for ( int p = 0; p < numPages; p++ ) {
+			if ( used[p] )
+				continue;
+			for ( int y = 0; y < pageSize; y++ ) {
+				for ( int x = 0; x < pageSize; x++ ) {
+					float c[3];
+					gi_sample_bsp_page( srcLightmaps, p, ( x + 0.5f ) / scale - 0.5f, ( y + 0.5f ) / scale - 0.5f, c );
+					byte *o = out + ( ( (size_t)p * pageSize + y ) * pageSize + x ) * 3;
+					o[0] = (byte)( c[0] + 0.5f ); o[1] = (byte)( c[1] + 0.5f ); o[2] = (byte)( c[2] + 0.5f );
+				}
+			}
+		}
 	}
 
 	delete bakePtr;
+	gi_lmSize = DEVOGI_BSP_LM_SIZE;
 
 	// 4. save the cache next to the map (in the home path)
 	{
-		const int fileLen = (int)sizeof( devogiHeader_t ) + ll.filelen;
+		const int numVC = (int)( gi_vertexColors.size() / 4 );
+		const int fileLen = (int)sizeof( devogiHeader_t ) + outBytes + numVC * 4;
 		byte *file = (byte *)Z_Malloc( fileLen, TAG_TEMP_WORKSPACE, qfalse );
 		devogiHeader_t *h = (devogiHeader_t *)file;
 		memcpy( h->magic, "DVGI", 4 );
 		h->version = DEVOGI_VERSION;
 		h->bspHash = bspHash;
 		h->settingsHash = settingsHash;
-		h->lightmapBytes = ll.filelen;
-		memcpy( file + sizeof( devogiHeader_t ), out, ll.filelen );
+		h->lightmapBytes = outBytes;
+		h->pageSize = pageSize;
+		h->numVertexColors = numVC;
+		memcpy( file + sizeof( devogiHeader_t ), out, outBytes );
+		if ( numVC )
+			memcpy( file + sizeof( devogiHeader_t ) + outBytes, gi_vertexColors.data(), numVC * 4 );
 		ri.FS_WriteFile( cacheName, file, fileLen );
 		Z_Free( file );
 	}
 
 	ri.Printf( PRINT_ALL, "DevoGI: baked %s in %.1fs, saved %s\n", mapName, ( ri.Milliseconds() - startTime ) / 1000.0f, cacheName );
+	*outPageSize = pageSize;
 	return out;
+}
+
+/*
+===========================================================================
+R_DevoGI_PatchVertexColors
+
+Writes the baked style 0 vertex colours of vertex-lit surfaces into the
+loaded BSP's draw verts, so R_LoadSurfaces picks them up.
+===========================================================================
+*/
+
+void R_DevoGI_PatchVertexColors( byte *fileBase, const dheader_t *header )
+{
+	const lump_t &lv = header->lumps[LUMP_DRAWVERTS];
+	const int numVerts = lv.filelen / (int)sizeof( mapVert_t );
+	if ( gi_vertexColors.size() == (size_t)numVerts * 4 ) {
+		mapVert_t *dv = (mapVert_t *)( fileBase + lv.fileofs );
+		for ( int v = 0; v < numVerts; v++ ) {
+			dv[v].color[0][0] = gi_vertexColors[(size_t)v * 4 + 0];
+			dv[v].color[0][1] = gi_vertexColors[(size_t)v * 4 + 1];
+			dv[v].color[0][2] = gi_vertexColors[(size_t)v * 4 + 2];
+		}
+	}
+	gi_vertexColors.clear();
+	gi_vertexColors.shrink_to_fit();
 }
