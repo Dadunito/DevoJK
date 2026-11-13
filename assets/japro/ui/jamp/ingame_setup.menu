@@ -3041,7 +3041,7 @@
 			{
 				@MENUS_OFF 0
 				@MENUS_ON 1
-				"Shader" 3
+				"SFX" 3
 				"Mirror" 2
 			}
 			rect				220 223 300 20
@@ -3052,7 +3052,7 @@
 			textscale 			1
 			forecolor			.615 .615 .956 1
 			visible				0
-			descText			"Toggle to display saber trail."
+			descText			"Saber trail style. SFX also changes the blade look, in game and in the saber menus."
 			action				{ play "sound/interface/button1" }
 			mouseenter			{ show highlight10 }
 			mouseexit			{ hide highlight10 }

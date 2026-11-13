@@ -6127,9 +6127,10 @@ void CG_DoSFXSaber( vec3_t blade_muz, vec3_t blade_tip, vec3_t trail_tip, vec3_t
 
 	VectorMA( blade_muz, blade_len * 0.5f, blade_dir, mid );
 
+	// rgb is also used for the blade colour below, so compute it even when there is no light
+	CG_RGBForSaberColor(color, rgb, cnum, bnum);
+	VectorScale(rgb, 0.66f, rgb);
 	if ( doLight ) {
-		CG_RGBForSaberColor(color, rgb, cnum, bnum);
-		VectorScale(rgb, 0.66f, rgb);
 		trap->R_AddLightToScene(mid, (blade_len*2.0f) + (Q_flrand(0.0f, 1.0f)*10.0f), rgb[0], rgb[1], rgb[2]);
 	}
 
