@@ -2534,7 +2534,8 @@ static const char *FindShaderInShaderText( const char *shadername ) {
 	return NULL;
 }
 
-// DevoGI: read access to a shader's text (after its name)
+// DevoJK / DevoGI: lets the lighting bake read a shader's text (it starts right after the
+// shader's name), to find q3map_surfacelight, glow stages, the sun and texture colours.
 const char *R_DevoGI_FindShaderText( const char *shaderName ) {
 	return FindShaderInShaderText( shaderName );
 }

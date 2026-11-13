@@ -6127,7 +6127,8 @@ void CG_DoSFXSaber( vec3_t blade_muz, vec3_t blade_tip, vec3_t trail_tip, vec3_t
 
 	VectorMA( blade_muz, blade_len * 0.5f, blade_dir, mid );
 
-	// rgb is also used for the blade colour below, so compute it even when there is no light
+	// DevoJK fix: rgb also colours the blade further down, so it must be set even when the
+	// saber casts no light (black blades never do) - before, they got random colours.
 	CG_RGBForSaberColor(color, rgb, cnum, bnum);
 	VectorScale(rgb, 0.66f, rgb);
 	if ( doLight ) {

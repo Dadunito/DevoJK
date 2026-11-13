@@ -771,7 +771,7 @@ typedef struct consoleCommand_s {
 
 static consoleCommand_t	commands[] = {
 	{ "imagelist",			R_ImageList_f },
-	{ "devolights",			R_DevoLights_List_f },
+	{ "devolights",			R_DevoLights_List_f },	// DevoJK: lists the current map's light sources
 	{ "shaderlist",			R_ShaderList_f },
 	{ "skinlist",			R_SkinList_f },
 	{ "fontlist",			R_FontList_f },
@@ -1000,10 +1000,12 @@ void R_Register( void )
 	r_baseNormalY						= ri.Cvar_Get("r_baseNormalY",						"1.0",						CVAR_ARCHIVE | CVAR_LATCH, "" );
 	r_baseParallax						= ri.Cvar_Get("r_baseParallax",						"0.05",						CVAR_ARCHIVE | CVAR_LATCH, "" );	
 	r_baseSpecular						= ri.Cvar_Get("r_baseSpecular",						"0.04",						CVAR_ARCHIVE | CVAR_LATCH, "" );
-#ifdef VK_CUBEMAP
+	// DevoJK: the settings of the baked lighting and the map light preview (tr_devogi.cpp).
+	// Registered unconditionally, the bake runs on every Vulkan build.
 	R_DevoGI_Register();
 
-	r_cubeMapping						= ri.Cvar_Get("r_cubeMapping",						"0",						CVAR_ARCHIVE | CVAR_LATCH, "" );
+#ifdef VK_CUBEMAP
+	r_cubeMapping					= ri.Cvar_Get("r_cubeMapping",						"0",						CVAR_ARCHIVE | CVAR_LATCH, "" );
 #endif
 #ifdef VK_COMPUTE_NORMALMAP
 	r_genNormalMaps						= ri.Cvar_Get("r_genNormalMaps",					"0",						CVAR_ARCHIVE | CVAR_LATCH, "Approximate normal maps from baked diffuse (albedo) textures" );

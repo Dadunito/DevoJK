@@ -356,9 +356,12 @@ static	void R_LoadLightmaps( world_t &worldData, lump_t *l, lump_t *surfs ) {
 			numLightmaps++;
 	}
 
-	// DevoGI: bake (or load the cached) global illumination into the lightmap data before
-	// upload. Pages may be baked larger than 128; when the packed atlas would then exceed
-	// the GPU's texture limit, every page becomes its own image instead
+	// DevoJK / DevoGI: before the lightmaps go to the GPU, swap in the new lighting.
+	// R_DevoGI_Process bakes it on a map's first load (or reads maps/<name>.devogi) and
+	// hands back the same pages, only bigger (128 * r_devoGI_scale pixels each). The
+	// renderer normally packs all pages into one big "atlas" texture; if that would be
+	// larger than the GPU allows, every page simply becomes its own texture instead.
+	// Everything after this point works unchanged, just with the new data.
 	byte *devoGILightmaps = NULL;
 	if ( buf ) {
 		const int atlasPages = tr.worldDeluxeMapping ? ( numLightmaps >> 1 ) : numLightmaps;
@@ -407,7 +410,8 @@ static	void R_LoadLightmaps( world_t &worldData, lump_t *l, lump_t *surfs ) {
 	else
 	{
 		tr.numLightmaps = numLightmaps;
-		// no atlas: surfaces keep their per-page lightmap coordinates
+		// no atlas (external lightmaps, or DevoGI pages too big for one): every page is its
+		// own texture and surfaces keep their per-page lightmap coordinates
 		tr.lightmapAtlasSize[0] = tr.lightmapAtlasSize[1] = 0;
 		tr.lightmapsPerAtlasSide[0] = tr.lightmapsPerAtlasSide[1] = 1;
 	}
@@ -3240,12 +3244,16 @@ void RE_LoadWorldMap_Actual( const char *name, world_t &worldData, int index )
 
 	// load into heap
 	R_LoadShaders( &header->lumps[LUMP_SHADERS], worldData );
+	// DevoJK: find the map's own light sources (lamp shaders, glowing lamps, the sun, light
+	// entities). Needs the shaders above; the lighting bake in R_LoadLightmaps uses them.
 	if ( !index )
-		R_DevoLights_Extract( worldData.name, fileBase, header );	// the map's own light sources, used by the bake
+		R_DevoLights_Extract( worldData.name, fileBase, header );
 	R_LoadLightmaps( worldData, &header->lumps[LUMP_LIGHTMAPS], &header->lumps[LUMP_SURFACES] );
 	R_LoadPlanes (&header->lumps[LUMP_PLANES], worldData);
 	R_LoadFogs( &header->lumps[LUMP_FOGS], &header->lumps[LUMP_BRUSHES], &header->lumps[LUMP_BRUSHSIDES], worldData, index );
-	R_DevoGI_PatchVertexColors( fileBase, header );	// baked GI for vertex-lit models
+	// DevoJK: the bake also re-lit vertex colours (models, glass, decals...). Copy them into
+	// the map data now, right before the surfaces below are built from it.
+	R_DevoGI_PatchVertexColors( fileBase, header );
 	R_LoadSurfaces( &header->lumps[LUMP_SURFACES], &header->lumps[LUMP_DRAWVERTS], &header->lumps[LUMP_DRAWINDEXES], worldData, index );
 	R_LoadMarksurfaces (&header->lumps[LUMP_LEAFSURFACES], worldData);
 	R_LoadNodesAndLeafs (&header->lumps[LUMP_NODES], &header->lumps[LUMP_LEAFS], worldData);

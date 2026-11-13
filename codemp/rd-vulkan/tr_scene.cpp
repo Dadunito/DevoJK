@@ -491,7 +491,9 @@ void RE_BeginScene( const refdef_t *fd ) {
 	tr.refdef.num_entities = r_numentities - r_firstSceneEntity;
 	tr.refdef.entities = &backEndData->entities[r_firstSceneEntity];
 
-	// DevoLights: the map's own lights join the game's dynamic lights in world scenes
+	// DevoJK / DevoLights: with r_devoLights 1 the map's own lamps join the game's dynamic
+	// lights (weapon flashes, sabers...) in every 3D world view. They only use the slots
+	// the game left free, so gameplay lights are never pushed out.
 	if ( !( fd->rdflags & RDF_NOWORLDMODEL ) && tr.world ) {
 		const int sceneLights = r_numdlights - r_firstSceneDlight;
 		const int freeSlots = Q_min( MAX_REAL_DLIGHTS - sceneLights, (int)ARRAY_LEN( backEndData->dlights ) - r_numdlights );

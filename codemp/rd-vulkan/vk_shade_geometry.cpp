@@ -2928,8 +2928,9 @@ void RB_StageIteratorGeneric( void )
 
 		// removed glow handling statement, this results in unnecessary glow pass binds?
 		{
-			// only use a cubemap that was actually rendered: its prefiltered image is
-			// missing if cubemap rendering never ran for this map (crashed on a NULL image)
+			// DevoJK fix: only use a reflection cubemap that was actually rendered. If cubemap
+			// rendering never ran for this map, its prefiltered image is NULL and binding it
+			// crashed the game; such surfaces now fall back to the empty cubemap below.
 			qboolean has_cubemap = ( !vk.useFastLight && tr.numCubemaps && tess.cubemapIndex > 0
 				&& tess.cubemapIndex <= tr.numCubemaps && tr.cubemaps[tess.cubemapIndex-1].prefiltered_image ) ? qtrue : qfalse;
 

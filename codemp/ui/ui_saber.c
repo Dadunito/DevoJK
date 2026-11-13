@@ -69,7 +69,7 @@ static qhandle_t rgbSaberTrail5Shader;
 static qhandle_t blackSaberGlowShader;
 static qhandle_t blackSaberCoreShader;
 static qhandle_t blackBlurShader;
-//SFX Sabers
+// DevoJK - SFX sabers in the menus: the white-hot core shaders (see UI_DoSFXSaber)
 static qhandle_t sfxSaberBladeShader;
 static qhandle_t sfxSaberBladeRGBShader;
 
@@ -486,9 +486,23 @@ void UI_DoSaber( vec3_t origin, vec3_t dir, float length, float lengthMax, float
 	trap->R_AddRefEntityToScene( &sbak );
 }
 
-// SFX Sabers: menu preview version of CG_DoSFXSaber (ported from JKEnhanced UI_DoSFXSaber).
-// The blade is static in the menu, so there is no trail half; glow and core size follow
-// cg_shaderSaberGlow / cg_shaderSaberCore like the in-game SFX blade.
+/*
+DevoJK - SFX sabers in the menus
+
+In game, "SFX" sabers (Saber Trail: SFX, i.e. cg_saberTrail 3) draw the blade as a soft
+coloured glow around a thin white-hot core (CG_DoSFXSaber in cgame). The saber preview in
+the profile / saber menus used to always draw the classic blade, so what you picked
+didn't match what you got. This is the menu's version of that SFX blade, ported from
+JKEnhanced's UI_DoSFXSaber (thanks, redsaurus!).
+
+How it's drawn:
+  1. the glow: a wide RT_SABER_GLOW sprite in the blade's colour
+  2. the core: a thin RT_LINE with the white saber_blade shader
+  3. for RGB/custom colours, a second core line that carries the colour
+The blade doesn't move in the menu, so there is no motion trail; glow and core sizes
+follow the same settings as in game (cg_shaderSaberGlow / cg_shaderSaberCore), and the
+core gently pulses like the real thing.
+*/
 static void UI_DoSFXSaber( vec3_t origin, vec3_t dir, float length, float lengthMax, float radius, saber_colors_t color, int bnum )
 {
 	vec3_t		rgb = { 1,1,1 };
