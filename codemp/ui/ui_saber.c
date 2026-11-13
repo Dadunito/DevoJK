@@ -69,6 +69,9 @@ static qhandle_t rgbSaberTrail5Shader;
 static qhandle_t blackSaberGlowShader;
 static qhandle_t blackSaberCoreShader;
 static qhandle_t blackBlurShader;
+//SFX Sabers
+static qhandle_t sfxSaberBladeShader;
+static qhandle_t sfxSaberBladeRGBShader;
 
 void UI_CacheSaberGlowGraphics( void )
 {//FIXME: these get fucked by vid_restarts
@@ -111,6 +114,10 @@ void UI_CacheSaberGlowGraphics( void )
 	blackSaberGlowShader		= trap->R_RegisterShaderNoMip( "gfx/effects/sabers/blackglow" );
 	blackSaberCoreShader		= trap->R_RegisterShaderNoMip( "gfx/effects/sabers/blackcore" );
 	blackBlurShader				= trap->R_RegisterShaderNoMip( "gfx/effects/sabers/blacktrail" );
+
+	//SFX Sabers (same blade shaders cgame uses for cg_saberTrail 3)
+	sfxSaberBladeShader			= trap->R_RegisterShaderNoMip( "gfx/effects/sabers/saber_blade" );
+	sfxSaberBladeRGBShader		= trap->R_RegisterShaderNoMip( "gfx/effects/sabers/saber_blade_rgb" );
 }
 
 qboolean UI_SaberModelForSaber( const char *saberName, char *saberModel )
@@ -479,6 +486,100 @@ void UI_DoSaber( vec3_t origin, vec3_t dir, float length, float lengthMax, float
 	trap->R_AddRefEntityToScene( &sbak );
 }
 
+// SFX Sabers: menu preview version of CG_DoSFXSaber (ported from JKEnhanced UI_DoSFXSaber).
+// The blade is static in the menu, so there is no trail half; glow and core size follow
+// cg_shaderSaberGlow / cg_shaderSaberCore like the in-game SFX blade.
+static void UI_DoSFXSaber( vec3_t origin, vec3_t dir, float length, float lengthMax, float radius, saber_colors_t color, int bnum )
+{
+	vec3_t		rgb = { 1,1,1 };
+	qhandle_t	glow = 0;
+	refEntity_t saber, sbak;
+	float radiusmult, effectradius, coreradius, pulse;
+	const float effectalpha = 0.8f;
+	int i;
+
+	if ( length < 0.5f )
+		return;
+
+	switch( color )
+	{
+		case SABER_RED:		glow = redSaberGlowShader;		break;
+		case SABER_ORANGE:	glow = orangeSaberGlowShader;	break;
+		case SABER_YELLOW:	glow = yellowSaberGlowShader;	break;
+		case SABER_GREEN:	glow = greenSaberGlowShader;	break;
+		case SABER_BLUE:	glow = blueSaberGlowShader;		break;
+		case SABER_PURPLE:	glow = purpleSaberGlowShader;	break;
+		case SABER_FLAME1:	glow = rgbSaberGlow2Shader;		break;
+		case SABER_ELEC1:	glow = rgbSaberGlow3Shader;		break;
+		case SABER_FLAME2:	glow = rgbSaberGlow4Shader;		break;
+		case SABER_ELEC2:	glow = rgbSaberGlow5Shader;		break;
+		case SABER_BLACK:	glow = blackSaberGlowShader;	break;
+		case SABER_RGB:
+		default:			glow = rgbSaberGlowShader;		break;
+	}
+
+	UI_RGBForSaberColor( color, rgb, bnum );
+	for ( i = 0; i < 3; i++ )
+		rgb[i] *= 255;
+
+	if ( length < lengthMax )
+		radiusmult = 0.5f + ((length / lengthMax) / 2);
+	else
+		radiusmult = 1.0f;
+
+	pulse = Q_fabs( sinf( (float)trap->Milliseconds() / 25.0f ) ) * 0.25f;
+
+	effectradius = ((radius * 1.6f) + Q_flrand(-1.0f, 1.0f) * 0.1f) * radiusmult;
+	coreradius = ((radius * 0.4f) + Q_flrand(-1.0f, 1.0f) * 0.1f) * radiusmult;
+	effectradius *= trap->Cvar_VariableValue( "cg_shaderSaberGlow" );
+	coreradius *= pulse + trap->Cvar_VariableValue( "cg_shaderSaberCore" );
+
+	memset( &saber, 0, sizeof( refEntity_t ) );
+
+	// glow
+	if ( length - (effectradius / 2) > 0 ) {
+		saber.radius = effectradius;
+		saber.saberLength = length - (saber.radius / 2);
+		VectorCopy( origin, saber.origin );
+		VectorCopy( dir, saber.axis[0] );
+		saber.reType = RT_SABER_GLOW;
+		saber.customShader = glow;
+		if ( color < SABER_RGB )
+			saber.shaderRGBA[0] = saber.shaderRGBA[1] = saber.shaderRGBA[2] = 0xff * effectalpha;
+		else {
+			for ( i = 0; i < 3; i++ )
+				saber.shaderRGBA[i] = rgb[i] * effectalpha;
+		}
+		saber.shaderRGBA[3] = 0xff * effectalpha;
+
+		trap->R_AddRefEntityToScene( &saber );
+	}
+
+	// hot core
+	VectorMA( origin, length, dir, saber.origin );
+	VectorMA( origin, -1, dir, saber.oldorigin );
+	saber.customShader = sfxSaberBladeShader;
+	saber.reType = RT_LINE;
+	saber.radius = coreradius;
+	saber.shaderTexCoord[0] = saber.shaderTexCoord[1] = 1.0f;
+	if ( color < SABER_RGB )
+		saber.shaderRGBA[0] = saber.shaderRGBA[1] = saber.shaderRGBA[2] = 0xff;
+	else {
+		for ( i = 0; i < 3; i++ )
+			saber.shaderRGBA[i] = rgb[i];
+	}
+	saber.shaderRGBA[3] = 0xff;
+	sbak = saber;
+	trap->R_AddRefEntityToScene( &saber );
+
+	if ( color >= SABER_RGB ) {
+		// surface that provides the colour for RGB blades
+		sbak.customShader = sfxSaberBladeRGBShader;
+		sbak.shaderRGBA[0] = sbak.shaderRGBA[1] = sbak.shaderRGBA[2] = sbak.shaderRGBA[3] = 0xff;
+		trap->R_AddRefEntityToScene( &sbak );
+	}
+}
+
 void UI_SaberDrawBlade( itemDef_t *item, char *saberName, int saberModel, saberType_t saberType, vec3_t origin, vec3_t angles, int bladeNum )
 {
 	char bladeColorString[MAX_QPATH];
@@ -715,7 +816,15 @@ void UI_SaberDrawBlade( itemDef_t *item, char *saberName, int saberModel, saberT
 		return;
 	}
 
-	UI_DoSaber( bladeOrigin, axis[0], bladeLength, bladeLength, bladeRadius, bladeColor, 0, qfalse, 0, snum );
+	{
+		// SFX Sabers: match the in-game style picked with cg_saberTrail 3 / -3
+		const int saberTrail = (int)trap->Cvar_VariableValue( "cg_saberTrail" );
+
+		if ( saberTrail == 3 || saberTrail == -3 )
+			UI_DoSFXSaber( bladeOrigin, axis[0], bladeLength, bladeLength, bladeRadius, bladeColor, snum );
+		else
+			UI_DoSaber( bladeOrigin, axis[0], bladeLength, bladeLength, bladeRadius, bladeColor, 0, qfalse, 0, snum );
+	}
 }
 
 void UI_GetSaberForMenu( char *saber, int saberNum )
