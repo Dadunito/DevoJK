@@ -36,7 +36,7 @@ This file is part of DevoJK, licensed under GPLv2.
 #include <thread>
 #include <vector>
 
-#define DEVOGI_VERSION		1
+#define DEVOGI_VERSION		2
 #define DEVOGI_LM_SIZE		128
 #define DEVOGI_PATCH_STEPS	8
 #define DEVOGI_INF			1e30f
@@ -49,6 +49,10 @@ static cvar_t *r_devoGI_sky;
 static cvar_t *r_devoGI_entityLights;
 static cvar_t *r_devoGI_threads;
 static cvar_t *r_devoGI_rebuild;
+static cvar_t *r_devoGI_ao;
+static cvar_t *r_devoGI_aoDirect;
+static cvar_t *r_devoGI_aoDistance;
+static cvar_t *r_devoGI_saturation;
 
 void R_DevoGI_Register( void )
 {
@@ -60,6 +64,10 @@ void R_DevoGI_Register( void )
 	r_devoGI_entityLights	= ri.Cvar_Get( "r_devoGI_entityLights",	"1",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI uses light entities kept in the BSP as extra light sources" );
 	r_devoGI_threads		= ri.Cvar_Get( "r_devoGI_threads",		"0",	CVAR_ARCHIVE, "DevoGI bake threads (0 = all CPU cores)" );
 	r_devoGI_rebuild		= ri.Cvar_Get( "r_devoGI_rebuild",		"0",	CVAR_TEMP, "Set to 1 to force DevoGI to rebake the next map that loads" );
+	r_devoGI_ao				= ri.Cvar_Get( "r_devoGI_ao",			"1.0",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI ambient occlusion on the bounce light: keeps corners and crevices dark (0 = off, 1 = full, up to 2)" );
+	r_devoGI_aoDirect		= ri.Cvar_Get( "r_devoGI_aoDirect",		"0.3",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI ambient occlusion on the original lightmap light, for contact shadows (0 = off, 1 = full)" );
+	r_devoGI_aoDistance		= ri.Cvar_Get( "r_devoGI_aoDistance",	"96",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI ambient occlusion range in game units" );
+	r_devoGI_saturation		= ri.Cvar_Get( "r_devoGI_saturation",	"1.6",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI colour bleeding strength: saturation of light reflected off surfaces (1 = texture average colour)" );
 }
 
 /*
@@ -649,7 +657,7 @@ struct giBake {
 	std::vector<int>			owner;		// per page pixel: texel index or -1
 	std::vector<float>			direct;		// per page pixel rgb
 	std::vector<float>			light;		// current total light, per page pixel rgb
-	std::vector<float>			indirect;	// per texel rgb
+	std::vector<float>			indirect;	// per texel rgb + ambient occlusion (4 floats)
 	int							numPages;
 	gvec3						skyColor;
 };
@@ -838,7 +846,8 @@ static void gi_entity_direct( giBake &bake, const std::vector<giPointLight> &lig
 
 static void gi_gather( giBake &bake, int rays ) {
 	const giScene &scene = bake.scene;
-	bake.indirect.assign( bake.texels.size() * 3, 0.0f );
+	const float aoDist = Q_max( 8.0f, r_devoGI_aoDistance->value );
+	bake.indirect.assign( bake.texels.size() * 4, 0.0f );
 	gi_parallel_for( (int)bake.texels.size(), [&]( int i ) {
 		const giTexel &tx = bake.texels[i];
 		gvec3 t, b;
@@ -846,6 +855,7 @@ static void gi_gather( giBake &bake, int rays ) {
 		uint32_t rng = gi_hash( (uint32_t)i * 9781u + 1u );
 		const gvec3 o = tx.pos + tx.normal * 0.5f;
 		gvec3 sum;
+		float occlusion = 0;
 		for ( int r = 0; r < rays; r++ ) {
 			// cosine weighted hemisphere sample
 			const float u1 = gi_rand( rng ), u2 = gi_rand( rng );
@@ -856,14 +866,19 @@ static void gi_gather( giBake &bake, int rays ) {
 			if ( !gi_trace( scene, o, d, 8192.0f, hit, false ) )
 				continue;	// escaped the map
 			const giTri &ht = scene.tris[hit.tri];
-			if ( !scene.surfs[ht.surf].sky && gdot( ht.n, d ) > 0 )
+			const bool sky = scene.surfs[ht.surf].sky;
+			// nearby geometry blocks light: ambient occlusion, fading out with distance
+			if ( !sky && hit.t < aoDist )
+				occlusion += 1.0f - hit.t / aoDist;
+			if ( !sky && gdot( ht.n, d ) > 0 )
 				continue;	// hit the back of a surface: inside geometry, no light
 			sum += gi_hit_radiance( bake, hit, tx.styleValue );
 		}
 		const float inv = 1.0f / rays;
-		bake.indirect[i * 3 + 0] = sum.x * inv;
-		bake.indirect[i * 3 + 1] = sum.y * inv;
-		bake.indirect[i * 3 + 2] = sum.z * inv;
+		bake.indirect[i * 4 + 0] = sum.x * inv;
+		bake.indirect[i * 4 + 1] = sum.y * inv;
+		bake.indirect[i * 4 + 2] = sum.z * inv;
+		bake.indirect[i * 4 + 3] = 1.0f - occlusion * inv;	// 1 = open, 0 = fully enclosed
 	} );
 }
 
@@ -873,6 +888,7 @@ static void gi_denoise( giBake &bake ) {
 	gi_parallel_for( (int)bake.texels.size(), [&]( int i ) {
 		const giTexel &tx = bake.texels[i];
 		gvec3 sum;
+		float aoSum = 0;
 		float wsum = 0;
 		for ( int dy = -2; dy <= 2; dy++ ) {
 			for ( int dx = -2; dx <= 2; dx++ ) {
@@ -886,27 +902,40 @@ static void gi_denoise( giBake &bake ) {
 				if ( ot.surf != tx.surf && gdot( ot.normal, tx.normal ) < 0.9f )
 					continue;
 				const float w = ( 1.0f / ( 1.0f + dx * dx + dy * dy ) ) * Q_max( 0.0f, gdot( ot.normal, tx.normal ) );
-				sum += gvec3( &bake.indirect[o * 3] ) * w;
+				sum += gvec3( &bake.indirect[o * 4] ) * w;
+				aoSum += bake.indirect[o * 4 + 3] * w;
 				wsum += w;
 			}
 		}
-		if ( wsum > 0 )
+		if ( wsum > 0 ) {
 			sum = sum * ( 1.0f / wsum );
-		out[i * 3 + 0] = sum.x;
-		out[i * 3 + 1] = sum.y;
-		out[i * 3 + 2] = sum.z;
+			aoSum /= wsum;
+		} else {
+			aoSum = bake.indirect[i * 4 + 3];
+		}
+		out[i * 4 + 0] = sum.x;
+		out[i * 4 + 1] = sum.y;
+		out[i * 4 + 2] = sum.z;
+		out[i * 4 + 3] = aoSum;
 	} );
 	bake.indirect.swap( out );
 }
 
 static void gi_compose( giBake &bake, float intensity ) {
+	const float aoIndirect = Com_Clamp( 0.0f, 2.0f, r_devoGI_ao->value );
+	const float aoDirect = Com_Clamp( 0.0f, 1.0f, r_devoGI_aoDirect->value );
 	bake.light = bake.direct;
 	for ( size_t i = 0; i < bake.texels.size(); i++ ) {
 		const giTexel &tx = bake.texels[i];
 		float *px = &bake.light[( ( tx.page * DEVOGI_LM_SIZE + tx.y ) * DEVOGI_LM_SIZE + tx.x ) * 3];
-		px[0] += bake.indirect[i * 3 + 0] * intensity;
-		px[1] += bake.indirect[i * 3 + 1] * intensity;
-		px[2] += bake.indirect[i * 3 + 2] * intensity;
+		const float ao = Com_Clamp( 0.0f, 1.0f, bake.indirect[i * 4 + 3] );
+		// bounce light is darkened by occlusion (keeps corners black), the original
+		// lightmap only a little, for contact shadows
+		const float bounceScale = intensity * powf( ao, aoIndirect * 2.0f );
+		const float directScale = 1.0f - aoDirect * ( 1.0f - ao );
+		px[0] = px[0] * directScale + bake.indirect[i * 4 + 0] * bounceScale;
+		px[1] = px[1] * directScale + bake.indirect[i * 4 + 1] * bounceScale;
+		px[2] = px[2] * directScale + bake.indirect[i * 4 + 2] * bounceScale;
 	}
 }
 
@@ -986,9 +1015,10 @@ static uint64_t gi_bsp_hash( const byte *fileBase, const dheader_t *header ) {
 
 static uint64_t gi_settings_hash( void ) {
 	char buf[256];
-	Com_sprintf( buf, sizeof( buf ), "v%d r%d b%d i%g s%g e%d", DEVOGI_VERSION,
+	Com_sprintf( buf, sizeof( buf ), "v%d r%d b%d i%g s%g e%d ao%g aod%g aor%g sat%g", DEVOGI_VERSION,
 		Com_Clampi( 8, 1024, r_devoGI_rays->integer ), Com_Clampi( 1, 4, r_devoGI_bounces->integer ),
-		r_devoGI_intensity->value, r_devoGI_sky->value, r_devoGI_entityLights->integer );
+		r_devoGI_intensity->value, r_devoGI_sky->value, r_devoGI_entityLights->integer,
+		r_devoGI_ao->value, r_devoGI_aoDirect->value, r_devoGI_aoDistance->value, r_devoGI_saturation->value );
 	return gi_fnv( 1469598103934665603ULL, buf, strlen( buf ) );
 }
 
@@ -1067,6 +1097,17 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 			s.surfaceFlags = LittleLong( in[i].surfaceFlags );
 			s.contentFlags = LittleLong( in[i].contentFlags );
 			s.albedo = ( s.surfaceFlags & SURF_SKY ) ? gvec3() : gi_shader_albedo( in[i].shader );
+
+			// colour bleeding: averaged texture colours are muddy, so push the saturation
+			// of reflected light (keeps brightness, still capped at 0.9 like q3map2)
+			const float sat = Com_Clamp( 0.0f, 4.0f, r_devoGI_saturation->value );
+			const float lum = 0.2126f * s.albedo.x + 0.7152f * s.albedo.y + 0.0722f * s.albedo.z;
+			gvec3 c( lum + ( s.albedo.x - lum ) * sat, lum + ( s.albedo.y - lum ) * sat, lum + ( s.albedo.z - lum ) * sat );
+			c = gmax( c, gvec3( 0, 0, 0 ) );
+			const float m = Q_max( c.x, Q_max( c.y, c.z ) );
+			if ( m > 0.9f )
+				c = c * ( 0.9f / m );
+			s.albedo = c;
 		}
 	}
 
