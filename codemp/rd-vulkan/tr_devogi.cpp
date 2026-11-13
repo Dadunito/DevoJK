@@ -59,7 +59,7 @@ This file is part of DevoJK by Devoted, licensed under GPLv2.
 #include <vector>
 
 // Bump this whenever the bake changes in a way that should invalidate old .devogi files.
-#define DEVOGI_VERSION		12
+#define DEVOGI_VERSION		13
 
 #define DEVOGI_BSP_LM_SIZE	128			// lightmap page size stored in every Q3/JA BSP
 #define DEVOGI_LM_SIZE		gi_lmSize	// page size we are baking right now (128 * scale)
@@ -102,6 +102,7 @@ static cvar_t *r_devoGI_relight;
 static cvar_t *r_devoGI_exposure;
 static cvar_t *r_devoGI_progress;
 static cvar_t *r_devoGI_sheen;
+static cvar_t *r_devoGI_aa;
 static cvar_t *r_devoLights_glow;
 static cvar_t *r_devoLights;
 static cvar_t *r_devoLights_max;
@@ -114,6 +115,7 @@ void R_DevoGI_Register( void )
 	r_devoGI_scale			= ri.Cvar_Get( "r_devoGI_scale",		"4",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI lightmap resolution multiplier (1, 2, 4 or 8). Higher gives sharper shadows and corners but bakes slower and uses more memory" );
 	r_devoGI_rays			= ri.Cvar_Get( "r_devoGI_rays",			"128",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI rays per bounce-light sample (8-1024). More is smoother but bakes slower" );
 	r_devoGI_bounces		= ri.Cvar_Get( "r_devoGI_bounces",		"8",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI light bounces (1-8)" );
+	r_devoGI_aa				= ri.Cvar_Get( "r_devoGI_aa",			"2.0",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI shadow anti-aliasing: width of the area each texel's shadow samples come from, in texels (0.5 = sharp, 2 = smooth, up to 4)" );
 	r_devoGI_sheen			= ri.Cvar_Get( "r_devoGI_sheen",		"0.12",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI baked sheen: every surface faintly picks up the faces right in front of it, like a slightly glossy finish (0 = off, up to 0.5)" );
 	r_devoGI_intensity		= ri.Cvar_Get( "r_devoGI_intensity",	"1.0",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI bounce light strength" );
 	r_devoGI_exposure		= ri.Cvar_Get( "r_devoGI_exposure",		"1.0",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI overall brightness (1 = match the original map's brightness)" );
@@ -1411,8 +1413,23 @@ static void gi_direct_point( const giBake &bake, const giLightGrid &grid, const 
 	*/
 	gvec3 ft, fb;
 	gi_basis( faceNormal, ft, fb );
-	const float fp = footprint * 0.8f;	// stay a little inside the square (near walls)
-	auto origin = [&]( float ux, float uy ) { return o + ft * ( ux * fp ) + fb * ( uy * fp ); };
+	// the sampling area is r_devoGI_aa texels wide: wider than the texel itself, it acts
+	// like a soft filter over the neighbours too, which hides the texel grid completely
+	const float fp = footprint * Com_Clamp( 0.25f, 4.0f, r_devoGI_aa->value );
+	auto origin = [&]( float ux, float uy ) -> gvec3 {
+		if ( fp <= 0 )
+			return o;
+		const gvec3 off = ft * ( ux * fp ) + fb * ( uy * fp );
+		const float len = sqrtf( gdot( off, off ) );
+		if ( len < 0.01f )
+			return o;
+		// a spread-out start must not end up inside a wall next to the texel (that would
+		// leak light, or darken the corner): if the way there is blocked, use the centre
+		giHit h;
+		if ( gi_trace( scene, o, off * ( 1.0f / len ), len + 0.5f, h, true ) )
+			return o;
+		return o + off;
+	};
 
 	if ( grid.nx ) {
 		const int cx = (int)( ( pos.x - grid.origin.x ) / grid.cell );
@@ -1970,7 +1987,7 @@ static uint64_t gi_bsp_hash( const byte *fileBase, const dheader_t *header ) {
 
 static uint64_t gi_settings_hash( int scale ) {
 	char buf[320];
-	Com_sprintf( buf, sizeof( buf ), "sh%g v%d ex%g r%d b%d i%g s%g e%d ao%g aod%g aor%g sat%g x%d rl%d gl%g lh%llx", r_devoGI_sheen->value, DEVOGI_VERSION, r_devoGI_exposure->value,
+	Com_sprintf( buf, sizeof( buf ), "aa%g sh%g v%d ex%g r%d b%d i%g s%g e%d ao%g aod%g aor%g sat%g x%d rl%d gl%g lh%llx", r_devoGI_aa->value, r_devoGI_sheen->value, DEVOGI_VERSION, r_devoGI_exposure->value,
 		Com_Clampi( 8, 1024, r_devoGI_rays->integer ), Com_Clampi( 1, 8, r_devoGI_bounces->integer ),
 		r_devoGI_intensity->value, r_devoGI_sky->value, r_devoGI_entityLights->integer,
 		r_devoGI_ao->value, r_devoGI_aoDirect->value, r_devoGI_aoDistance->value, r_devoGI_saturation->value, scale,
@@ -2137,7 +2154,8 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 		texelPos[i] = bake.texels[i].pos;
 		allTexels[i] = (int)i;
 	}
-	const float directRadius = bake.texelSize * 2.0f;
+	// final smoothing grows with the anti-aliasing setting
+	const float directRadius = bake.texelSize * ( 1.0f + Com_Clamp( 0.25f, 4.0f, r_devoGI_aa->value ) );
 	giSpatialHash texelHash;
 	texelHash.build( texelPos, allTexels, directRadius );
 
