@@ -771,6 +771,7 @@ typedef struct consoleCommand_s {
 
 static consoleCommand_t	commands[] = {
 	{ "imagelist",			R_ImageList_f },
+	{ "devolights",			R_DevoLights_List_f },
 	{ "shaderlist",			R_ShaderList_f },
 	{ "skinlist",			R_SkinList_f },
 	{ "fontlist",			R_FontList_f },

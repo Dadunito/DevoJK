@@ -491,6 +491,13 @@ void RE_BeginScene( const refdef_t *fd ) {
 	tr.refdef.num_entities = r_numentities - r_firstSceneEntity;
 	tr.refdef.entities = &backEndData->entities[r_firstSceneEntity];
 
+	// DevoLights: the map's own lights join the game's dynamic lights in world scenes
+	if ( !( fd->rdflags & RDF_NOWORLDMODEL ) && tr.world ) {
+		const int sceneLights = r_numdlights - r_firstSceneDlight;
+		const int freeSlots = Q_min( MAX_REAL_DLIGHTS - sceneLights, (int)ARRAY_LEN( backEndData->dlights ) - r_numdlights );
+		R_DevoLights_AddToScene( fd->vieworg, freeSlots );
+	}
+
 	tr.refdef.num_dlights = r_numdlights - r_firstSceneDlight;
 	tr.refdef.dlights = &backEndData->dlights[r_firstSceneDlight];
 

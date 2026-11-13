@@ -2852,6 +2852,9 @@ void		R_DevoGI_Register( void );
 byte		*R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader_t *header, int maxScale, int *outPageSize );
 const char	*R_DevoGI_FindShaderText( const char *shaderName );
 void		R_DevoGI_PatchVertexColors( byte *fileBase, const dheader_t *header );
+void		R_DevoLights_Extract( const char *mapName, const byte *fileBase, const dheader_t *header );
+void		R_DevoLights_AddToScene( const vec3_t viewOrg, int freeSlots );
+void		R_DevoLights_List_f( void );
 
 // Vulkan
 void		RB_AddDrawItem( Pass *pass, const DrawItem& drawItem );

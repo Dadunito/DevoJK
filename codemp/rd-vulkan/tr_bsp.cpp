@@ -3232,6 +3232,8 @@ void RE_LoadWorldMap_Actual( const char *name, world_t &worldData, int index )
 
 	// load into heap
 	R_LoadShaders( &header->lumps[LUMP_SHADERS], worldData );
+	if ( !index )
+		R_DevoLights_Extract( worldData.name, fileBase, header );	// the map's own light sources, used by the bake
 	R_LoadLightmaps( worldData, &header->lumps[LUMP_LIGHTMAPS], &header->lumps[LUMP_SURFACES] );
 	R_LoadPlanes (&header->lumps[LUMP_PLANES], worldData);
 	R_LoadFogs( &header->lumps[LUMP_FOGS], &header->lumps[LUMP_BRUSHES], &header->lumps[LUMP_BRUSHSIDES], worldData, index );
