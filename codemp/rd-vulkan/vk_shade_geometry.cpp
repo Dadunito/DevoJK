@@ -2928,7 +2928,10 @@ void RB_StageIteratorGeneric( void )
 
 		// removed glow handling statement, this results in unnecessary glow pass binds?
 		{
-			qboolean has_cubemap = ( !vk.useFastLight && tr.numCubemaps && tess.cubemapIndex > 0) ? qtrue : qfalse;
+			// only use a cubemap that was actually rendered: its prefiltered image is
+			// missing if cubemap rendering never ran for this map (crashed on a NULL image)
+			qboolean has_cubemap = ( !vk.useFastLight && tr.numCubemaps && tess.cubemapIndex > 0
+				&& tess.cubemapIndex <= tr.numCubemaps && tr.cubemaps[tess.cubemapIndex-1].prefiltered_image ) ? qtrue : qfalse;
 
 			if ( def.vk_light_flags )
 				vk_update_descriptor( VK_DESC_PBR_BRDFLUT, vk.brdflut_image_descriptor);
