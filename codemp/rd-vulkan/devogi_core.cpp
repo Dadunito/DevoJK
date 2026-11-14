@@ -35,12 +35,18 @@ On the first load of a map we:
   6. Trace bounced light (global illumination) for several bounces.
   7. Match the overall exposure to the original level, write the new
      lightmaps and also re-light vertex-lit models and vertex colours.
-  8. Hand back the result; the host saves it as maps/<name>.devogi, so later
+  8. Also save the same light split for real-time lighting: bounce-only
+     lightmaps, a grid of light probes for models, and the lamps merged
+     into fixtures with their calibrated strength (see "Splitting the
+     light for real-time use").
+  9. Hand back the result; the host saves it as maps/<name>.devogi, so later
      loads skip all of this. The cache is rebuilt automatically when the
      BSP, its shaders or any bake setting changes.
 
 The renderer then uses the new lightmaps exactly like the old ones, so
-there is no runtime cost at all.
+there is no runtime cost at all. The split in step 8 is for a renderer that
+draws direct light live with soft shadows and only takes the bounce light
+from the bake.
 
 Ideas inspired by Berk Emre Saribas' Panko-Renderer (MIT) and by q3map2's
 own light code; the implementation here is written for the Q3 BSP format.
@@ -303,6 +309,7 @@ static_assert( sizeof( dsurface_t ) == 148, "dsurface_t must match the BSP file"
 
 
 #include <algorithm>
+#include <functional>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -312,7 +319,7 @@ static_assert( sizeof( dsurface_t ) == 148, "dsurface_t must match the BSP file"
 #include <vector>
 
 // Bump this whenever the bake changes in a way that should invalidate old .devogi files.
-#define DEVOGI_VERSION		13
+#define DEVOGI_VERSION		14
 
 #define DEVOGI_BSP_LM_SIZE	128			// lightmap page size stored in every Q3/JA BSP
 #define DEVOGI_LM_SIZE		gi_lmSize	// page size we are baking right now (128 * scale)
@@ -1956,7 +1963,7 @@ static gvec3 gi_hit_radiance( const giBake &bake, const giHit &hit, int styleVal
 
 // bounce light and ambient occlusion at one point: out[0..2] = rgb, out[3] = 1 open .. 0 enclosed
 static void gi_gather_point( const giBake &bake, const gvec3 &pos, const gvec3 &normal, const gvec3 &faceNormal,
-	int styleValue, uint32_t seed, int rays, float out[4] ) {
+	int styleValue, uint32_t seed, int rays, float out[4], bool allowSheen = true ) {
 	const giScene &scene = bake.scene;
 	const float aoDist = Q_max( 8.0f, g_set.aoDistance );
 	gvec3 t, b;
@@ -2002,7 +2009,7 @@ static void gi_gather_point( const giBake &bake, const gvec3 &pos, const gvec3 &
 	(The renderer's cubemaps, r_cubeMapping, are the real view-dependent reflections.)
 	*/
 	const float sheen = Com_Clamp( 0.0f, 0.5f, g_set.sheen );
-	if ( sheen > 0 ) {
+	if ( sheen > 0 && allowSheen ) {
 		const int coneRays = Q_max( 4, rays / 8 );
 		gvec3 cone;
 		int got = 0;
@@ -2099,7 +2106,7 @@ static void gi_compose( giBake &bake, float intensity ) {
 
 // grows lit texels into the empty pixels around them, so the GPU's texture filtering at
 // polygon edges never blends in black
-static void gi_dilate( giBake &bake, std::vector<float> &img ) {
+static void gi_dilate( giBake &bake, std::vector<float> &img, std::vector<char> *filledOut = NULL ) {
 	std::vector<char> filled( bake.owner.size() );
 	for ( size_t i = 0; i < bake.owner.size(); i++ )
 		filled[i] = bake.owner[i] >= 0;
@@ -2135,6 +2142,8 @@ static void gi_dilate( giBake &bake, std::vector<float> &img ) {
 		}
 		filled.swap( next );
 	}
+	if ( filledOut )
+		filledOut->swap( filled );
 }
 
 /*
@@ -2196,6 +2205,329 @@ static uint64_t gi_settings_hash( int scale ) {
 		g_set.ao, g_set.aoDirect, g_set.aoDistance, g_set.saturation, scale,
 		g_set.relight, g_set.glow, (unsigned long long)( g_set.relight ? gi_lightsHash : 0 ) );
 	return gi_fnv( 1469598103934665603ULL, buf, strlen( buf ) );
+}
+
+/*
+===========================================================================
+Splitting the light for real-time use
+
+The full bake above mixes everything into one lightmap: fast, but frozen.
+Real-time lighting keeps the two parts apart, like modern games do:
+
+  - direct light is drawn live by the renderer, from every lamp and the
+    sun, with shadow maps. It needs the lamps themselves: neighbouring
+    glowing patches of a lamp are merged into one "fixture", with the
+    brightness the calibration found, so live light matches the bake.
+  - bounce light is expensive and changes little, so it stays baked: in
+    "bounce lightmaps" for the map's surfaces, and in a grid of light
+    probes for everything that moves (players, weapons, doors).
+
+Nothing here changes the full bake; this only saves the parts separately.
+===========================================================================
+*/
+
+// float -> 16-bit half float (round to nearest; no NaNs needed here)
+static uint16_t gi_float_to_half( float f ) {
+	uint32_t x;
+	memcpy( &x, &f, 4 );
+	const uint32_t sign = ( x >> 16 ) & 0x8000u;
+	int exp = (int)( ( x >> 23 ) & 0xff ) - 127 + 15;
+	uint32_t mant = x & 0x7fffffu;
+	if ( exp <= 0 ) {
+		if ( exp < -10 )
+			return (uint16_t)sign;					// too small: zero
+		mant |= 0x800000u;							// a denormal half
+		const int shift = 14 - exp;
+		uint32_t h = mant >> shift;
+		if ( ( mant >> ( shift - 1 ) ) & 1u )
+			h++;
+		return (uint16_t)( sign | h );
+	}
+	if ( exp >= 31 )
+		return (uint16_t)( sign | 0x7bffu );		// too big: the largest half
+	uint32_t h = sign | ( (uint32_t)exp << 10 ) | ( mant >> 13 );
+	if ( mant & 0x1000u )
+		h++;										// round (may carry into the exponent: fine)
+	return (uint16_t)h;
+}
+
+/*
+Bounce lightmaps: the bounce part of every texel (with its ambient occlusion and
+exposure, exactly as the full bake mixed it in), stored at half the resolution of
+the full lightmaps - bounce light is soft, so that loses nothing visible.
+*/
+static void gi_build_bounce_maps( giBake &bake, dgLiveLighting &live, bool relight, float exposure, float intensity ) {
+	const float aoIndirect = Com_Clamp( 0.0f, 2.0f, g_set.ao );
+	std::vector<float> img( bake.owner.size() * 3, 0.0f );
+	for ( size_t i = 0; i < bake.texels.size(); i++ ) {
+		const giTexel &tx = bake.texels[i];
+		const float ao = Com_Clamp( 0.0f, 1.0f, bake.indirect[i * 4 + 3] );
+		float k = intensity * powf( ao, aoIndirect * 2.0f );
+		if ( relight && tx.styleValue == 0 )
+			k *= exposure;
+		float *px = &img[( ( (size_t)tx.page * DEVOGI_LM_SIZE + tx.y ) * DEVOGI_LM_SIZE + tx.x ) * 3];
+		px[0] = bake.indirect[i * 4 + 0] * k;
+		px[1] = bake.indirect[i * 4 + 1] * k;
+		px[2] = bake.indirect[i * 4 + 2] * k;
+	}
+	std::vector<char> filled;
+	gi_dilate( bake, img, &filled );
+
+	// average each 2x2 block, counting only pixels that hold light (empty space would
+	// darken the edges of every polygon)
+	const int f = DEVOGI_LM_SIZE > DEVOGI_BSP_LM_SIZE ? 2 : 1;
+	const int bs = DEVOGI_LM_SIZE / f;
+	live.bouncePageSize = bs;
+	live.bounce.assign( (size_t)bake.numPages * bs * bs * 3, 0 );
+	for ( int p = 0; p < bake.numPages; p++ ) {
+		for ( int y = 0; y < bs; y++ ) {
+			for ( int x = 0; x < bs; x++ ) {
+				float sum[3] = { 0, 0, 0 };
+				int n = 0;
+				for ( int dy = 0; dy < f; dy++ ) {
+					for ( int dx = 0; dx < f; dx++ ) {
+						const size_t q = ( (size_t)p * DEVOGI_LM_SIZE + y * f + dy ) * DEVOGI_LM_SIZE + x * f + dx;
+						if ( !filled[q] )
+							continue;
+						sum[0] += img[q * 3]; sum[1] += img[q * 3 + 1]; sum[2] += img[q * 3 + 2];
+						n++;
+					}
+				}
+				if ( !n )
+					continue;
+				uint8_t *o = &live.bounce[( ( (size_t)p * bs + y ) * bs + x ) * 3];
+				for ( int k = 0; k < 3; k++ )
+					o[k] = (uint8_t)Com_Clampi( 0, 255, (int)( sum[k] / n + 0.5f ) );
+			}
+		}
+	}
+}
+
+/*
+Light probes: a 3D grid over the whole map, 64 units apart (wider on huge maps).
+Each probe looks in 6 directions and stores the bounce light coming from each -
+an "ambient cube". A player model reads the 8 probes around it and lights every
+part of itself from the matching directions, so a red wall on its left tints its
+left side. Probes inside walls or outside the map are marked invalid and get the
+average of their valid neighbours, so a renderer can sample anywhere.
+*/
+static void gi_build_probes( giBake &bake, dgLiveLighting &live, float intensity, int rays ) {
+	const giScene &scene = bake.scene;
+	if ( scene.verts.empty() )
+		return;
+	gvec3 mins( DEVOGI_INF, DEVOGI_INF, DEVOGI_INF ), maxs( -DEVOGI_INF, -DEVOGI_INF, -DEVOGI_INF );
+	for ( const giVert &v : scene.verts ) {
+		mins = gmin( mins, v.xyz );
+		maxs = gmax( maxs, v.xyz );
+	}
+
+	// 64 units apart, wider if the map is so big that the grid would get huge
+	float spacing = 64.0f;
+	int dims[3];
+	while ( 1 ) {
+		for ( int k = 0; k < 3; k++ ) {
+			const float lo = k == 0 ? mins.x : ( k == 1 ? mins.y : mins.z );
+			const float hi = k == 0 ? maxs.x : ( k == 1 ? maxs.y : maxs.z );
+			dims[k] = Q_max( 1, (int)ceilf( ( hi - lo ) / spacing ) + 1 );
+		}
+		if ( (size_t)dims[0] * dims[1] * dims[2] <= 400000 || spacing > 1024 )
+			break;
+		spacing *= 1.25f;
+	}
+	const size_t count = (size_t)dims[0] * dims[1] * dims[2];
+	live.probeSpacing = spacing;
+	live.probeOrigin[0] = mins.x; live.probeOrigin[1] = mins.y; live.probeOrigin[2] = mins.z;
+	for ( int k = 0; k < 3; k++ )
+		live.probeDims[k] = dims[k];
+
+	std::vector<float> cube( count * 18, 0.0f );
+	std::vector<uint8_t> valid( count, 0 );
+	const gvec3 axes[6] = { gvec3( 1, 0, 0 ), gvec3( -1, 0, 0 ), gvec3( 0, 1, 0 ), gvec3( 0, -1, 0 ), gvec3( 0, 0, 1 ), gvec3( 0, 0, -1 ) };
+	const int probeRays = Q_max( 32, rays / 2 );	// a probe has no neighbours to blend with
+
+	gi_progress_stage( "Light probes for models", 0.96f, 0.035f );
+	gi_parallel_for( (int)count, [&]( int i ) {
+		const int x = (int)( i % dims[0] ), y = (int)( ( i / dims[0] ) % dims[1] ), z = (int)( i / ( (size_t)dims[0] * dims[1] ) );
+		const gvec3 pos( mins.x + x * spacing, mins.y + y * spacing, mins.z + z * spacing );
+
+		// inside a wall or outside the sealed map, rays mostly hit the backs of faces
+		int bad = 0, tested = 0;
+		for ( int k = 0; k < 14; k++ ) {
+			gvec3 d = k < 6 ? axes[k] : gnorm( gvec3( ( k & 1 ) ? 1.0f : -1.0f, ( k & 2 ) ? 1.0f : -1.0f, ( k & 4 ) ? 1.0f : -1.0f ) );
+			giHit hit;
+			tested++;
+			if ( !gi_trace( scene, pos, d, 16384.0f, hit, false ) ) {
+				bad++;	// escaped: we are outside the map
+				continue;
+			}
+			const giTri &t = scene.tris[hit.tri];
+			if ( !scene.surfs[t.surf].sky && gdot( t.n, d ) > 0 )
+				bad++;
+		}
+		if ( bad * 10 > tested * 3 )
+			return;
+		valid[i] = 1;
+		for ( int a = 0; a < 6; a++ ) {
+			float g[4];
+			gi_gather_point( bake, pos, axes[a], axes[a], 0, (uint32_t)i * 2654435761u + (uint32_t)a * 97u, probeRays, g, false );
+			cube[(size_t)i * 18 + a * 3 + 0] = g[0] * intensity;
+			cube[(size_t)i * 18 + a * 3 + 1] = g[1] * intensity;
+			cube[(size_t)i * 18 + a * 3 + 2] = g[2] * intensity;
+		}
+	}, true );
+
+	// invalid probes take the average of their valid (or already filled) neighbours
+	std::vector<uint8_t> have = valid;
+	for ( int pass = 0; pass < 8; pass++ ) {
+		std::vector<uint8_t> next = have;
+		bool changed = false;
+		for ( size_t i = 0; i < count; i++ ) {
+			if ( have[i] )
+				continue;
+			const int x = (int)( i % dims[0] ), y = (int)( ( i / dims[0] ) % dims[1] ), z = (int)( i / ( (size_t)dims[0] * dims[1] ) );
+			float sum[18] = {};
+			int n = 0;
+			const int nb[6][3] = { { 1, 0, 0 }, { -1, 0, 0 }, { 0, 1, 0 }, { 0, -1, 0 }, { 0, 0, 1 }, { 0, 0, -1 } };
+			for ( const auto &o : nb ) {
+				const int xx = x + o[0], yy = y + o[1], zz = z + o[2];
+				if ( xx < 0 || yy < 0 || zz < 0 || xx >= dims[0] || yy >= dims[1] || zz >= dims[2] )
+					continue;
+				const size_t j = ( (size_t)zz * dims[1] + yy ) * dims[0] + xx;
+				if ( !have[j] )
+					continue;
+				for ( int k = 0; k < 18; k++ )
+					sum[k] += cube[j * 18 + k];
+				n++;
+			}
+			if ( n ) {
+				for ( int k = 0; k < 18; k++ )
+					cube[i * 18 + k] = sum[k] / n;
+				next[i] = 1;
+				changed = true;
+			}
+		}
+		have.swap( next );
+		if ( !changed )
+			break;
+	}
+
+	live.probes.resize( count * 18 );
+	for ( size_t k = 0; k < count * 18; k++ )
+		live.probes[k] = gi_float_to_half( cube[k] );
+	live.probeValid.swap( valid );
+
+	size_t numValid = 0;
+	for ( uint8_t v : live.probeValid )
+		numValid += v;
+	dg_print( "DevoGI: %d x %d x %d light probes, %d units apart, %d in open space\n",
+		dims[0], dims[1], dims[2], (int)spacing, (int)numValid );
+}
+
+/*
+Fixtures: the lamps for real-time light. The bake cuts every glowing surface into
+small patches (that's what makes its shadows soft); a renderer wants one light per
+lamp instead. Patches of the same shader that face the same way and touch are one
+lamp: they are merged, keeping their total strength, centre and size.
+*/
+static void gi_build_fixtures( dgLiveLighting &live, float exposure, const std::vector<float> &groupScale ) {
+	auto scaleOf = [&]( int group ) {
+		return group >= 0 && group < (int)groupScale.size() ? groupScale[group] : 1.0f;
+	};
+	const int n = (int)gi_lights.size();
+
+	// union-find over the patches
+	std::vector<int> parent( n );
+	for ( int i = 0; i < n; i++ )
+		parent[i] = i;
+	std::function<int( int )> root = [&]( int i ) { return parent[i] == i ? i : ( parent[i] = root( parent[i] ) ); };
+	for ( int i = 0; i < n; i++ ) {
+		const devoLight_t &a = gi_lights[i];
+		if ( a.shader < 0 )
+			continue;	// light entities stay single lights
+		for ( int j = i + 1; j < n; j++ ) {
+			const devoLight_t &b = gi_lights[j];
+			if ( b.shader != a.shader || gdot( a.normal, b.normal ) < 0.9f )
+				continue;
+			const gvec3 d = a.origin - b.origin;
+			const float link = Q_max( a.size, b.size ) * 1.5f + 8.0f;
+			if ( gdot( d, d ) > link * link )
+				continue;
+			parent[root( i )] = root( j );
+		}
+	}
+
+	std::vector<std::vector<int>> members( n );
+	for ( int i = 0; i < n; i++ )
+		members[root( i )].push_back( i );
+
+	live.fixtures.clear();
+	for ( int r = 0; r < n; r++ ) {
+		const std::vector<int> &m = members[r];
+		if ( m.empty() )
+			continue;
+		const devoLight_t &first = gi_lights[m[0]];
+		const float strength = scaleOf( first.group ) * exposure;
+		float photons = 0;
+		gvec3 centre, normal;
+		for ( int i : m ) {
+			const devoLight_t &lt = gi_lights[i];
+			photons += lt.photons;
+			centre += lt.origin * lt.photons;
+			normal += lt.normal * lt.photons;
+		}
+		if ( photons <= 0 || strength <= 0 )
+			continue;	// a lamp the calibration switched off
+		centre = centre * ( 1.0f / photons );
+
+		dgFixture fx = {};
+		fx.origin[0] = centre.x; fx.origin[1] = centre.y; fx.origin[2] = centre.z;
+		fx.shader = first.shader;
+		const gvec3 rgb = first.color * ( photons * strength );
+		fx.rgb[0] = rgb.x; fx.rgb[1] = rgb.y; fx.rgb[2] = rgb.z;
+
+		float reach = 0;
+		if ( first.size > 0 ) {
+			// a glowing rectangle: its extent along two edges, around the centre
+			const gvec3 nn = gnorm( normal );
+			gvec3 u, v;
+			gi_basis( nn, u, v );
+			float hu = 0, hv = 0;
+			for ( int i : m ) {
+				const devoLight_t &lt = gi_lights[i];
+				const gvec3 d = lt.origin - centre;
+				hu = Q_max( hu, fabsf( gdot( d, u ) ) + lt.size * 0.5f );
+				hv = Q_max( hv, fabsf( gdot( d, v ) ) + lt.size * 0.5f );
+				reach = Q_max( reach, sqrtf( gdot( d, d ) ) + lt.radius );
+			}
+			fx.normal[0] = nn.x; fx.normal[1] = nn.y; fx.normal[2] = nn.z;
+			fx.axisU[0] = u.x; fx.axisU[1] = u.y; fx.axisU[2] = u.z;
+			fx.halfU = hu;
+			fx.halfV = hv;
+		} else {
+			reach = first.radius;	// a light entity: shines everywhere from one point
+		}
+		fx.reach = reach;
+		live.fixtures.push_back( fx );
+	}
+
+	live.hasSun = gi_hasSun;
+	if ( gi_hasSun ) {
+		const gvec3 rgb = gi_sunColor * ( gi_sunIntensity * scaleOf( gi_sunGroup ) * exposure );
+		live.sunDir[0] = gi_sunDir.x; live.sunDir[1] = gi_sunDir.y; live.sunDir[2] = gi_sunDir.z;
+		live.sunRgb[0] = rgb.x; live.sunRgb[1] = rgb.y; live.sunRgb[2] = rgb.z;
+	}
+	dg_print( "DevoGI: %d light patches merged into %d lamps for real-time light%s\n",
+		n, (int)live.fixtures.size(), gi_hasSun ? ", plus the sun" : "" );
+}
+
+static void gi_build_live( giBake &bake, dgLiveLighting &live, bool relight, float exposure, float intensity,
+	int rays, const std::vector<float> &groupScale ) {
+	live = dgLiveLighting();
+	live.relit = relight;
+	gi_build_bounce_maps( bake, live, relight, exposure, intensity );
+	if ( relight )
+		gi_build_fixtures( live, exposure, groupScale );
+	gi_build_probes( bake, live, intensity, rays );
 }
 
 /*
@@ -2520,7 +2852,7 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 			// vertex-lit models (crates, ships, lamps...): the same direct and bounce light per vertex
 			const float aoIndirect = Com_Clamp( 0.0f, 2.0f, g_set.ao );
 			const float aoDirect = Com_Clamp( 0.0f, 1.0f, g_set.aoDirect );
-			gi_progress_stage( "Models and vertex colours", 0.92f, 0.07f );
+			gi_progress_stage( "Models and vertex colours", 0.92f, 0.04f );
 			gi_parallel_for( (int)list.size(), [&]( int i ) {
 				const int v = list[i];
 				giVert gv;
@@ -2535,9 +2867,11 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 					gvec3 total;
 					gi_direct_point( bake, lightGrid, gv.xyz, gv.normal, gv.normal, (uint32_t)v * 40503u + 7u, 0.0f,
 						[&]( int group, const gvec3 &rgb ) { total += rgb * groupScale[group]; } );
-					c[0] = ( total.x + g[0] * bounceScale ) * exposure;
-					c[1] = ( total.y + g[1] * bounceScale ) * exposure;
-					c[2] = ( total.z + g[2] * bounceScale ) * exposure;
+					// (the bounce light is gathered from surfaces that are already exposed,
+					// so only the direct part gets the exposure factor)
+					c[0] = total.x * exposure + g[0] * bounceScale;
+					c[1] = total.y * exposure + g[1] * bounceScale;
+					c[2] = total.z * exposure + g[2] * bounceScale;
 				} else {
 					const float directScale = 1.0f - aoDirect * ( 1.0f - ao );
 					for ( int k = 0; k < 3; k++ )
@@ -2551,6 +2885,9 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 				(int)list.size(), (int)lmList.size() );
 		}
 	}
+
+	// ---- the same lighting, split for real-time use (see gi_build_live) ----
+	gi_build_live( bake, result.live, relight, exposure, intensity, rays, groupScale );
 
 	// ---- 3. back to lightmap bytes ----
 	result.lightmaps.assign( outBytes, 0 );
@@ -3046,10 +3383,44 @@ uint64_t DG_SettingsHash( const dgSettings &settings, int scale )
 	return gi_settings_hash( scale );
 }
 
+/*
+After the lightmaps and vertex colours, the file holds tagged sections, so new
+kinds of data can be added later without breaking the layout:
+
+  "BNCE"  int32 bouncePageSize, int32 relit, then the bounce lightmaps (RGB)
+  "PRBE"  float origin[3], float spacing, int32 dims[3], then 18 half floats
+          per probe, then one valid byte per probe
+  "LITE"  int32 count, count x dgFixture, int32 hasSun, float sunDir[3],
+          float sunRgb[3]
+
+Each section is: 4-byte tag, int32 size of what follows, the data.
+*/
+static void gi_put( std::vector<byte> &f, const void *data, size_t size ) {
+	const size_t at = f.size();
+	f.resize( at + size );
+	if ( size )
+		memcpy( f.data() + at, data, size );
+}
+
+static void gi_put_i32( std::vector<byte> &f, int32_t v ) {
+	gi_put( f, &v, 4 );
+}
+
+// starts a section: returns where its size goes, filled in by gi_section_end
+static size_t gi_section_begin( std::vector<byte> &f, const char tag[4] ) {
+	gi_put( f, tag, 4 );
+	gi_put_i32( f, 0 );
+	return f.size();
+}
+
+static void gi_section_end( std::vector<byte> &f, size_t start ) {
+	const int32_t size = (int32_t)( f.size() - start );
+	memcpy( f.data() + start - 4, &size, 4 );
+}
+
 std::vector<byte> DG_WriteCache( uint64_t bspHash, uint64_t settingsHash, const dgResult &result )
 {
 	const int numVC = (int)( result.vertexColors.size() / 4 );
-	std::vector<byte> file( sizeof( devogiHeader_t ) + result.lightmaps.size() + (size_t)numVC * 4 );
 	devogiHeader_t h;
 	memcpy( h.magic, "DVGI", 4 );
 	h.version = DEVOGI_VERSION;
@@ -3058,12 +3429,87 @@ std::vector<byte> DG_WriteCache( uint64_t bspHash, uint64_t settingsHash, const 
 	h.lightmapBytes = (int32_t)result.lightmaps.size();
 	h.pageSize = result.pageSize;
 	h.numVertexColors = numVC;
-	memcpy( file.data(), &h, sizeof( h ) );
-	if ( !result.lightmaps.empty() )
-		memcpy( file.data() + sizeof( h ), result.lightmaps.data(), result.lightmaps.size() );
-	if ( numVC )
-		memcpy( file.data() + sizeof( h ) + result.lightmaps.size(), result.vertexColors.data(), (size_t)numVC * 4 );
+
+	std::vector<byte> file;
+	gi_put( file, &h, sizeof( h ) );
+	gi_put( file, result.lightmaps.data(), result.lightmaps.size() );
+	gi_put( file, result.vertexColors.data(), (size_t)numVC * 4 );
+
+	const dgLiveLighting &live = result.live;
+	size_t s = gi_section_begin( file, "BNCE" );
+	gi_put_i32( file, live.bouncePageSize );
+	gi_put_i32( file, live.relit ? 1 : 0 );
+	gi_put( file, live.bounce.data(), live.bounce.size() );
+	gi_section_end( file, s );
+
+	s = gi_section_begin( file, "PRBE" );
+	gi_put( file, live.probeOrigin, sizeof( live.probeOrigin ) );
+	gi_put( file, &live.probeSpacing, 4 );
+	gi_put( file, live.probeDims, sizeof( live.probeDims ) );
+	gi_put( file, live.probes.data(), live.probes.size() * 2 );
+	gi_put( file, live.probeValid.data(), live.probeValid.size() );
+	gi_section_end( file, s );
+
+	s = gi_section_begin( file, "LITE" );
+	gi_put_i32( file, (int32_t)live.fixtures.size() );
+	gi_put( file, live.fixtures.data(), live.fixtures.size() * sizeof( dgFixture ) );
+	gi_put_i32( file, live.hasSun ? 1 : 0 );
+	gi_put( file, live.sunDir, sizeof( live.sunDir ) );
+	gi_put( file, live.sunRgb, sizeof( live.sunRgb ) );
+	gi_section_end( file, s );
 	return file;
+}
+
+// reads the tagged sections (unknown ones are skipped); false if one is damaged
+static bool gi_read_sections( const byte *p, const byte *end, dgLiveLighting &live ) {
+	live = dgLiveLighting();
+	while ( end - p >= 8 ) {
+		char tag[4];
+		int32_t size;
+		memcpy( tag, p, 4 );
+		memcpy( &size, p + 4, 4 );
+		p += 8;
+		if ( size < 0 || size > end - p )
+			return false;
+		const byte *q = p, *qend = p + size;
+		auto get = [&]( void *out, size_t n ) {
+			if ( (size_t)( qend - q ) < n )
+				return false;
+			memcpy( out, q, n );
+			q += n;
+			return true;
+		};
+		if ( !memcmp( tag, "BNCE", 4 ) ) {
+			int32_t bs = 0, relit = 0;
+			if ( !get( &bs, 4 ) || !get( &relit, 4 ) )
+				return false;
+			live.bouncePageSize = bs;
+			live.relit = relit != 0;
+			live.bounce.assign( q, qend );
+		}
+		else if ( !memcmp( tag, "PRBE", 4 ) ) {
+			if ( !get( live.probeOrigin, 12 ) || !get( &live.probeSpacing, 4 ) || !get( live.probeDims, 12 ) )
+				return false;
+			const size_t count = (size_t)Q_max( 0, live.probeDims[0] ) * Q_max( 0, live.probeDims[1] ) * Q_max( 0, live.probeDims[2] );
+			if ( (size_t)( qend - q ) != count * 18 * 2 + count )
+				return false;
+			live.probes.resize( count * 18 );
+			get( live.probes.data(), count * 36 );
+			live.probeValid.assign( q, qend );
+		}
+		else if ( !memcmp( tag, "LITE", 4 ) ) {
+			int32_t n = 0, sun = 0;
+			if ( !get( &n, 4 ) || n < 0 || (size_t)( qend - q ) < (size_t)n * sizeof( dgFixture ) )
+				return false;
+			live.fixtures.resize( n );
+			get( live.fixtures.data(), (size_t)n * sizeof( dgFixture ) );
+			if ( !get( &sun, 4 ) || !get( live.sunDir, 12 ) || !get( live.sunRgb, 12 ) )
+				return false;
+			live.hasSun = sun != 0;
+		}
+		p = qend;
+	}
+	return p == end;
 }
 
 // only accepts a file made for exactly this BSP, these settings and this resolution
@@ -3085,13 +3531,16 @@ bool DG_ReadCache( const byte *data, size_t length, const byte *bsp,
 		|| h.bspHash != bspHash || h.settingsHash != settingsHash
 		|| (size_t)h.lightmapBytes != outBytes || h.pageSize != pageSize
 		|| ( h.numVertexColors != 0 && h.numVertexColors != numDrawVerts )
-		|| length != sizeof( devogiHeader_t ) + outBytes + (size_t)h.numVertexColors * 4 )
+		|| length < sizeof( devogiHeader_t ) + outBytes + (size_t)h.numVertexColors * 4 )
 		return false;
 
 	const byte *p = data + sizeof( devogiHeader_t );
+	const byte *sections = p + outBytes + (size_t)h.numVertexColors * 4;
+	if ( !gi_read_sections( sections, data + length, result.live ) )
+		return false;
 	result.pageSize = pageSize;
 	result.lightmaps.assign( p, p + outBytes );
-	result.vertexColors.assign( p + outBytes, p + outBytes + (size_t)h.numVertexColors * 4 );
+	result.vertexColors.assign( p + outBytes, sections );
 	return true;
 }
 

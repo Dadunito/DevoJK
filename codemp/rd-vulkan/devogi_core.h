@@ -91,10 +91,58 @@ what the GPU can hold, maxScale). The two hashes are the cache key: the BSP
 itself, and the settings + version + the text of the map's shaders (call
 DG_ExtractLights first).
 */
+/*
+A light fixture for real-time lighting: neighbouring glowing patches of one lamp
+shader merged into one lamp, or a light entity. Its strength is already
+calibrated and exposed, so a renderer reproduces the bake's direct light with
+
+    light = rgb * cosR * cosE / max( distance^2, 16 )
+
+where cosR is the angle at the lit surface, and cosE the angle at the lamp
+(-dot( normal, toSurface ), or 1 for an omni light with a zero normal). A lamp
+with halfU/halfV > 0 is a glowing rectangle (axisU and normal x axisU span it),
+which is what makes its shadows soft. Past "reach" it is too weak to matter.
+*/
+struct dgFixture {
+	float	origin[3];
+	float	normal[3];		// facing of the glowing surface; 0 0 0 = shines everywhere
+	float	axisU[3];		// the rectangle's first edge direction
+	float	halfU, halfV;	// half the rectangle's size (0 = a point)
+	float	rgb[3];			// calibrated strength per colour channel
+	float	reach;			// distance where it stops mattering
+	int32_t	shader;			// BSP shader index it comes from, -1 for a light entity
+};
+
+/*
+Everything a renderer needs to light a map live instead of using the full bake:
+direct light comes from the fixtures and the sun, bounce light from these
+lightmaps (surfaces) and probes (models and players).
+*/
+struct dgLiveLighting {
+	bool					relit = false;		// false: the map couldn't be relit, use the full bake
+	// bounce light only, RGB, linear, in lightmap units (same layout as the
+	// lightmaps, at bouncePageSize pixels per page - bounce light is smooth)
+	int						bouncePageSize = 0;
+	std::vector<uint8_t>	bounce;
+	// a grid of light probes: bounce light arriving from 6 directions (an "ambient cube":
+	// +X -X +Y -Y +Z -Z, RGB each, half floats). For a normal n the light is
+	//   n.x^2 * cube[n.x > 0 ? +X : -X] + n.y^2 * cube[..Y] + n.z^2 * cube[..Z]
+	float					probeOrigin[3] = { 0, 0, 0 };	// position of probe (0,0,0)
+	float					probeSpacing = 64.0f;
+	int						probeDims[3] = { 0, 0, 0 };		// probes along x, y, z (x fastest)
+	std::vector<uint16_t>	probes;				// 18 half floats per probe
+	std::vector<uint8_t>	probeValid;			// 0 = inside a wall (filled from neighbours)
+	std::vector<dgFixture>	fixtures;
+	bool					hasSun = false;
+	float					sunDir[3] = { 0, 0, 1 };	// towards the sun
+	float					sunRgb[3] = { 0, 0, 0 };	// calibrated: light = sunRgb * cosR when lit
+};
+
 struct dgResult {
 	int						pageSize = 128;		// pixels per side of each lightmap page
 	std::vector<uint8_t>	lightmaps;			// all pages, RGB, in the BSP's page order
 	std::vector<uint8_t>	vertexColors;		// RGBA per BSP draw vertex (may be empty)
+	dgLiveLighting			live;				// the same lighting split for real-time use
 };
 
 int			DG_ChooseScale( const dgSettings &settings, int maxScale );
@@ -111,7 +159,8 @@ game does. Returns a buffer that is reused by the next call on the same thread.
 const char	*DG_ParseToken( const char **text, bool allowLineBreaks );
 
 /*
-The .devogi cache file: a small header, the lightmap pages, the vertex colours.
+The .devogi cache file: a small header, the lightmap pages, the vertex colours,
+then tagged sections with the live-lighting split (bounce lightmaps, probes, lamps).
 DG_ReadCache only accepts a file made for exactly this BSP, settings and size.
 */
 std::vector<uint8_t>	DG_WriteCache( uint64_t bspHash, uint64_t settingsHash, const dgResult &result );
