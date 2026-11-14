@@ -103,40 +103,57 @@
 		}
 
 		/*
-		DevoGI real-time sun shadow: how much sun reaches this spot, 0..1, from the
-		shadow map drawn from the sun this frame. The lookup is pushed a little off the
-		surface and towards the sun, so a surface never shadows itself ("acne").
-		16 lookups spread over 4x4 shadow-map pixels (each already smoothed 2x2 by the
-		hardware) give soft edges. Near the edge of the map's area, and outside it, the
-		bake's shadow (bakedVis) takes over.
+		DevoGI real-time sun shadow: how much sun reaches this spot, 0..1, from the two
+		shadow maps ("cascades") drawn from the sun this frame: a sharp one around the
+		player and a coarse one across the map, side by side in one image. The lookup is
+		pushed a little off the surface and towards the sun, so a surface never shadows
+		itself ("acne"). 16 lookups over 4x4 shadow-map pixels (each already smoothed
+		2x2 by the hardware) give soft edges.
 		*/
+
+		// one cascade: -1 when the spot is outside it, otherwise the light 0..1, and
+		// 'edge' tells how close to the cascade's border it is (0 centre .. 1 border)
+		float DevoSunShadowCascade( in mat4 mvp, in float cascade, in vec3 p, out float edge )
+		{
+			edge = 1.0;
+			vec4 clip = mvp * vec4( p, 1.0 );
+			vec3 ndc = clip.xyz / clip.w;
+			vec2 fromCentre = abs( ndc.xy );
+			edge = max( fromCentre.x, fromCentre.y );
+			if ( edge >= 0.98 || ndc.z <= 0.0 || ndc.z >= 1.0 )
+				return -1.0;
+
+			vec4 params = u_lights.devo_shadow_params;
+			// this cascade's half of the image
+			vec2 uv = vec2( ( ndc.x * 0.5 + 0.5 + cascade ) * 0.5, ndc.y * 0.5 + 0.5 );
+			float sum = 0.0;
+			for ( int y = 0; y < 4; y++ )
+				for ( int x = 0; x < 4; x++ )
+					sum += texture( devo_shadow_map, vec3( uv + ( vec2( x, y ) - 1.5 ) * params.yz, ndc.z ) );
+			return sum / 16.0;
+		}
+
 		float CalcDevoSunShadow( in vec3 position, in vec3 vertexNormal, in vec3 sunDir, in float bakedVis )
 		{
 			vec4 params = u_lights.devo_shadow_params;
 			if ( params.x < 0.5 )
 				return bakedVis;
 
-			vec3 p = position + vertexNormal * params.z + sunDir * params.z;
-			vec4 clip = u_lights.devo_shadow_mvp * vec4( p, 1.0 );
-			if ( clip.w <= 0.0 )
-				return bakedVis;
-			vec3 ndc = clip.xyz / clip.w;
-			vec2 uv = ndc.xy * 0.5 + 0.5;
+			vec3 offsetDir = vertexNormal + sunDir;
+			float edgeNear, edgeFar;
+			float nearVis = DevoSunShadowCascade( u_lights.devo_shadow_mvp0, 0.0,
+				position + offsetDir * u_lights.devo_shadow_offset.x, edgeNear );
+			float farVis = DevoSunShadowCascade( u_lights.devo_shadow_mvp1, 1.0,
+				position + offsetDir * u_lights.devo_shadow_offset.y, edgeFar );
 
-			// 0 in the middle of the map's area, 1 at its edge
-			vec2 fromCentre = abs( ndc.xy );
-			float edge = max( fromCentre.x, fromCentre.y );
-			if ( edge >= 1.0 || ndc.z <= 0.0 || ndc.z >= 1.0 )
-				return bakedVis;
-
-			float sum = 0.0;
-			for ( int y = 0; y < 4; y++ )
-				for ( int x = 0; x < 4; x++ )
-					sum += texture( devo_shadow_map, vec3( uv + ( vec2( x, y ) - 1.5 ) * params.y, ndc.z ) );
-			float live = sum / 16.0;
-
-			float blend = clamp( ( edge - params.w ) / ( 1.0 - params.w ), 0.0, 1.0 );
-			return mix( live, bakedVis, blend );
+			// far cascade, fading into the bake right at its own border
+			float vis = bakedVis;
+			if ( farVis >= 0.0 )
+				vis = mix( farVis, bakedVis, clamp( ( edgeFar - params.w ) / ( 0.98 - params.w ), 0.0, 1.0 ) );
+			// near cascade on top, fading into the far one at its border
+			if ( nearVis >= 0.0 )
+				vis = mix( nearVis, vis, clamp( ( edgeNear - params.w ) / ( 0.98 - params.w ), 0.0, 1.0 ) );
+			return vis;
 		}
 
 		vec3 CalcDynamicLightContribution(

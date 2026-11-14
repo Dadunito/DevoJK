@@ -254,11 +254,14 @@ STRUCT (
         PAD3                ( pad0 )
 	    VEC4				( devo_sun_dir )
 	    VEC4				( devo_sun_color )
-	    // DevoGI sun shadow map: world -> shadow map clip space, and
-	    // x = 1 when the map is valid, y = one texel in map units (0..1),
-	    // z = how far to push the lookup off the surface, w = fade start (0..1 of the edge)
-	    MAT4				( devo_shadow_mvp )
+	    // DevoGI sun shadow maps (two cascades side by side in one image):
+	    // world -> each cascade's clip space; params: x = 1 when valid,
+	    // y = one texel across the whole image (u), z = one texel (v), w = fade start;
+	    // offset: how far to push each cascade's lookups off the surface
+	    MAT4				( devo_shadow_mvp0 )
+	    MAT4				( devo_shadow_mvp1 )
 	    VEC4				( devo_shadow_params )
+	    VEC4				( devo_shadow_offset )
 	    LIGHT_ENTRY_T		( light[64] )
     , vkUniformLight_t )
 

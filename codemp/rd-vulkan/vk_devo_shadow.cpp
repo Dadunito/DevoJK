@@ -5,7 +5,9 @@ DevoJK - DevoGI sun shadows (real-time)
 Part of DevoGI's real-time lighting (r_devoGI_live 1). Once per frame the
 scene is drawn a second time, from the sun's direction, into a depth-only
 image: the "shadow map". It stores, for every spot of a square area around
-the player, how far the sunlight travels before it hits something. When the
+the player, how far the sunlight travels before it hits something. There are
+two "cascades" side by side in one image: a sharp one close to the player
+and a coarser one that covers the whole map. When the
 lighting shader later lights a pixel with the sun, it looks that pixel up in
 the shadow map: if something was in front of it, it is in shadow. Because
 the map is redrawn every frame, players, weapons, doors and everything else
@@ -105,7 +107,7 @@ void vk_devo_shadow_create( void )
 	image.sType			= VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
 	image.imageType		= VK_IMAGE_TYPE_2D;
 	image.format		= vk.depth_format;
-	image.extent.width	= size;
+	image.extent.width	= size * 2;		// cascade 1 on the left, cascade 2 on the right
 	image.extent.height	= size;
 	image.extent.depth	= 1;
 	image.mipLevels		= 1;
@@ -153,7 +155,7 @@ void vk_devo_shadow_create( void )
 	fb.renderPass		= vk_devoShadow.render_pass;
 	fb.attachmentCount	= 1;
 	fb.pAttachments		= &vk_devoShadow.attachment_view;
-	fb.width			= size;
+	fb.width			= size * 2;
 	fb.height			= size;
 	fb.layers			= 1;
 	VK_CHECK( qvkCreateFramebuffer( vk.device, &fb, NULL, &vk_devoShadow.framebuffer ) );
@@ -175,10 +177,24 @@ void vk_devo_shadow_create( void )
 	VK_CHECK( qvkCreateSampler( vk.device, &sampler, NULL, &vk_devoShadow.sampler ) );
 
 	// the shader may read the map before it was ever drawn: give it a valid, empty-ish layout
+	// (a plain barrier: the renderer's layout helper doesn't know the depth read-only layout)
+	VkImageMemoryBarrier barrier;
+	Com_Memset( &barrier, 0, sizeof( barrier ) );
+	barrier.sType							= VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+	barrier.srcAccessMask					= 0;
+	barrier.dstAccessMask					= VK_ACCESS_SHADER_READ_BIT;
+	barrier.oldLayout						= VK_IMAGE_LAYOUT_UNDEFINED;
+	barrier.newLayout						= VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+	barrier.srcQueueFamilyIndex				= VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex				= VK_QUEUE_FAMILY_IGNORED;
+	barrier.image							= vk_devoShadow.image;
+	barrier.subresourceRange.aspectMask		= VK_IMAGE_ASPECT_DEPTH_BIT | ( hasStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0 );
+	barrier.subresourceRange.levelCount		= 1;
+	barrier.subresourceRange.layerCount		= 1;
+
 	VkCommandBuffer cmd = vk_begin_command_buffer();
-	vk_record_image_layout_transition( cmd, vk_devoShadow.image,
-		VK_IMAGE_ASPECT_DEPTH_BIT | ( hasStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0 ),
-		VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL, 0, 0 );
+	qvkCmdPipelineBarrier( cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+		0, 0, NULL, 0, NULL, 1, &barrier );
 	vk_end_command_buffer( cmd, __func__ );
 
 	vk_devoShadow.active = qtrue;
@@ -224,7 +240,7 @@ void vk_devo_shadow_write_descriptor( VkDescriptorSet set )
 void vk_devo_shadow_begin_pass( void )
 {
 	vk.renderPassIndex = RENDER_PASS_DEVO_SHADOW;
-	vk.renderWidth = vk_devoShadow.size;
+	vk.renderWidth = vk_devoShadow.size * 2;
 	vk.renderHeight = vk_devoShadow.size;
 	vk.renderScaleX = vk.renderScaleY = 1.0f;
 
@@ -237,7 +253,7 @@ void vk_devo_shadow_begin_pass( void )
 	begin.sType						= VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
 	begin.renderPass				= vk_devoShadow.render_pass;
 	begin.framebuffer				= vk_devoShadow.framebuffer;
-	begin.renderArea.extent.width	= vk_devoShadow.size;
+	begin.renderArea.extent.width	= vk_devoShadow.size * 2;
 	begin.renderArea.extent.height	= vk_devoShadow.size;
 	begin.clearValueCount			= 1;
 	begin.pClearValues				= &clear;

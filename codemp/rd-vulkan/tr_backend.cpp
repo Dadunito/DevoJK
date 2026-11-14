@@ -1261,13 +1261,16 @@ const void	*RB_DrawSurfs( const void *data ) {
 		if ( vk.renderPassIndex == RENDER_PASS_DEVO_SHADOW )
 		{
 			RB_RenderDrawSurfList( cmd->drawSurfs, cmd->numDrawSurfs );
-			vk_end_render_pass();
 			R_DevoGI_SunShadowDrawn( &backEnd.viewParms );
 
-			if ( vk_find_screenmap_drawsurfs() )
-				vk_begin_screenmap_render_pass();
-			else
-				vk_begin_main_render_pass();
+			// both cascades share one image and one pass: close it after the last one
+			if ( !vk_next_is_devo_shadow( (const void*)(cmd + 1) ) ) {
+				vk_end_render_pass();
+				if ( vk_find_screenmap_drawsurfs() )
+					vk_begin_screenmap_render_pass();
+				else
+					vk_begin_main_render_pass();
+			}
 		}
 		return (const void*)(cmd + 1);
 	}

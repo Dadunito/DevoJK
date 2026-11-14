@@ -402,6 +402,15 @@ void vk_destroy_framebuffers( void )
 #endif
 }
 
+// DevoGI: is the next draw command another sun shadow cascade?
+qboolean vk_next_is_devo_shadow( const void *curCmd )
+{
+    curCmd = PADP(curCmd, sizeof(void*));
+    if ( *(const int*)curCmd != RC_DRAW_SURFS )
+        return qfalse;
+    return ((const drawSurfsCommand_t*)curCmd)->viewParms.devoShadow ? qtrue : qfalse;
+}
+
 // DevoGI: does the frame start with the sun's shadow view?
 static qboolean vk_find_devo_shadow_drawsurfs( void )
 {
@@ -414,7 +423,7 @@ static qboolean vk_find_devo_shadow_drawsurfs( void )
             curCmd = (const void*)((const drawBufferCommand_t*)curCmd + 1);
             break;
         case RC_DRAW_SURFS:
-            return ((const drawSurfsCommand_t*)curCmd)->viewParms.devoShadow;
+            return ((const drawSurfsCommand_t*)curCmd)->viewParms.devoShadow ? qtrue : qfalse;
         default:
             return qfalse;
         }

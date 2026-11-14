@@ -616,11 +616,12 @@ void RE_RenderScene( const refdef_t *fd ) {
 	// scene from the sun into the shadow map (the backend starts the frame with it)
 	if ( lastRenderCommand == RC_DRAW_BUFFER ) {
 		viewParms_t shadowParms;
-		if ( R_DevoGI_SunShadowView( &parms, &shadowParms ) ) {
-			R_RenderView( &shadowParms );
-			tr.drawSurfCmd = NULL;		// keep it out of the screen-map copies below
-			tr.numDrawSurfCmds = 0;
+		for ( int cascade = 0; cascade < 2; cascade++ ) {	// near and far shadow maps
+			if ( R_DevoGI_SunShadowView( &parms, &shadowParms, cascade ) )
+				R_RenderView( &shadowParms );
 		}
+		tr.drawSurfCmd = NULL;		// keep them out of the screen-map copies below
+		tr.numDrawSurfCmds = 0;
 	}
 
 	R_RenderView(&parms);

@@ -518,6 +518,10 @@ static void R_SetFarClip( void )
 	// The sky renders at zFar so need to move it out a little
 	// ...and make sure there is a minimum zfar to prevent problems
 	tr.viewParms.zFar = Com_Clamp(2048.0f, tr.distanceCull * (1.732), sqrtf(farthestCornerDistance));
+
+	// DevoGI: the sun's camera is far away on purpose; it must reach everything it sees
+	if ( tr.viewParms.devoShadow )
+		tr.viewParms.zFar = sqrtf( farthestCornerDistance ) + 64.0f;
 }
 
 /*
@@ -571,6 +575,34 @@ void R_SetupProjection( viewParms_t *dest, float zProj, qboolean computeFrustum 
 	float	xmin, xmax, ymin, ymax;
 	float	width, height;
 
+	// DevoGI: the sun's shadow views are orthographic - parallel rays, like real sunlight,
+	// over a square of 2 * devoShadowRange around the view's origin
+	if ( dest->devoShadow ) {
+		const float r = dest->devoShadowRange;
+		Com_Memset( dest->projectionMatrix, 0, sizeof( dest->projectionMatrix ) );
+		dest->projectionMatrix[0] = 1.0f / r;
+		dest->projectionMatrix[5] = 1.0f / r;
+		dest->projectionMatrix[15] = 1.0f;
+		if ( computeFrustum ) {
+			// four side planes facing into the square, plus the near plane
+			for ( int i = 0; i < 2; i++ ) {
+				const float *axis = dest->ori.axis[i + 1];
+				const float centre = DotProduct( dest->ori.origin, axis );
+				VectorCopy( axis, dest->frustum[i * 2].normal );
+				dest->frustum[i * 2].dist = centre - r;
+				VectorScale( axis, -1.0f, dest->frustum[i * 2 + 1].normal );
+				dest->frustum[i * 2 + 1].dist = -centre - r;
+			}
+			VectorCopy( dest->ori.axis[0], dest->frustum[4].normal );
+			dest->frustum[4].dist = DotProduct( dest->ori.origin, dest->frustum[4].normal );
+			for ( int i = 0; i < 5; i++ ) {
+				dest->frustum[i].type = PLANE_NON_AXIAL;
+				SetPlaneSignbits( &dest->frustum[i] );
+			}
+		}
+		return;
+	}
+
 	ymax = zProj * tan(dest->fovY * M_PI / 360.0f);
 	ymin = -ymax;
 
@@ -620,6 +652,13 @@ static void R_SetupProjectionZ( viewParms_t *dest ) {
 	dest->projectionMatrix[10] = -zFar / depth;
 	dest->projectionMatrix[14] = -zFar * zNear / depth;
 #endif
+
+	// DevoGI sun shadow views: orthographic depth, 0 at the near plane .. 1 at the far one
+	if ( dest->devoShadow ) {
+		dest->projectionMatrix[10] = -1.0f / depth;
+		dest->projectionMatrix[14] = -zNear / depth;
+		return;
+	}
 
 	if (dest->portalView != PV_NONE)
 	{

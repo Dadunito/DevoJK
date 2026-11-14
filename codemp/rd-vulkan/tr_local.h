@@ -927,7 +927,8 @@ typedef struct viewParms_s {
 	cubemap_t		*targetCube;
 	int				targetCubeLayer;
 
-	qboolean		devoShadow;		// DevoGI: the sun's view, drawn into the shadow map
+	int				devoShadow;		// DevoGI: the sun's view for shadow cascade 1 or 2 (0 = a normal view)
+	float			devoShadowRange;// half the side of the square the sun's view covers (orthographic)
 } viewParms_t;
 
 /*
@@ -2875,7 +2876,7 @@ float		R_DevoGI_LightmapAlpha( int page, int pixel );
 qboolean	R_DevoGI_LiveActive( void );
 qboolean	R_DevoGI_EntityLighting( const vec3_t point, vec3_t ambient, vec3_t directed, float *sunVis );
 void		R_DevoGI_FillLights( const trRefdef_t *refdef, vkUniformLight_t *uniform );
-qboolean	R_DevoGI_SunShadowView( const viewParms_t *mainView, viewParms_t *out );
+qboolean	R_DevoGI_SunShadowView( const viewParms_t *mainView, viewParms_t *out, int cascade );
 void		R_DevoGI_SunShadowDrawn( const viewParms_t *view );
 
 // Vulkan

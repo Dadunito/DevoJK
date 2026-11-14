@@ -1397,7 +1397,8 @@ void		vk_begin_cubemap_render_pass( void );
 // DevoGI sun shadows (vk_devo_shadow.cpp): a depth image drawn from the sun's view
 typedef struct {
 	qboolean		active;
-	uint32_t		size;				// pixels per side (r_devoGI_sunShadowSize)
+	uint32_t		size;				// pixels per side of each cascade (r_devoGI_sunShadowSize);
+										// the image holds both cascades side by side
 	VkImage			image;
 	VkDeviceMemory	memory;
 	VkImageView		attachment_view;	// for drawing into
@@ -1412,6 +1413,7 @@ void		vk_devo_shadow_destroy( void );
 void		vk_devo_shadow_write_descriptor( VkDescriptorSet set );
 void		vk_devo_shadow_begin_pass( void );
 qboolean	vk_find_screenmap_drawsurfs( void );
+qboolean	vk_next_is_devo_shadow( const void *cmd );
 void		vk_create_cubemap_prefilter( void );
 void		vk_destroy_cubemap_prefilter( void );
 #endif
