@@ -237,6 +237,8 @@ file is missing, the map is baked again and the file rewritten.
 static std::vector<byte> gi_vertexColors;
 // surfaces that get their own lightmap spot, also applied in R_DevoGI_PatchVertexColors
 static std::vector<dgLightmapMove> gi_lightmapMoves;
+// DevoGI lit this map: its faceted round walls get smooth normals too (R_DevoGI_PatchVertexColors)
+static bool gi_smoothMapNormals;
 
 /*
 Real-time lighting (r_devoGI_live 1). The bake's light split is kept here for the
@@ -291,6 +293,7 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 	*outNumPages = 0;
 	gi_vertexColors.clear();
 	gi_lightmapMoves.clear();
+	gi_smoothMapNormals = false;
 	gi_liveActive = false;
 	gi_live = dgLiveLighting();
 	gi_liveAlpha.clear();
@@ -345,6 +348,7 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 	// are moved before it builds them (R_DevoGI_PatchVertexColors)
 	gi_lightmapMoves.swap( result.lightmapMoves );
 	*outNumPages = DG_NumPages( result );
+	gi_smoothMapNormals = true;
 
 	// ---- 3a. real-time lighting: the GPU gets bounce light only, the lamps come live ----
 	const int numPages = (int)( result.lightmaps.size() / ( (size_t)result.pageSize * result.pageSize * 3 ) );
@@ -696,8 +700,12 @@ moves the surfaces that got their own lightmap spot (see dgLightmapMove).
 
 void R_DevoGI_PatchVertexColors( byte *fileBase, const dheader_t *header )
 {
-	// surfaces that shared a lightmap spot with another one get their own
+	// surfaces that shared a lightmap spot with another one, or get more detail, move
 	DG_ApplyLightmapMoves( fileBase, gi_lightmapMoves );
+	// round walls made of flat faces shade smoothly, as in the bake
+	if ( gi_smoothMapNormals )
+		DG_SmoothMapNormals( fileBase );
+	gi_smoothMapNormals = false;
 	gi_lightmapMoves.clear();
 	gi_lightmapMoves.shrink_to_fit();
 

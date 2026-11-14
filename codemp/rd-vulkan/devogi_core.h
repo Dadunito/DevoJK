@@ -145,17 +145,21 @@ struct dgLiveLighting {
 };
 
 /*
-A surface that got its own spot in the lightmaps. The original compiler lets
-surfaces whose old light came out identical share one spot in a lightmap page
-(two stair steps, two bench ends). DevoGI lights every surface on its own, so
-each sharing surface (after the first) moves to a new page added after the
-BSP's own pages. A renderer applies these moves to the loaded BSP before it
-reads the surfaces (DG_ApplyLightmapMoves).
+A surface that got its own spot in the lightmaps, on new pages added after the
+BSP's own. Two reasons:
+  - The original compiler lets surfaces whose old light came out identical share
+    one spot (two stair steps, two bench ends). DevoGI lights every surface on
+    its own, so each sharing surface (but one) moves.
+  - Detail: a surface crossed by a sharp shadow edge, or a very thin face, gets
+    2 or 4 times more lightmap pixels each way (scale), for crisp shadows.
+A renderer applies these moves to the loaded BSP before it reads the surfaces
+(DG_ApplyLightmapMoves): lightmap coordinate = old * scale + d / 128.
 */
 struct dgLightmapMove {
 	int32_t	surf;			// BSP surface number
 	int32_t	page;			// its new lightmap page
-	int32_t	dx, dy;			// how far its lightmap coordinates shift, in pixels of a 128x128 page
+	int32_t	dx, dy;			// added to its lightmap coordinates, in pixels of a 128x128 page
+	int32_t	scale;			// 1, 2 or 4: more pixels for the same surface
 };
 
 struct dgResult {
@@ -170,6 +174,8 @@ struct dgResult {
 int			DG_NumPages( const dgResult &result );
 // moves surfaces to their own lightmap spots (see dgLightmapMove), in a BSP loaded in memory
 void		DG_ApplyLightmapMoves( uint8_t *bsp, const std::vector<dgLightmapMove> &moves );
+// gives faceted round walls smooth normals (as the bake shades them), in a BSP loaded in memory
+void		DG_SmoothMapNormals( uint8_t *bsp );
 
 int			DG_ChooseScale( const dgSettings &settings, int maxScale );
 uint64_t	DG_BspHash( const uint8_t *bsp );

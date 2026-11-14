@@ -328,7 +328,7 @@ static_assert( sizeof( dsurface_t ) == 148, "dsurface_t must match the BSP file"
 #include <vector>
 
 // Bump this whenever the bake changes in a way that should invalidate old .devogi files.
-#define DEVOGI_VERSION		20
+#define DEVOGI_VERSION		21
 
 #define DEVOGI_BSP_LM_SIZE	128			// lightmap page size stored in every Q3/JA BSP
 #define DEVOGI_LM_SIZE		gi_lmSize	// page size we are baking right now (128 * scale)
@@ -524,6 +524,7 @@ struct giVert {
 	float	st[2];					// texture coordinates (where a glowing texture is sampled)
 	float	lm[MAXLIGHTMAPS][2];	// lightmap coordinates, per light style slot (0..1 across a page)
 	float	color[MAXLIGHTMAPS][3];	// q3map2's baked vertex colours, per light style slot
+	int		bspVert;				// the BSP draw vertex it is (-1: made here, e.g. a patch point)
 };
 
 struct giTri {
@@ -590,6 +591,7 @@ static giVert gi_patch_eval( const giVert *c[9], float u, float v ) {
 		}
 	}
 	out.normal = gnorm( out.normal );
+	out.bspVert = -1;
 	return out;
 }
 
@@ -751,6 +753,7 @@ static void gi_build_geometry( giScene &scene, const byte *fileBase, const dhead
 			for ( int v = 0; v < nv; v++ ) {
 				giVert gv;
 				gi_load_vert( gv, dv[firstVert + v] );
+				gv.bspVert = firstVert + v;
 				scene.verts.push_back( gv );
 			}
 			for ( int k = 0; k + 2 < ni; k += 3 ) {
@@ -769,8 +772,10 @@ static void gi_build_geometry( giScene &scene, const byte *fileBase, const dhead
 			if ( w < 3 || h < 3 || w * h > nv || !( w & 1 ) || !( h & 1 ) )
 				continue;
 			std::vector<giVert> ctrl( w * h );
-			for ( int v = 0; v < w * h; v++ )
+			for ( int v = 0; v < w * h; v++ ) {
 				gi_load_vert( ctrl[v], dv[firstVert + v] );
+				ctrl[v].bspVert = -1;
+			}
 
 			const int steps = DEVOGI_PATCH_STEPS;
 			for ( int py = 0; py + 2 < h; py += 2 ) {
@@ -1517,12 +1522,13 @@ static void gi_cover_tri_128( const giScene &scene, const giTri &t, F fn ) {
 
 /*
 Finds the sharing surfaces and moves them (in the bake's own copy of the
-geometry). Returns the new number of lightmap pages; "moves" says what moved.
+geometry), along with every surface that gets more detail (detail[surf] > 1:
+that many times more lightmap pixels each way, see gi_detail_scales). Returns the new number of lightmap pages; "moves" says what moved.
 "srcOut" gets the BSP's own 128x128 lightmaps with every moved surface's old
 light copied to its new spot: the old light is still used for light styles and
 for matching the lamps' brightness.
 */
-static int gi_unshare_lightmaps( giScene &scene, const byte *src, int bspPages,
+static int gi_unshare_lightmaps( giScene &scene, const byte *src, int bspPages, const std::vector<int> &detail,
 	std::vector<dgLightmapMove> &moves, std::vector<byte> &srcOut ) {
 	const int N = DEVOGI_BSP_LM_SIZE;
 	moves.clear();
@@ -1610,13 +1616,16 @@ static int gi_unshare_lightmaps( giScene &scene, const byte *src, int bspPages,
 			for ( int pix : mineInside )
 				ownerInside[pix] = -1;
 			toMove.push_back( s );
+		} else if ( !extraStyles && covered > 0 && s < (int)detail.size() && detail[s] > 1 ) {
+			toMove.push_back( s );	// moves for more detail (it keeps its claim, so sharers still move)
 		}
 	}
 	if ( toMove.empty() )
 		return bspPages;
 
-	// the lightmap rectangle of each surface to move
-	struct moveRect_t { int surf, x0, y0, w, h; };
+	// the lightmap rectangle of each surface to move: x0, y0, w0, h0 its block on the old
+	// page, scale how much bigger it gets, w, h its new size with an empty border
+	struct moveRect_t { int surf, x0, y0, w0, h0, scale, w, h; };
 	std::vector<moveRect_t> rects;
 	for ( int s : toMove ) {
 		float mins[2] = { 1e9f, 1e9f }, maxs[2] = { -1e9f, -1e9f };
@@ -1631,10 +1640,15 @@ static int gi_unshare_lightmaps( giScene &scene, const byte *src, int bspPages,
 		}
 		moveRect_t r;
 		r.surf = s;
-		r.x0 = (int)floorf( mins[0] ) - DEVOGI_MOVE_PAD;
-		r.y0 = (int)floorf( mins[1] ) - DEVOGI_MOVE_PAD;
-		r.w = (int)ceilf( maxs[0] ) + DEVOGI_MOVE_PAD - r.x0;
-		r.h = (int)ceilf( maxs[1] ) + DEVOGI_MOVE_PAD - r.y0;
+		r.x0 = (int)floorf( mins[0] );
+		r.y0 = (int)floorf( mins[1] );
+		r.w0 = Q_max( 1, (int)ceilf( maxs[0] ) - r.x0 );
+		r.h0 = Q_max( 1, (int)ceilf( maxs[1] ) - r.y0 );
+		r.scale = s < (int)detail.size() ? Q_max( 1, detail[s] ) : 1;
+		while ( r.scale > 1 && Q_max( r.w0, r.h0 ) * r.scale + 2 * DEVOGI_MOVE_PAD > N )
+			r.scale /= 2;	// too big for a page at that detail
+		r.w = r.w0 * r.scale + 2 * DEVOGI_MOVE_PAD;
+		r.h = r.h0 * r.scale + 2 * DEVOGI_MOVE_PAD;
 		if ( r.w > N || r.h > N )
 			continue;	// can't happen in a valid map
 		rects.push_back( r );
@@ -1655,21 +1669,24 @@ static int gi_unshare_lightmaps( giScene &scene, const byte *src, int bspPages,
 			page++;
 			shelfX = shelfY = shelfH = 0;
 		}
+		// new coordinate = old * scale + d (in pixels of a 128 page), so that the old
+		// block's corner lands just inside the border of the new spot
 		dgLightmapMove m;
 		m.surf = r.surf;
 		m.page = page;
-		m.dx = shelfX - r.x0;
-		m.dy = shelfY - r.y0;
+		m.dx = shelfX + DEVOGI_MOVE_PAD - r.x0 * r.scale;
+		m.dy = shelfY + DEVOGI_MOVE_PAD - r.y0 * r.scale;
+		m.scale = r.scale;
 		moves.push_back( m );
 
-		// its old light, padding included, goes along
+		// its old light goes along (enlarged with it), border included
 		if ( srcOut.size() < (size_t)( page + 1 ) * N * N * 3 )
 			srcOut.resize( (size_t)( page + 1 ) * N * N * 3, 0 );
 		const int from = scene.surfs[r.surf].lightmapNum[0];
 		for ( int y = 0; y < r.h; y++ ) {
-			const int sy = r.y0 + y;
+			const int sy = (int)floorf( ( y + 0.5f - DEVOGI_MOVE_PAD ) / r.scale ) + r.y0;
 			for ( int x = 0; x < r.w; x++ ) {
-				const int sx = r.x0 + x;
+				const int sx = (int)floorf( ( x + 0.5f - DEVOGI_MOVE_PAD ) / r.scale ) + r.x0;
 				if ( sx < 0 || sy < 0 || sx >= N || sy >= N )
 					continue;
 				memcpy( &srcOut[( ( (size_t)page * N + shelfY + y ) * N + shelfX + x ) * 3],
@@ -1691,8 +1708,8 @@ static int gi_unshare_lightmaps( giScene &scene, const byte *src, int bspPages,
 				if ( shifted[v] )
 					continue;
 				shifted[v] = 1;
-				scene.verts[v].lm[0][0] += m.dx / (float)N;
-				scene.verts[v].lm[0][1] += m.dy / (float)N;
+				scene.verts[v].lm[0][0] = scene.verts[v].lm[0][0] * m.scale + m.dx / (float)N;
+				scene.verts[v].lm[0][1] = scene.verts[v].lm[0][1] * m.scale + m.dy / (float)N;
 			}
 		}
 	}
@@ -1938,9 +1955,10 @@ static void gi_world_smooth( const giBake &bake, const giSpatialHash &hash, std:
 	const float aa = 1.0f + Com_Clamp( 0.25f, 4.0f, g_set.aa );
 	gi_parallel_for( (int)bake.texels.size(), [&]( int i ) {
 		const giTexel &tx = bake.texels[i];
-		// at least a few of its own texels wide: where the lightmap is stretched, a
-		// light change squeezed into one long texel shows as a staircase
-		const float r = Com_Clamp( radius, Q_max( radius, 24.0f ), tx.sizeMax * aa );
+		// a few of its own texels wide: where the lightmap is stretched, a light change
+		// squeezed into one long texel shows as a staircase; where a surface got more
+		// detail (gi_detail_scales), a smaller radius keeps its shadows crisp
+		const float r = Com_Clamp( Q_min( radius, 1.0f ), Q_max( radius, 24.0f ), tx.sizeMax * aa );
 		const float r2 = r * r;
 		T sum = T();
 		float wsum = 0;
@@ -3619,6 +3637,195 @@ baked (no lightmaps inside the BSP).
 ===========================================================================
 */
 
+/*
+===========================================================================
+Detail where it matters
+
+The lightmap resolution is the same everywhere, but sharp shadow edges are
+not: most of a level is evenly lit, while a few surfaces are crossed by the
+hard edge of a sun shadow or a lamp's shadow. Those (and very thin faces like
+stair risers and door jambs, which only get a sliver of a pixel) get 2 or 4
+times more pixels each way, on pages of their own, within a memory budget.
+
+To find them, a quick first look at the map's own 128x128 grid: at every
+lightmap pixel, can the sun be seen, and the three lamps that light it most?
+Where two neighbouring pixels of a surface disagree, a shadow edge runs
+through it.
+===========================================================================
+*/
+
+#define DEVOGI_DETAIL_BUDGET	0.75f	// extra pixels allowed, as a share of all the BSP's pages
+
+static std::vector<int> gi_detail_scales( const giScene &scene, int bspPages ) {
+	const int N = DEVOGI_BSP_LM_SIZE;
+	const int numSurfs = (int)scene.surfs.size();
+	std::vector<int> detail( numSurfs, 1 );
+
+	// every pixel well inside a lightmapped surface, with its spot in the world
+	struct sample_t { gvec3 pos, normal; int surf, key; uint32_t sig[4]; };
+	std::vector<sample_t> samples;
+	std::unordered_map<int, int> at;	// page pixel -> sample
+	std::vector<int> luxels( numSurfs, 0 );
+	std::vector<float> minU( numSurfs, 1e9f ), maxU( numSurfs, -1e9f ), minV( numSurfs, 1e9f ), maxV( numSurfs, -1e9f );
+	for ( const giTri &t : scene.tris ) {
+		const giSurf &gs = scene.surfs[t.surf];
+		const int page = gs.lightmapNum[0];
+		if ( page < 0 || page >= bspPages || gs.sky || gs.lightmapStyle[0] != 0 )
+			continue;
+		const giVert *v[3] = { &scene.verts[t.vert[0]], &scene.verts[t.vert[1]], &scene.verts[t.vert[2]] };
+		float px[3], py[3];
+		for ( int i = 0; i < 3; i++ ) {
+			px[i] = v[i]->lm[0][0] * N;
+			py[i] = v[i]->lm[0][1] * N;
+			minU[t.surf] = Q_min( minU[t.surf], px[i] ); maxU[t.surf] = Q_max( maxU[t.surf], px[i] );
+			minV[t.surf] = Q_min( minV[t.surf], py[i] ); maxV[t.surf] = Q_max( maxV[t.surf], py[i] );
+		}
+		const float area = ( px[1] - px[0] ) * ( py[2] - py[0] ) - ( px[2] - px[0] ) * ( py[1] - py[0] );
+		if ( fabsf( area ) < 1e-6f )
+			continue;
+		const int x0 = Q_max( 0, (int)floorf( Q_min( px[0], Q_min( px[1], px[2] ) ) ) );
+		const int y0 = Q_max( 0, (int)floorf( Q_min( py[0], Q_min( py[1], py[2] ) ) ) );
+		const int x1 = Q_min( N - 1, (int)ceilf( Q_max( px[0], Q_max( px[1], px[2] ) ) ) );
+		const int y1 = Q_min( N - 1, (int)ceilf( Q_max( py[0], Q_max( py[1], py[2] ) ) ) );
+		for ( int y = y0; y <= y1; y++ ) {
+			for ( int x = x0; x <= x1; x++ ) {
+				const float cx = x + 0.5f, cy = y + 0.5f;
+				const float w1 = ( ( cx - px[0] ) * ( py[2] - py[0] ) - ( px[2] - px[0] ) * ( cy - py[0] ) ) / area;
+				const float w2 = ( ( px[1] - px[0] ) * ( cy - py[0] ) - ( cx - px[0] ) * ( py[1] - py[0] ) ) / area;
+				const float w0 = 1 - w1 - w2;
+				if ( w0 < 0 || w1 < 0 || w2 < 0 )
+					continue;
+				const int key = ( page * N + y ) * N + x;
+				if ( at.count( key ) )
+					continue;
+				sample_t smp;
+				smp.pos = v[0]->xyz * w0 + v[1]->xyz * w1 + v[2]->xyz * w2;
+				smp.normal = t.n;
+				smp.surf = t.surf;
+				smp.key = key;
+				at[key] = (int)samples.size();
+				samples.push_back( smp );
+				luxels[t.surf]++;
+			}
+		}
+	}
+
+	// what each one sees: the sun (sig[0]: 0 hidden, 1 visible, 2 faces away) and its
+	// three strongest lamps (sig[1..3]: lamp number * 2 + visible, or ~0 for none)
+	gi_parallel_for( (int)samples.size(), [&]( int i ) {
+		sample_t &smp = samples[i];
+		const gvec3 o = smp.pos + smp.normal * 1.5f;
+		smp.sig[0] = 2;
+		if ( gi_hasSun && gdot( smp.normal, gi_sunDir ) > 0.02f ) {
+			giHit hit;
+			const bool lit = !gi_trace( scene, o, gi_sunDir, 16384.0f, hit, false, DEVOGI_RAY_TMIN )
+				|| scene.surfs[scene.tris[hit.tri].surf].sky;
+			smp.sig[0] = lit ? 1 : 0;
+		}
+		int best[3] = { -1, -1, -1 };
+		float bestE[3] = { 0, 0, 0 };
+		for ( int li = 0; li < (int)gi_lights.size(); li++ ) {
+			const devoLight_t &lt = gi_lights[li];
+			const gvec3 target = lt.halfU > 0 ? lt.rectCentre + lt.normal * 1.0f : lt.origin;
+			gvec3 L = target - o;
+			const float d2 = gdot( L, L );
+			if ( d2 > lt.radius * lt.radius || d2 < 1.0f )
+				continue;
+			L = L * ( 1.0f / sqrtf( d2 ) );
+			const float cr = gdot( smp.normal, L );
+			const float ce = lt.size > 0 ? -gdot( lt.normal, L ) : 1.0f;
+			if ( cr <= 0 || ce <= 0 )
+				continue;
+			const float e = lt.photons * cr * ce / Q_max( d2, 16.0f );
+			if ( e < 1.0f )
+				continue;
+			for ( int k = 0; k < 3; k++ ) {
+				if ( e > bestE[k] ) {
+					for ( int m = 2; m > k; m-- ) { bestE[m] = bestE[m - 1]; best[m] = best[m - 1]; }
+					bestE[k] = e;
+					best[k] = li;
+					break;
+				}
+			}
+		}
+		for ( int k = 0; k < 3; k++ ) {
+			smp.sig[k + 1] = ~0u;
+			if ( best[k] < 0 )
+				continue;
+			const devoLight_t &lt = gi_lights[best[k]];
+			const gvec3 target = lt.halfU > 0 ? lt.rectCentre + lt.normal * 1.0f : lt.origin;
+			gvec3 L = target - o;
+			const float d = sqrtf( gdot( L, L ) );
+			giHit hit;
+			const bool lit = d - 0.5f <= DEVOGI_RAY_TMIN
+				|| !gi_trace( scene, o, L * ( 1.0f / d ), d - 0.5f, hit, true, DEVOGI_RAY_TMIN );
+			smp.sig[k + 1] = (uint32_t)best[k] * 2u + ( lit ? 1u : 0u );
+		}
+	} );
+
+	// shadow edges: neighbouring pixels of the same surface that see different things
+	std::vector<int> edges( numSurfs, 0 );
+	auto differs = [&]( const sample_t &a, const sample_t &b ) {
+		if ( a.sig[0] != b.sig[0] && a.sig[0] != 2 && b.sig[0] != 2 )
+			return true;
+		for ( int i = 1; i < 4; i++ )
+			for ( int j = 1; j < 4; j++ )
+				if ( a.sig[i] != ~0u && b.sig[j] != ~0u && ( a.sig[i] >> 1 ) == ( b.sig[j] >> 1 ) && a.sig[i] != b.sig[j] )
+					return true;
+		return false;
+	};
+	for ( const sample_t &smp : samples ) {
+		const int nb[2] = { smp.key + 1, smp.key + N };
+		for ( int k : nb ) {
+			auto it = at.find( k );
+			if ( it == at.end() )
+				continue;
+			const sample_t &o = samples[it->second];
+			if ( o.surf == smp.surf && differs( smp, o ) )
+				edges[smp.surf]++;
+		}
+	}
+
+	// first the surfaces with the most shadow edge for their size, until the budget is
+	// spent; then, with what is left, thin faces (2x)
+	double budget = (double)bspPages * N * N * DEVOGI_DETAIL_BUDGET;
+	int thin = 0, sharp = 0, edgeSurfs = 0;
+	std::vector<std::pair<float, int>> order;
+	for ( int s = 0; s < numSurfs; s++ ) {
+		if ( edges[s] > 0 && luxels[s] > 0 ) {
+			order.push_back( std::make_pair( -(float)edges[s] / sqrtf( (float)luxels[s] ), s ) );
+			edgeSurfs++;
+		}
+	}
+	std::sort( order.begin(), order.end() );
+	for ( const std::pair<float, int> &c : order ) {
+		const int s = c.second;
+		const float w = maxU[s] - minU[s] + 1, h = maxV[s] - minV[s] + 1;
+		const int scale = w * h <= 24.0f * 24.0f ? 4 : 2;
+		const double cost = (double)w * h * ( scale * scale - 1 );
+		if ( cost > budget )
+			continue;
+		budget -= cost;
+		detail[s] = scale;
+		sharp++;
+	}
+	for ( int s = 0; s < numSurfs; s++ ) {
+		if ( detail[s] > 1 || maxU[s] < minU[s] )
+			continue;
+		const float w = maxU[s] - minU[s], h = maxV[s] - minV[s];
+		if ( Q_min( w, h ) >= 1.5f || Q_max( w, h ) >= 32.0f )
+			continue;
+		const double cost = ( w * 2 + 4 ) * ( h * 2 + 4 );	// a sliver: one blurry row otherwise
+		if ( cost > budget )
+			break;
+		budget -= cost;
+		detail[s] = 2;
+		thin++;
+	}
+	dg_print( "DevoGI: more detail for %d of %d surfaces with sharp shadows, and %d thin faces\n", sharp, edgeSurfs, thin );
+	return detail;
+}
+
 bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &settings, int scale, dgResult &result )
 {
 	g_set = settings;
@@ -3743,15 +3950,16 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 	gi_progress_stage( "Preparing geometry", 0.0f, 0.03f );
 
 	gi_build_geometry( bake.scene, fileBase, header );
-	numPages = gi_unshare_lightmaps( bake.scene, srcLightmaps, bspPages, result.lightmapMoves, movedSrc );
+	gi_build_bvh( bake.scene );	// (the lightmap moves below don't change the tree)
+	numPages = gi_unshare_lightmaps( bake.scene, srcLightmaps, bspPages, gi_detail_scales( bake.scene, bspPages ),
+		result.lightmapMoves, movedSrc );
 	if ( numPages > bspPages ) {
 		srcLightmaps = movedSrc.data();
 		bake.numPages = numPages;
-		dg_print( "DevoGI: %d surfaces shared a lightmap spot with another one, they get their own on %d new page%s\n",
+		dg_print( "DevoGI: %d surfaces got their own lightmap spot (shared spots, more detail) on %d new page%s\n",
 			(int)result.lightmapMoves.size(), numPages - bspPages, numPages - bspPages > 1 ? "s" : "" );
 	}
 	const int outBytes = numPages * pageBytes;
-	gi_build_bvh( bake.scene );
 
 	// the GPU tracer: the BVH and the triangles go to the GPU once, then the bounce
 	// light (the bulk of the work) is traced there in big batches
@@ -4079,8 +4287,8 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 				if ( moveOf[surf] >= 0 ) {
 					const dgLightmapMove &m = result.lightmapMoves[moveOf[surf]];
 					page = m.page;
-					u += m.dx / (float)DEVOGI_BSP_LM_SIZE;
-					w += m.dy / (float)DEVOGI_BSP_LM_SIZE;
+					u = u * m.scale + m.dx / (float)DEVOGI_BSP_LM_SIZE;
+					w = w * m.scale + m.dy / (float)DEVOGI_BSP_LM_SIZE;
 				}
 				const float fx = Com_Clamp( 0.0f, (float)( DEVOGI_LM_SIZE - 1 ), u * DEVOGI_LM_SIZE - 0.5f );
 				const float fy = Com_Clamp( 0.0f, (float)( DEVOGI_LM_SIZE - 1 ), w * DEVOGI_LM_SIZE - 0.5f );
@@ -4919,7 +5127,7 @@ bool DG_ReadCache( const byte *data, size_t length, const byte *bsp,
 	if ( !gi_read_sections( sections, data + length, result ) )
 		return false;
 	for ( const dgLightmapMove &m : result.lightmapMoves )
-		if ( m.surf < 0 || m.surf >= numSurfs || m.page < bspPages || m.page >= numPages )
+		if ( m.surf < 0 || m.surf >= numSurfs || m.page < bspPages || m.page >= numPages || m.scale < 1 || m.scale > 8 )
 			return false;	// damaged
 	if ( result.lightmapMoves.empty() && numPages != bspPages )
 		return false;
@@ -4929,13 +5137,46 @@ bool DG_ReadCache( const byte *data, size_t length, const byte *bsp,
 	return true;
 }
 
+/*
+Smooth shading for the renderer: the normals gi_smooth_normals gives faceted
+round walls in the bake, written into a BSP loaded in memory, so per-pixel
+light drawn live (the sun, lamps) runs smoothly across them too, instead of
+showing every flat face of the wall as its own stripe.
+*/
+void DG_SmoothMapNormals( byte *bsp )
+{
+	const dheader_t *header = (const dheader_t *)bsp;
+	giScene *scene = new giScene();
+	const lump_t &l = header->lumps[LUMP_SHADERS];
+	const dshader_t *sh = (const dshader_t *)( bsp + l.fileofs );
+	const int count = l.filelen / (int)sizeof( dshader_t );
+	scene->shaders.resize( Q_max( 1, count ) );
+	for ( int i = 0; i < count; i++ ) {	// only which surfaces are sky or invisible matters here
+		scene->shaders[i].surfaceFlags = LittleLong( sh[i].surfaceFlags );
+		scene->shaders[i].contentFlags = LittleLong( sh[i].contentFlags );
+	}
+	gi_build_geometry( *scene, bsp, header );
+
+	const lump_t &lv = header->lumps[LUMP_DRAWVERTS];
+	mapVert_t *dv = (mapVert_t *)( bsp + lv.fileofs );
+	const int numVerts = lv.filelen / (int)sizeof( mapVert_t );
+	for ( const giVert &gv : scene->verts ) {
+		if ( gv.bspVert < 0 || gv.bspVert >= numVerts )
+			continue;
+		dv[gv.bspVert].normal[0] = LittleFloat( gv.normal.x );
+		dv[gv.bspVert].normal[1] = LittleFloat( gv.normal.y );
+		dv[gv.bspVert].normal[2] = LittleFloat( gv.normal.z );
+	}
+	delete scene;
+}
+
 int DG_NumPages( const dgResult &result )
 {
 	const size_t pageBytes = (size_t)result.pageSize * result.pageSize * 3;
 	return pageBytes ? (int)( result.lightmaps.size() / pageBytes ) : 0;
 }
 
-// shifts each moved surface's lightmap coordinates (style slot 0) and points it at its new page
+// moves each surface's lightmap coordinates (style slot 0) to its new spot and points it at its new page
 void DG_ApplyLightmapMoves( byte *bsp, const std::vector<dgLightmapMove> &moves )
 {
 	const dheader_t *header = (const dheader_t *)bsp;
@@ -4954,8 +5195,9 @@ void DG_ApplyLightmapMoves( byte *bsp, const std::vector<dgLightmapMove> &moves 
 		for ( int v = first; v < first + nv; v++ ) {
 			if ( v < 0 || v >= numVerts )
 				continue;
-			verts[v].lightmap[0][0] = LittleFloat( LittleFloat( verts[v].lightmap[0][0] ) + m.dx / (float)DEVOGI_BSP_LM_SIZE );
-			verts[v].lightmap[0][1] = LittleFloat( LittleFloat( verts[v].lightmap[0][1] ) + m.dy / (float)DEVOGI_BSP_LM_SIZE );
+			const float scale = (float)Q_max( 1, m.scale );
+			verts[v].lightmap[0][0] = LittleFloat( LittleFloat( verts[v].lightmap[0][0] ) * scale + m.dx / (float)DEVOGI_BSP_LM_SIZE );
+			verts[v].lightmap[0][1] = LittleFloat( LittleFloat( verts[v].lightmap[0][1] ) * scale + m.dy / (float)DEVOGI_BSP_LM_SIZE );
 		}
 	}
 }
