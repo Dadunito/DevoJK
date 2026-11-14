@@ -57,7 +57,9 @@
 #define VK_DESC_UNIFORM_BONES_BINDING		4
 #define VK_DESC_UNIFORM_FOGS_BINDING		5
 #define VK_DESC_UNIFORM_GLOBAL_BINDING		6
-#define VK_DESC_UNIFORM_COUNT				7
+#define VK_DESC_UNIFORM_COUNT				7	// dynamic uniform buffers in the set
+// DevoGI: the sun's shadow map, a sampler in the same set (not a uniform buffer, so not counted)
+#define VK_DESC_UNIFORM_DEVO_SHADOW_BINDING	7
 
 #ifdef GLSL
     #ifdef USE_TX2
@@ -252,6 +254,11 @@ STRUCT (
         PAD3                ( pad0 )
 	    VEC4				( devo_sun_dir )
 	    VEC4				( devo_sun_color )
+	    // DevoGI sun shadow map: world -> shadow map clip space, and
+	    // x = 1 when the map is valid, y = one texel in map units (0..1),
+	    // z = how far to push the lookup off the surface, w = fade start (0..1 of the edge)
+	    MAT4				( devo_shadow_mvp )
+	    VEC4				( devo_shadow_params )
 	    LIGHT_ENTRY_T		( light[64] )
     , vkUniformLight_t )
 

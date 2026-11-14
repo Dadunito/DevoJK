@@ -1255,6 +1255,23 @@ const void	*RB_DrawSurfs( const void *data ) {
 	// clear the z buffer, set the modelview, etc
 	RB_BeginDrawingView();
 
+	// DevoGI: the sun's view, drawn into the shadow map (the frame began with its pass)
+	if ( backEnd.viewParms.devoShadow )
+	{
+		if ( vk.renderPassIndex == RENDER_PASS_DEVO_SHADOW )
+		{
+			RB_RenderDrawSurfList( cmd->drawSurfs, cmd->numDrawSurfs );
+			vk_end_render_pass();
+			R_DevoGI_SunShadowDrawn( &backEnd.viewParms );
+
+			if ( vk_find_screenmap_drawsurfs() )
+				vk_begin_screenmap_render_pass();
+			else
+				vk_begin_main_render_pass();
+		}
+		return (const void*)(cmd + 1);
+	}
+
 #ifdef VK_CUBEMAP
 	if ( backEnd.viewParms.targetCube != nullptr ) 
 	{

@@ -597,6 +597,7 @@ void vk_initialize( void )
 	vk_create_command_buffer();
 	vk_create_descriptor_layout();
 	vk_create_pipeline_layout();
+	vk_devo_shadow_create();	// DevoGI sun shadows: before the uniform descriptor sets are written
 
 	vk.geometry_buffer_size_new = vk.defaults.geometry_size;
 	vk.indirect_buffer_size_new = sizeof(VkDrawIndexedIndirectCommand) * 1024 * 1024;
@@ -649,6 +650,7 @@ void vk_shutdown( void )
 	vk_destroy_framebuffers();
 	vk_destroy_pipelines( qtrue ); // reset counter
 	vk_destroy_render_passes();
+	vk_devo_shadow_destroy();
 	vk_destroy_attachments();
 	vk_destroy_swapchain();
 #ifdef VK_CUBEMAP	

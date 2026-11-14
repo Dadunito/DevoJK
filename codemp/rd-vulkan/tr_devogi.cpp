@@ -66,6 +66,9 @@ static cvar_t *r_devoLights_max;
 static cvar_t *r_devoLights_intensity;
 static cvar_t *r_devoLights_range;
 static cvar_t *r_devoGI_live;
+static cvar_t *r_devoGI_sunShadow;
+static cvar_t *r_devoGI_sunShadowSize;
+static cvar_t *r_devoGI_sunShadowRange;
 
 void R_DevoGI_Register( void )
 {
@@ -87,6 +90,9 @@ void R_DevoGI_Register( void )
 	r_devoGI_threads		= ri.Cvar_Get( "r_devoGI_threads",		"0",	CVAR_ARCHIVE, "DevoGI bake threads (0 = all CPU cores)" );
 	r_devoGI_progress		= ri.Cvar_Get( "r_devoGI_progress",		"1",	CVAR_ARCHIVE, "DevoGI: show a progress screen with a percentage while a map bakes" );
 	r_devoGI_live			= ri.Cvar_Get( "r_devoGI_live",			"0",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI real-time lighting (work in progress): the map's lamps and the sun are drawn live, only bounce light comes from the bake\n 0: full bake (fastest)\n 1: live lamps and sun (no lamp shadows yet)" );
+	r_devoGI_sunShadow		= ri.Cvar_Get( "r_devoGI_sunShadow",	"1",	CVAR_ARCHIVE, "DevoGI live lighting: real-time sun shadows from everything, players and moving objects included (0 = only the baked sun shadows)" );
+	r_devoGI_sunShadowSize	= ri.Cvar_Get( "r_devoGI_sunShadowSize",	"2048",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI live lighting: sun shadow map resolution (1024, 2048 or 4096 - sharper but slower)" );
+	r_devoGI_sunShadowRange	= ri.Cvar_Get( "r_devoGI_sunShadowRange",	"1024",	CVAR_ARCHIVE, "DevoGI live lighting: how far around the player real-time sun shadows reach, in game units (further away the baked shadows take over)" );
 	r_devoGI_rebuild		= ri.Cvar_Get( "r_devoGI_rebuild",		"0",	CVAR_TEMP, "Set to 1 to force DevoGI to bake the next map that loads again" );
 	r_devoLights_glow		= ri.Cvar_Get( "r_devoLights_glow",		"4000",	CVAR_ARCHIVE | CVAR_LATCH, "DevoLights: starting strength of glowing lamp textures without q3map_surfacelight (the bake then matches each lamp type to the original map); 0 = they give no light" );
 	r_devoLights			= ri.Cvar_Get( "r_devoLights",			"0",	CVAR_ARCHIVE, "DevoLights: preview the map's own lights as live dynamic lights (no shadows yet)\n 0: off\n 1: on" );
@@ -233,6 +239,11 @@ static dgLiveLighting		gi_live;
 static std::vector<byte>	gi_liveAlpha;		// sun visibility per bounce-lightmap pixel
 static int					gi_livePageSize;
 
+// the sun's real-time shadow map (see R_DevoGI_SunShadowView)
+static float				gi_shadowMvp[16];		// world -> shadow map, as last drawn
+static float				gi_shadowTexelWorld;	// size of one shadow-map pixel, in game units
+static bool					gi_shadowValid;
+
 // lightmap bytes -> the GPU's lightmap values (the map's overbright shift, as R_LoadLightmaps does)
 static float R_DevoGI_Shift( void ) {
 	return powf( 2.0f, (float)( r_mapOverBrightBits->integer - tr.overbrightBits ) );
@@ -245,6 +256,7 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 	gi_liveActive = false;
 	gi_live = dgLiveLighting();
 	gi_liveAlpha.clear();
+	gi_shadowValid = false;
 	if ( !r_devoGI || !r_devoGI->integer )
 		return NULL;
 	if ( header->lumps[LUMP_LIGHTMAPS].filelen < 128 * 128 * 3 )
@@ -430,10 +442,85 @@ that matter most from where the camera is: in reach, in a part of the map the
 camera can see, and bright for their distance. Each lamp fades out smoothly
 before its reach, so lamps entering or leaving the list don't pop.
 */
+/*
+Real-time sun shadows. Once per frame the scene is drawn from the sun into a depth
+image (see vk_devo_shadow.cpp). The sun's "camera" sits far away along the sun's
+direction and looks at a square area around the player, with a very narrow field
+of view, so its view is almost a parallel (orthographic) projection - like real
+sunlight. The square is moved in steps of exactly one shadow-map pixel, so shadow
+edges don't crawl when the player moves.
+*/
+
+qboolean R_DevoGI_SunShadowView( const viewParms_t *mainView, viewParms_t *out )
+{
+	if ( !gi_liveActive || !gi_live.hasSun || !r_devoGI_sunShadow->integer || !vk_devoShadow.active
+		|| ( tr.refdef.rdflags & RDF_NOWORLDMODEL ) )
+		return qfalse;
+
+	const float range = Com_Clamp( 256.0f, 8192.0f, r_devoGI_sunShadowRange->value );	// half the square's side
+	const float distance = Q_max( 4096.0f, range * 4.0f );		// how far away the sun's camera is
+	const int size = (int)vk_devoShadow.size;
+
+	// the sun camera's axes: forward points from the sun to the ground
+	vec3_t forward, left, up, hint = { 0, 0, 1 };
+	VectorScale( gi_live.sunDir, -1.0f, forward );
+	if ( fabsf( forward[2] ) > 0.99f )
+		VectorSet( hint, 1, 0, 0 );
+	CrossProduct( hint, forward, left );
+	VectorNormalize( left );
+	CrossProduct( forward, left, up );
+
+	// centre of the square: a little ahead of the player, snapped to whole shadow-map pixels
+	const float texel = 2.0f * range / size;
+	vec3_t centre;
+	VectorMA( mainView->ori.origin, range * 0.4f, mainView->ori.axis[0], centre );
+	const float cx = floorf( DotProduct( centre, left ) / texel ) * texel;
+	const float cy = floorf( DotProduct( centre, up ) / texel ) * texel;
+	const float cz = DotProduct( centre, forward );
+	VectorScale( left, cx, centre );
+	VectorMA( centre, cy, up, centre );
+	VectorMA( centre, cz, forward, centre );
+
+	Com_Memset( out, 0, sizeof( *out ) );
+	out->viewportX = out->viewportY = 0;
+	out->viewportWidth = out->viewportHeight = size;
+	out->scissorX = out->scissorY = 0;
+	out->scissorWidth = out->scissorHeight = size;
+	out->portalView = PV_NONE;
+	out->fovX = out->fovY = 2.0f * RAD2DEG( atanf( range / distance ) );
+	VectorMA( centre, -distance, forward, out->ori.origin );
+	VectorCopy( forward, out->ori.axis[0] );
+	VectorCopy( left, out->ori.axis[1] );
+	VectorCopy( up, out->ori.axis[2] );
+	// out in the void the camera sees no PVS, so nothing is hidden from the sun
+	VectorCopy( out->ori.origin, out->pvsOrigin );
+	out->zNear = Q_max( 16.0f, distance - range * 3.0f );
+	out->devoShadow = qtrue;
+
+	gi_shadowTexelWorld = texel;
+	return qtrue;
+}
+
+// the backend has drawn the sun's view: remember how to find a world position in it
+void R_DevoGI_SunShadowDrawn( const viewParms_t *view )
+{
+	// the same transform the GPU used to draw the view (see get_mvp_transform)
+	float proj[16];
+	Com_Memcpy( proj, view->projectionMatrix, sizeof( proj ) );
+	proj[5] = -proj[5];
+	myGlMultMatrix( view->world.modelViewMatrix, proj, gi_shadowMvp );
+	gi_shadowValid = true;
+}
+
 void R_DevoGI_FillLights( const trRefdef_t *refdef, vkUniformLight_t *u )
 {
 	u->devo_sun_dir[3] = 0.0f;
+	u->devo_shadow_params[0] = 0.0f;
 	if ( !gi_liveActive || ( refdef->rdflags & RDF_NOWORLDMODEL ) || !tr.world )
+		return;
+	// the sun's own view only needs depth: no lighting there, and above all the shaders
+	// must not read the shadow map while it is being drawn
+	if ( backEnd.viewParms.devoShadow )
 		return;
 	const float shift = R_DevoGI_Shift() / 255.0f;	// lightmap units -> GPU colour
 
@@ -444,6 +531,15 @@ void R_DevoGI_FillLights( const trRefdef_t *refdef, vkUniformLight_t *u )
 	} else {
 		u->devo_sun_dir[3] = 1.0f;	// live lighting on, but no sun
 		VectorClear( u->devo_sun_color );
+	}
+
+	// the sun's real-time shadow map, when it has been drawn
+	if ( gi_shadowValid && r_devoGI_sunShadow->integer && gi_live.hasSun ) {
+		Com_Memcpy( u->devo_shadow_mvp, gi_shadowMvp, sizeof( gi_shadowMvp ) );
+		u->devo_shadow_params[0] = 1.0f;
+		u->devo_shadow_params[1] = 1.0f / (float)vk_devoShadow.size;
+		u->devo_shadow_params[2] = gi_shadowTexelWorld * 1.5f;	// push lookups off the surface (no "acne")
+		u->devo_shadow_params[3] = 0.85f;						// start blending to the baked shadow here
 	}
 
 	const int maxLights = (int)ARRAY_LEN( u->light );

@@ -102,6 +102,43 @@
 			return cosE * fade * fade / ( sqrLightDist + light.normal.w );
 		}
 
+		/*
+		DevoGI real-time sun shadow: how much sun reaches this spot, 0..1, from the
+		shadow map drawn from the sun this frame. The lookup is pushed a little off the
+		surface and towards the sun, so a surface never shadows itself ("acne").
+		16 lookups spread over 4x4 shadow-map pixels (each already smoothed 2x2 by the
+		hardware) give soft edges. Near the edge of the map's area, and outside it, the
+		bake's shadow (bakedVis) takes over.
+		*/
+		float CalcDevoSunShadow( in vec3 position, in vec3 vertexNormal, in vec3 sunDir, in float bakedVis )
+		{
+			vec4 params = u_lights.devo_shadow_params;
+			if ( params.x < 0.5 )
+				return bakedVis;
+
+			vec3 p = position + vertexNormal * params.z + sunDir * params.z;
+			vec4 clip = u_lights.devo_shadow_mvp * vec4( p, 1.0 );
+			if ( clip.w <= 0.0 )
+				return bakedVis;
+			vec3 ndc = clip.xyz / clip.w;
+			vec2 uv = ndc.xy * 0.5 + 0.5;
+
+			// 0 in the middle of the map's area, 1 at its edge
+			vec2 fromCentre = abs( ndc.xy );
+			float edge = max( fromCentre.x, fromCentre.y );
+			if ( edge >= 1.0 || ndc.z <= 0.0 || ndc.z >= 1.0 )
+				return bakedVis;
+
+			float sum = 0.0;
+			for ( int y = 0; y < 4; y++ )
+				for ( int x = 0; x < 4; x++ )
+					sum += texture( devo_shadow_map, vec3( uv + ( vec2( x, y ) - 1.5 ) * params.y, ndc.z ) );
+			float live = sum / 16.0;
+
+			float blend = clamp( ( edge - params.w ) / ( 1.0 - params.w ), 0.0, 1.0 );
+			return mix( live, bakedVis, blend );
+		}
+
 		vec3 CalcDynamicLightContribution(
 			in float roughness,
 			in vec3 N,
@@ -168,9 +205,10 @@
 
 			// DevoGI: the sun, live, with its baked shadow (devoSunVis) until the
 			// renderer draws its own sun shadows
-			if ( devoAllowed && u_lights.devo_sun_dir.w > 0.5 && devoSunVis > 0.0 )
+			if ( devoAllowed && u_lights.devo_sun_dir.w > 0.5 && dot( vertexNormal, u_lights.devo_sun_dir.xyz ) > -0.2 )
 			{
 				vec3  L  = u_lights.devo_sun_dir.xyz;
+				devoSunVis = CalcDevoSunShadow( position, vertexNormal, L, devoSunVis );
 				vec3  H  = normalize(L + E);
 				float NL = clamp(dot(N, L), 0.0, 1.0);
 				float LH = clamp(dot(L, H), 0.0, 1.0);

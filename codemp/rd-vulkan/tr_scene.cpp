@@ -612,6 +612,17 @@ void RE_RenderScene( const refdef_t *fd ) {
 	tr.drawSurfCmd = NULL;
 	tr.numDrawSurfCmds = 0;
 
+	// DevoGI real-time lighting: before the first world view of the frame, draw the
+	// scene from the sun into the shadow map (the backend starts the frame with it)
+	if ( lastRenderCommand == RC_DRAW_BUFFER ) {
+		viewParms_t shadowParms;
+		if ( R_DevoGI_SunShadowView( &parms, &shadowParms ) ) {
+			R_RenderView( &shadowParms );
+			tr.drawSurfCmd = NULL;		// keep it out of the screen-map copies below
+			tr.numDrawSurfCmds = 0;
+		}
+	}
+
 	R_RenderView(&parms);
 	if (tr.needScreenMap)
 	{

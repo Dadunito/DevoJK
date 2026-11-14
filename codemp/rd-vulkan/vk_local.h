@@ -494,6 +494,7 @@ typedef enum {
 	RENDER_PASS_DGLOW,
 	RENDER_PASS_CUBEMAP,
 	RENDER_PASS_REFRACTION,
+	RENDER_PASS_DEVO_SHADOW,	// DevoGI: the sun's view, depth only (vk_devo_shadow.cpp)
 	RENDER_PASS_COUNT
 } renderPass_t;
 
@@ -1392,6 +1393,25 @@ qboolean	vk_begin_dglow_blur( void );
 // cubemap
 #ifdef VK_CUBEMAP
 void		vk_begin_cubemap_render_pass( void );
+
+// DevoGI sun shadows (vk_devo_shadow.cpp): a depth image drawn from the sun's view
+typedef struct {
+	qboolean		active;
+	uint32_t		size;				// pixels per side (r_devoGI_sunShadowSize)
+	VkImage			image;
+	VkDeviceMemory	memory;
+	VkImageView		attachment_view;	// for drawing into
+	VkImageView		sampler_view;		// depth only, for the lighting shader
+	VkRenderPass	render_pass;
+	VkFramebuffer	framebuffer;
+	VkSampler		sampler;			// depth comparison sampler
+} vkDevoShadow_t;
+extern vkDevoShadow_t vk_devoShadow;
+void		vk_devo_shadow_create( void );
+void		vk_devo_shadow_destroy( void );
+void		vk_devo_shadow_write_descriptor( VkDescriptorSet set );
+void		vk_devo_shadow_begin_pass( void );
+qboolean	vk_find_screenmap_drawsurfs( void );
 void		vk_create_cubemap_prefilter( void );
 void		vk_destroy_cubemap_prefilter( void );
 #endif

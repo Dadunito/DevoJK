@@ -1352,6 +1352,13 @@ void R_AddDrawSurf( surfaceType_t *surface, int entityNum, shader_t *shader,
 	int			index;
 	drawSurf_t *surf;
 
+	// DevoGI sun shadow map: only solid things block the sun (no sky, glass, decals,
+	// effects or transparent surfaces)
+	if ( tr.viewParms.devoShadow ) {
+		if ( shader->isSky || ( shader->sort != SS_OPAQUE && shader->sort != SS_SEE_THROUGH ) )
+			return;
+	}
+
 #ifdef RDF_NOFOG
 	if (tr.refdef.rdflags & RDF_NOFOG)
 	{
@@ -1485,6 +1492,15 @@ static void R_AddEntitySurface( const trRefdef_t *refdef, trRefEntity_t *ent, in
 	//
 	if ((ent->e.renderfx & RF_FIRST_PERSON) && (tr.viewParms.portalView != PV_NONE)) {
 		return;
+	}
+
+	// DevoGI sun shadow map: the first-person weapon, models that ask for no shadow
+	// and sprites/beams/effects don't cast sun shadows
+	if ( tr.viewParms.devoShadow ) {
+		if ( ent->e.renderfx & ( RF_FIRST_PERSON | RF_NOSHADOW | RF_DEPTHHACK ) )
+			return;
+		if ( ent->e.reType != RT_MODEL )
+			return;
 	}
 
 	// simple generated models, like sprites and beams, are not culled

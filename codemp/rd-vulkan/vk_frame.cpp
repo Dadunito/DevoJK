@@ -402,7 +402,26 @@ void vk_destroy_framebuffers( void )
 #endif
 }
 
-static qboolean vk_find_screenmap_drawsurfs( void )
+// DevoGI: does the frame start with the sun's shadow view?
+static qboolean vk_find_devo_shadow_drawsurfs( void )
+{
+    const void* curCmd = &backEndData->commands.cmds;
+
+    for (;; ) {
+        curCmd = PADP(curCmd, sizeof(void*));
+        switch (*(const int*)curCmd) {
+        case RC_DRAW_BUFFER:
+            curCmd = (const void*)((const drawBufferCommand_t*)curCmd + 1);
+            break;
+        case RC_DRAW_SURFS:
+            return ((const drawSurfsCommand_t*)curCmd)->viewParms.devoShadow;
+        default:
+            return qfalse;
+        }
+    }
+}
+
+qboolean vk_find_screenmap_drawsurfs( void )
 {
     const void* curCmd = &backEndData->commands.cmds;
     const drawBufferCommand_t* db_cmd;
@@ -417,6 +436,10 @@ static qboolean vk_find_screenmap_drawsurfs( void )
             break;
         case RC_DRAW_SURFS:
             ds_cmd = (const drawSurfsCommand_t*)curCmd;
+            if ( ds_cmd->viewParms.devoShadow ) {	// DevoGI: look past the sun's shadow view
+                curCmd = (const void*)(ds_cmd + 1);
+                break;
+            }
             return ds_cmd->refdef.needScreenMap;
         default:
             return qfalse;
@@ -571,7 +594,12 @@ _retry:
 
     backEnd.screenMapDone = qfalse;
 
-    if (vk_find_screenmap_drawsurfs()) {
+    if (vk_find_devo_shadow_drawsurfs()) {
+        // DevoGI: the sun's shadow map is drawn first; RB_DrawSurfs moves on to the
+        // screen-map or main pass when it is done
+        vk_devo_shadow_begin_pass();
+    }
+    else if (vk_find_screenmap_drawsurfs()) {
         vk_begin_screenmap_render_pass();
     }
     else {

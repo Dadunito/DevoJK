@@ -480,6 +480,9 @@ void vk_update_uniform_descriptor( VkDescriptorSet descriptor, VkBuffer buffer )
 	vk_write_uniform_descriptor( desc, info, buffer, descriptor, VK_DESC_UNIFORM_GLOBAL_BINDING, sizeof(vkUniformGlobal_t) );
 
 	qvkUpdateDescriptorSets(vk.device, VK_DESC_UNIFORM_COUNT, desc, 0, NULL);
+
+	// DevoGI: the sun's shadow map lives in the same set
+	vk_devo_shadow_write_descriptor( descriptor );
 }
 
 void vk_create_storage_buffer( vk_storage_buffer_t *out, uint32_t size, const char *name )

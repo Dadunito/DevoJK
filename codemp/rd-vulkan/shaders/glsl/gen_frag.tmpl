@@ -39,6 +39,9 @@
 		vkUniformEntity_t u_entity;
 	};
 
+	// DevoGI: the sun's real-time shadow map (depth comparison sampler)
+	layout(set = VK_DESC_UNIFORM, binding = VK_DESC_UNIFORM_DEVO_SHADOW_BINDING) uniform sampler2DShadow devo_shadow_map;
+
 	layout(set = VK_DESC_UNIFORM, binding = VK_DESC_UNIFORM_GLOBAL_BINDING) uniform Global {
 		vkUniformGlobal_t u_global;
 	};	

@@ -73,7 +73,7 @@ static void vk_create_layout_binding( int binding, VkDescriptorType type,
     VkShaderStageFlags flags, VkDescriptorSetLayout *layout, qboolean is_uniform ) 
 {
     uint32_t count = 1;
-    VkDescriptorSetLayoutBinding bind[VK_DESC_UNIFORM_COUNT];
+    VkDescriptorSetLayoutBinding bind[VK_DESC_UNIFORM_COUNT + 1];
     VkDescriptorSetLayoutCreateInfo desc;
     
     vk_push_layout_binding( bind, type, binding, flags );
@@ -86,8 +86,10 @@ static void vk_create_layout_binding( int binding, VkDescriptorType type,
         vk_push_layout_binding( bind, type, VK_DESC_UNIFORM_BONES_BINDING, VK_SHADER_STAGE_VERTEX_BIT );
         vk_push_layout_binding( bind, type, VK_DESC_UNIFORM_FOGS_BINDING, VK_SHADER_STAGE_FRAGMENT_BIT );
         vk_push_layout_binding( bind, type, VK_DESC_UNIFORM_GLOBAL_BINDING, uniform_flags );
+        // DevoGI: the sun's shadow map, read by the lighting shader
+        vk_push_layout_binding( bind, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESC_UNIFORM_DEVO_SHADOW_BINDING, VK_SHADER_STAGE_FRAGMENT_BIT );
 
-        count = VK_DESC_UNIFORM_COUNT;
+        count = VK_DESC_UNIFORM_COUNT + 1;
     }
 
     desc.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
@@ -114,6 +116,8 @@ void vk_create_descriptor_layout( void )
 
         if ( !vk.useFastLight || vk.cubemapActive )
             pool_size[0].descriptorCount += 1 + ( MAX_DRAWIMAGES * 2 ); // + 1:  brdf-lut | MAX_DRAWIMAGES * (physical + normal)
+
+        pool_size[0].descriptorCount += NUM_COMMAND_BUFFERS;	// DevoGI sun shadow map in each uniform set
 
         pool_size[1].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
         pool_size[1].descriptorCount = VK_DESC_UNIFORM_COUNT * NUM_COMMAND_BUFFERS;
@@ -1334,7 +1338,7 @@ VkPipeline vk_create_pipeline( const Vk_Pipeline_Def *def, renderPass_t renderPa
     multisample_state.flags = 0;
     multisample_state.rasterizationSamples = (renderPassIndex == RENDER_PASS_SCREENMAP) ? (VkSampleCountFlagBits)vk.screenMapSamples : (VkSampleCountFlagBits)vkSamples;
     
-    if ( renderPassIndex == RENDER_PASS_CUBEMAP )
+    if ( renderPassIndex == RENDER_PASS_CUBEMAP || renderPassIndex == RENDER_PASS_DEVO_SHADOW )
         multisample_state.rasterizationSamples = (VkSampleCountFlagBits)VK_SAMPLE_COUNT_1_BIT;
     
     multisample_state.sampleShadingEnable = VK_FALSE;
@@ -1430,7 +1434,7 @@ VkPipeline vk_create_pipeline( const Vk_Pipeline_Def *def, renderPass_t renderPa
     blend_state.flags = 0;
     blend_state.logicOpEnable = VK_FALSE;
     blend_state.logicOp = VK_LOGIC_OP_COPY;
-    blend_state.attachmentCount = 1;
+    blend_state.attachmentCount = ( renderPassIndex == RENDER_PASS_DEVO_SHADOW ) ? 0 : 1;	// DevoGI shadow map: depth only
     blend_state.pAttachments = &attachment_blend_state;
     blend_state.blendConstants[0] = 0.0f;
     blend_state.blendConstants[1] = 0.0f;
@@ -1479,6 +1483,8 @@ VkPipeline vk_create_pipeline( const Vk_Pipeline_Def *def, renderPass_t renderPa
         create_info.renderPass = vk.render_pass.refraction.extract.handle;
     else if ( renderPassIndex == RENDER_PASS_CUBEMAP )
         create_info.renderPass = vk.render_pass.cubemap.handle;
+    else if ( renderPassIndex == RENDER_PASS_DEVO_SHADOW )
+        create_info.renderPass = vk_devoShadow.render_pass;
     else
         create_info.renderPass = vk.render_pass.main.handle;
 
