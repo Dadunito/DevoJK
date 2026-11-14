@@ -68,6 +68,7 @@ static cvar_t *r_devoLights_range;
 static cvar_t *r_devoGI_live;
 static cvar_t *r_devoGI_gpu;
 static cvar_t *r_devoGI_liveBounces;
+static cvar_t *r_devoGI_liveSky;
 static cvar_t *r_devoGI_sunShadow;
 static cvar_t *r_devoGI_sunShadowSize;
 static cvar_t *r_devoGI_sunShadowRange;
@@ -85,8 +86,8 @@ void R_DevoGI_Register( void )
 	r_devoGI_exposure		= ri.Cvar_Get( "r_devoGI_exposure",		"1.0",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI overall brightness (1 = match the original map's brightness)" );
 	r_devoGI_sky			= ri.Cvar_Get( "r_devoGI_sky",			"0.5",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI soft ambient light from visible sky (0 = none)" );
 	r_devoGI_saturation		= ri.Cvar_Get( "r_devoGI_saturation",	"1.6",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI colour bleeding strength: saturation of light reflected off surfaces (1 = texture average colour)" );
-	r_devoGI_ao				= ri.Cvar_Get( "r_devoGI_ao",			"1.0",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI ambient occlusion on bounce light: keeps corners and crevices dark (0 = off, 1 = full, up to 2)" );
-	r_devoGI_aoDistance		= ri.Cvar_Get( "r_devoGI_aoDistance",	"64",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI ambient occlusion range in game units" );
+	r_devoGI_ao				= ri.Cvar_Get( "r_devoGI_ao",			"1.6",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI ambient occlusion on bounce light: keeps corners and crevices dark (0 = off, 2 = full)" );
+	r_devoGI_aoDistance		= ri.Cvar_Get( "r_devoGI_aoDistance",	"256",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI ambient occlusion range in game units (wider = softer)" );
 	r_devoGI_aoDirect		= ri.Cvar_Get( "r_devoGI_aoDirect",		"0.15",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI contact darkening of the old lightmap, only used when a map cannot be relit (0 = off, 1 = full)" );
 	r_devoGI_relight		= ri.Cvar_Get( "r_devoGI_relight",		"1",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI: trace the direct light again from the map's own lights, with soft shadows, replacing the old lightmap (only its brightness is used as a reference)\n 0: keep the old lightmap's direct light" );
 	r_devoGI_entityLights	= ri.Cvar_Get( "r_devoGI_entityLights",	"1",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI uses light entities kept in the BSP as light sources" );
@@ -98,6 +99,7 @@ void R_DevoGI_Register( void )
 	r_devoGI_sunShadowRange	= ri.Cvar_Get( "r_devoGI_sunShadowRange",	"1024",	CVAR_ARCHIVE, "DevoGI live lighting: how far around the player real-time sun shadows reach, in game units (further away the baked shadows take over)" );
 	r_devoGI_sunShadowRangeFar = ri.Cvar_Get( "r_devoGI_sunShadowRangeFar", "4096", CVAR_ARCHIVE, "DevoGI live lighting: reach of the second, coarser sun shadow map, in game units (beyond it the baked shadows take over)" );
 	r_devoGI_liveBounces	= ri.Cvar_Get( "r_devoGI_liveBounces",	"24",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI: light bounces of the bounce-only light that live lighting (r_devoGI_live 1) uses (1-32); the full bake keeps r_devoGI_bounces" );
+	r_devoGI_liveSky		= ri.Cvar_Get( "r_devoGI_liveSky",		"3",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI: sky light in the live layer (r_devoGI_live 1), times r_devoGI_sky: with no sun baked in, the sky all around lights the shade" );
 	r_devoGI_gpu			= ri.Cvar_Get( "r_devoGI_gpu",			"1",	CVAR_ARCHIVE, "DevoGI: trace the bake's rays on the graphics card (much faster, same result; falls back to the CPU when it can't)" );
 	r_devoGI_rebuild		= ri.Cvar_Get( "r_devoGI_rebuild",		"0",	CVAR_TEMP, "Set to 1 to force DevoGI to bake the next map that loads again" );
 	r_devoLights_glow		= ri.Cvar_Get( "r_devoLights_glow",		"4000",	CVAR_ARCHIVE | CVAR_LATCH, "DevoLights: starting strength of glowing lamp textures without q3map_surfacelight (the bake then matches each lamp type to the original map); 0 = they give no light" );
@@ -129,6 +131,7 @@ static dgSettings R_DevoGI_Settings( void )
 	s.threads		= r_devoGI_threads->integer;
 	s.gpu			= r_devoGI_gpu->integer;
 	s.liveBounces	= r_devoGI_liveBounces->integer;
+	s.liveSky		= r_devoGI_liveSky->value;
 	return s;
 }
 

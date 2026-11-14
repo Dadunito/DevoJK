@@ -1359,6 +1359,8 @@ struct giTexel {
 	float	sizeMax;	// its longer side: a stretched texel (a steep slope whose lightmap
 						// was projected from above) is much longer one way than the other
 	bool	edge;		// its centre lies just outside its triangle (a border texel)
+	bool	buried;		// its centre was inside solid geometry (a floor running on under a wall):
+						// nobody sees it, it takes the light of its nearest visible neighbour
 	int		page;
 	int		x, y;
 	int		style;		// light style slot of the owning surface (0..3)
@@ -1436,6 +1438,7 @@ static void gi_rasterize_tri( giBake &bake, const giTri &t, int style, int page 
 			tx.size = texelSize;
 			tx.sizeMax = texelSizeMax;
 			tx.edge = !inside;
+			tx.buried = false;
 			tx.page = page;
 			tx.x = x;
 			tx.y = y;
@@ -1968,6 +1971,8 @@ static void gi_world_smooth( const giBake &bake, const giSpatialHash &hash, std:
 			const float d2 = gdot( d, d );
 			if ( d2 > r2 || !gi_texels_compatible( tx, ot, r * 0.75f ) )
 				return;
+			if ( ot.buried && !tx.buried )
+				return;	// light from inside a wall must not spread to visible texels
 			const float w = 1.0f - d2 / r2;	// soft falloff towards the edge of the radius
 			sum += values[o] * w;
 			wsum += w;
@@ -2082,12 +2087,50 @@ static void gi_fix_texel_positions( giBake &bake ) {
 	gi_parallel_for( (int)bake.texels.size(), [&]( int i ) {
 		giTexel &tx = bake.texels[i];
 		const int r = gi_fix_point( bake.scene, tx.pos, tx.faceNormal, tx.size, tx.surf );
+		// a texel well inside its polygon that still starts inside a wall lies where its
+		// surface runs on under that wall: whichever way it was pushed out, it may have
+		// come out on the far side, in another room
+		tx.buried = r == 1 && !tx.edge;
 		if ( r == 1 )
 			moved.fetch_add( 1 );
 		else if ( r == 2 )
 			padded.fetch_add( 1 );
 	} );
 	dg_print( "DevoGI: moved %d texel sample points out of walls, %d away from corners\n", moved.load(), padded.load() );
+}
+
+/*
+For every buried texel (see giTexel::buried), the nearest texel of the same
+surface that is not buried, searched outwards in the lightmap page; -1 if none
+within reach. Its light is copied over at the end of the bake, so the GPU's
+texture filtering at a wall's foot blends in this room's light, not the next.
+*/
+static std::vector<int> gi_buried_sources( const giBake &bake ) {
+	std::vector<int> src( bake.texels.size(), -1 );
+	const int reach = 12;
+	gi_parallel_for( (int)bake.texels.size(), [&]( int i ) {
+		const giTexel &tx = bake.texels[i];
+		if ( !tx.buried )
+			return;
+		int best = -1, bestD = INT32_MAX;
+		for ( int dy = -reach; dy <= reach; dy++ ) {
+			for ( int dx = -reach; dx <= reach; dx++ ) {
+				const int d = dx * dx + dy * dy;
+				if ( d >= bestD || d > reach * reach )
+					continue;
+				const int x = tx.x + dx, y = tx.y + dy;
+				if ( x < 0 || y < 0 || x >= DEVOGI_LM_SIZE || y >= DEVOGI_LM_SIZE )
+					continue;
+				const int o = bake.owner[( (size_t)tx.page * DEVOGI_LM_SIZE + y ) * DEVOGI_LM_SIZE + x];
+				if ( o < 0 || bake.texels[o].buried || bake.texels[o].surf != tx.surf )
+					continue;
+				best = o;
+				bestD = d;
+			}
+		}
+		src[i] = best;
+	} );
+	return src;
 }
 
 /*
@@ -3104,7 +3147,7 @@ bounce light. (It used to be ao squared, which left floors next to walls far too
 dark - they are almost always near something.)
 */
 static inline float gi_ao_factor( float ao ) {
-	const float strength = Com_Clamp( 0.0f, 2.0f, g_set.ao ) * 0.5f;
+	const float strength = Com_Clamp( 0.0f, 2.0f, g_set.ao ) * 0.5f;	// ao 1.6 (the default) = 80%
 	return Q_max( 0.0f, 1.0f - strength * ( 1.0f - Com_Clamp( 0.0f, 1.0f, ao ) ) );
 }
 
@@ -3220,9 +3263,9 @@ static uint64_t gi_bsp_hash( const byte *fileBase, const dheader_t *header ) {
 
 static uint64_t gi_settings_hash( int scale ) {
 	char buf[320];
-	Com_sprintf( buf, sizeof( buf ), "aa%g sh%g v%d ex%g r%d b%d i%g s%g e%d ao%g aod%g aor%g sat%g x%d rl%d gl%g lh%llx", g_set.aa, g_set.sheen, DEVOGI_VERSION, g_set.exposure,
+	Com_sprintf( buf, sizeof( buf ), "aa%g sh%g v%d ex%g r%d b%d i%g s%g ls%g e%d ao%g aod%g aor%g sat%g x%d rl%d gl%g lh%llx", g_set.aa, g_set.sheen, DEVOGI_VERSION, g_set.exposure,
 		Com_Clampi( 8, 1024, g_set.rays ), Com_Clampi( 1, 16, g_set.bounces ) * 100 + Com_Clampi( 1, 32, g_set.liveBounces ),
-		g_set.intensity, g_set.sky, g_set.entityLights,
+		g_set.intensity, g_set.sky, g_set.liveSky, g_set.entityLights,
 		g_set.ao, g_set.aoDirect, g_set.aoDistance, g_set.saturation, scale,
 		g_set.relight, g_set.glow, (unsigned long long)( g_set.relight ? gi_lightsHash : 0 ) );
 	return gi_fnv( 1469598103934665603ULL, buf, strlen( buf ) );
@@ -3874,6 +3917,7 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 	giLightGrid lightGrid;
 	std::vector<float> origLuma;		// old lightmap brightness per texel
 	std::vector<float> groupScale;		// calibrated strength per light group
+	std::vector<gvec3> sunDirect;		// the sun's share of each texel's direct light (calibrated)
 	if ( relight ) {
 		gi_build_light_grid( lightGrid );
 		const size_t n = bake.texels.size();
@@ -3889,6 +3933,7 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 
 		gi_progress_stage( "Direct light and soft shadows", 0.12f, 0.33f );
 		std::vector<gvec3> directLight( n );
+		sunDirect.assign( n, gvec3() );
 		bake.sunVis.assign( n, 0.0f );
 		gi_parallel_for( (int)n, [&]( int i ) {
 			const giTexel &tx = bake.texels[i];
@@ -3902,6 +3947,7 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 						sun += rgb;
 				} );
 			directLight[i] = total;
+			sunDirect[i] = sun * groupScale[gi_sunGroup];
 			// the sun's visibility: what arrived, divided by what would arrive with nothing in
 			// the way (a real-time renderer draws the sun live and uses this as its shadow)
 			if ( gi_hasSun ) {
@@ -3913,6 +3959,7 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 
 		// gentle world-space smoothing: soft, anti-aliased shadow edges with no polygon seams
 		gi_world_smooth( bake, texelHash, directLight, directRadius );
+		gi_world_smooth( bake, texelHash, sunDirect, directRadius );
 
 		for ( size_t i = 0; i < n; i++ ) {
 			const giTexel &tx = bake.texels[i];
@@ -3979,36 +4026,85 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 	gridHash.build( texelPos, gridPoints, bounceRadius );
 
 	/*
-	Two bounce counts. The full bake (r_devoGI_live 0) uses 'bounces'. Live lighting
-	(r_devoGI_live 1) takes only the bounce light from the bake, and since that is all
-	the baked light it shows, it gets more: the light keeps bouncing up to 'liveBounces'
-	(24 by default), filling deep rooms and corridors a little more each time. The
-	full bake's light is put aside after its last bounce, so it stays exactly as it was.
+	Two bounce chains.
+	  - The full bake (r_devoGI_live 0): direct light from the lamps and the sun,
+	    bounced 'bounces' times.
+	  - Live lighting (r_devoGI_live 1) draws the sun and the lamps itself and takes
+	    only bounce light from the bake. There the sun must not be baked in at all,
+	    not even its bounce: the live layer is light from the sky all around (with its
+	    ambient occlusion) and the lamps' bounce, like a skylight. So a second chain
+	    starts again from the direct light without the sun and bounces 'liveBounces'
+	    times (24 by default), filling deep rooms and corridors a little more each time.
+	The full bake's light is put aside after its own chain, so it stays exactly as it was.
 	*/
-	const int totalBounces = relight ? Q_max( bounces, Com_Clampi( 1, 32, g_set.liveBounces ) ) : bounces;
+	const int liveBounces = relight ? Com_Clampi( 1, 32, g_set.liveBounces ) : 0;
+	const int totalBounces = bounces + liveBounces;
 	std::vector<float> fullLight;	// the full bake's light, after its own last bounce
+	const float fullSkyScale = gi_sky.scale;
 
 	bake.light = bake.direct;
 	static char bounceStage[64];
 	const float bounceBase = 0.45f, bounceSpan = 0.47f;
 	for ( int b = 0; b < totalBounces; b++ ) {
-		Com_sprintf( bounceStage, sizeof( bounceStage ), b < bounces ? "Bounce light %d of %d" : "Bounce light %d of %d (live)",
-			b + 1, totalBounces );
+		if ( b == bounces ) {
+			// the full bake is done: keep its light, then start the live chain without the sun
+			fullLight = bake.light;
+			for ( size_t i = 0; i < bake.texels.size() && i < sunDirect.size(); i++ ) {
+				const giTexel &tx = bake.texels[i];
+				if ( tx.styleValue != 0 )
+					continue;
+				float *px = &bake.direct[( ( (size_t)tx.page * DEVOGI_LM_SIZE + tx.y ) * DEVOGI_LM_SIZE + tx.x ) * 3];
+				px[0] = Q_max( 0.0f, px[0] - sunDirect[i].x );
+				px[1] = Q_max( 0.0f, px[1] - sunDirect[i].y );
+				px[2] = Q_max( 0.0f, px[2] - sunDirect[i].z );
+			}
+			bake.light = bake.direct;
+			// ...and with more sky: it is what lights the shade there
+			gi_sky.scale *= Q_max( 0.0f, g_set.liveSky );
+		}
+		const int chainBounce = b < bounces ? b : b - bounces;
+		Com_sprintf( bounceStage, sizeof( bounceStage ), b < bounces ? "Bounce light %d of %d" : "Live bounce light %d of %d",
+			chainBounce + 1, b < bounces ? bounces : liveBounces );
 		gi_progress_stage( bounceStage, bounceBase + bounceSpan * b / totalBounces, bounceSpan / totalBounces );
 		// later bounces carry less and less energy, so fewer rays are enough for them
-		const int bounceRays = b == 0 ? rays : ( b < 3 ? rays / 2 : rays / 4 );
+		const int bounceRays = chainBounce == 0 ? rays : ( chainBounce < 3 ? rays / 2 : rays / 4 );
 		gi_gather( bake, gridHash, gridPoints, texelPos, bounceRadius, Q_max( 16, bounceRays ) );
 		gi_compose( bake, intensity );
-		dg_print( "DevoGI: bounce %d/%d done (%.1fs)\n", b + 1, totalBounces, ( dg_ms() - startTime ) / 1000.0f );
-		if ( b + 1 == bounces && totalBounces > bounces )
-			fullLight = bake.light;
+		dg_print( "DevoGI: %s bounce %d/%d done (%.1fs)\n", b < bounces ? "full" : "live",
+			chainBounce + 1, b < bounces ? bounces : liveBounces, ( dg_ms() - startTime ) / 1000.0f );
 	}
 	// the full bake goes on with its own light; the bounce-only light for live lighting
-	// (bake.indirect, see gi_build_bounce_maps) keeps all the extra bounces
+	// (bake.indirect, see gi_build_bounce_maps) is the live chain's, without the sun
 	if ( !fullLight.empty() ) {
 		bake.light.swap( fullLight );
 		fullLight.clear();
 		fullLight.shrink_to_fit();
+		gi_sky.scale = fullSkyScale;	// back to the full bake's sky (models, probes)
+	}
+	sunDirect.clear();
+	sunDirect.shrink_to_fit();
+
+	// buried texels (a floor running on under a wall) take the light of their nearest
+	// visible neighbour, in the full bake and in the live bounce light
+	{
+		const std::vector<int> buriedSrc = gi_buried_sources( bake );
+		int copied = 0;
+		for ( size_t i = 0; i < bake.texels.size(); i++ ) {
+			const int o = buriedSrc[i];
+			if ( o < 0 )
+				continue;
+			const giTexel &tx = bake.texels[i], &ot = bake.texels[o];
+			const size_t a = ( (size_t)tx.page * DEVOGI_LM_SIZE + tx.y ) * DEVOGI_LM_SIZE + tx.x;
+			const size_t c = ( (size_t)ot.page * DEVOGI_LM_SIZE + ot.y ) * DEVOGI_LM_SIZE + ot.x;
+			for ( int k = 0; k < 3; k++ )
+				bake.light[a * 3 + k] = bake.light[c * 3 + k];
+			for ( int k = 0; k < 4; k++ )
+				bake.indirect[i * 4 + k] = bake.indirect[(size_t)o * 4 + k];
+			if ( !bake.sunVis.empty() )
+				bake.sunVis[i] = bake.sunVis[o];
+			copied++;
+		}
+		dg_print( "DevoGI: %d texels under walls take their light from the visible side\n", copied );
 	}
 
 	// ---- exposure: one factor for the whole map ----

@@ -32,15 +32,17 @@ struct dgSettings {
 	int		scale		= 4;		// lightmap resolution multiplier (1, 2, 4 or 8)
 	int		rays		= 128;		// rays per bounce-light sample
 	int		bounces		= 8;		// light bounces
-	int		liveBounces	= 24;		// light bounces of the bounce-only light used by live lighting (1-16)
+	int		liveBounces	= 24;		// light bounces of the bounce-only light used by live lighting (1-32)
+	float	liveSky		= 3.0f;		// sky light in the live layer, times 'sky': with no sun baked in,
+									// the sky all around is what lights the shade (like a skylight)
 	float	aa			= 2.0f;		// shadow anti-aliasing width, in texels
 	float	sheen		= 0.12f;	// baked glossy sheen
 	float	intensity	= 1.0f;		// bounce light strength
 	float	exposure	= 1.0f;		// overall brightness
 	float	sky			= 0.5f;		// ambient light from visible sky
 	float	saturation	= 1.6f;		// colour bleeding strength
-	float	ao			= 1.0f;		// ambient occlusion on bounce light
-	float	aoDistance	= 64.0f;	// ambient occlusion range in game units
+	float	ao			= 1.6f;		// ambient occlusion on bounce light (2 = full)
+	float	aoDistance	= 256.0f;	// ambient occlusion range in game units: wide = soft
 	float	aoDirect	= 0.15f;	// contact darkening when a map can't be relit
 	float	glow		= 4000.0f;	// starting strength of glowing lamps without q3map_surfacelight
 	int		relight		= 1;		// trace direct light from the map's own lights
