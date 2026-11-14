@@ -3637,195 +3637,6 @@ baked (no lightmaps inside the BSP).
 ===========================================================================
 */
 
-/*
-===========================================================================
-Detail where it matters
-
-The lightmap resolution is the same everywhere, but sharp shadow edges are
-not: most of a level is evenly lit, while a few surfaces are crossed by the
-hard edge of a sun shadow or a lamp's shadow. Those (and very thin faces like
-stair risers and door jambs, which only get a sliver of a pixel) get 2 or 4
-times more pixels each way, on pages of their own, within a memory budget.
-
-To find them, a quick first look at the map's own 128x128 grid: at every
-lightmap pixel, can the sun be seen, and the three lamps that light it most?
-Where two neighbouring pixels of a surface disagree, a shadow edge runs
-through it.
-===========================================================================
-*/
-
-#define DEVOGI_DETAIL_BUDGET	0.75f	// extra pixels allowed, as a share of all the BSP's pages
-
-static std::vector<int> gi_detail_scales( const giScene &scene, int bspPages ) {
-	const int N = DEVOGI_BSP_LM_SIZE;
-	const int numSurfs = (int)scene.surfs.size();
-	std::vector<int> detail( numSurfs, 1 );
-
-	// every pixel well inside a lightmapped surface, with its spot in the world
-	struct sample_t { gvec3 pos, normal; int surf, key; uint32_t sig[4]; };
-	std::vector<sample_t> samples;
-	std::unordered_map<int, int> at;	// page pixel -> sample
-	std::vector<int> luxels( numSurfs, 0 );
-	std::vector<float> minU( numSurfs, 1e9f ), maxU( numSurfs, -1e9f ), minV( numSurfs, 1e9f ), maxV( numSurfs, -1e9f );
-	for ( const giTri &t : scene.tris ) {
-		const giSurf &gs = scene.surfs[t.surf];
-		const int page = gs.lightmapNum[0];
-		if ( page < 0 || page >= bspPages || gs.sky || gs.lightmapStyle[0] != 0 )
-			continue;
-		const giVert *v[3] = { &scene.verts[t.vert[0]], &scene.verts[t.vert[1]], &scene.verts[t.vert[2]] };
-		float px[3], py[3];
-		for ( int i = 0; i < 3; i++ ) {
-			px[i] = v[i]->lm[0][0] * N;
-			py[i] = v[i]->lm[0][1] * N;
-			minU[t.surf] = Q_min( minU[t.surf], px[i] ); maxU[t.surf] = Q_max( maxU[t.surf], px[i] );
-			minV[t.surf] = Q_min( minV[t.surf], py[i] ); maxV[t.surf] = Q_max( maxV[t.surf], py[i] );
-		}
-		const float area = ( px[1] - px[0] ) * ( py[2] - py[0] ) - ( px[2] - px[0] ) * ( py[1] - py[0] );
-		if ( fabsf( area ) < 1e-6f )
-			continue;
-		const int x0 = Q_max( 0, (int)floorf( Q_min( px[0], Q_min( px[1], px[2] ) ) ) );
-		const int y0 = Q_max( 0, (int)floorf( Q_min( py[0], Q_min( py[1], py[2] ) ) ) );
-		const int x1 = Q_min( N - 1, (int)ceilf( Q_max( px[0], Q_max( px[1], px[2] ) ) ) );
-		const int y1 = Q_min( N - 1, (int)ceilf( Q_max( py[0], Q_max( py[1], py[2] ) ) ) );
-		for ( int y = y0; y <= y1; y++ ) {
-			for ( int x = x0; x <= x1; x++ ) {
-				const float cx = x + 0.5f, cy = y + 0.5f;
-				const float w1 = ( ( cx - px[0] ) * ( py[2] - py[0] ) - ( px[2] - px[0] ) * ( cy - py[0] ) ) / area;
-				const float w2 = ( ( px[1] - px[0] ) * ( cy - py[0] ) - ( cx - px[0] ) * ( py[1] - py[0] ) ) / area;
-				const float w0 = 1 - w1 - w2;
-				if ( w0 < 0 || w1 < 0 || w2 < 0 )
-					continue;
-				const int key = ( page * N + y ) * N + x;
-				if ( at.count( key ) )
-					continue;
-				sample_t smp;
-				smp.pos = v[0]->xyz * w0 + v[1]->xyz * w1 + v[2]->xyz * w2;
-				smp.normal = t.n;
-				smp.surf = t.surf;
-				smp.key = key;
-				at[key] = (int)samples.size();
-				samples.push_back( smp );
-				luxels[t.surf]++;
-			}
-		}
-	}
-
-	// what each one sees: the sun (sig[0]: 0 hidden, 1 visible, 2 faces away) and its
-	// three strongest lamps (sig[1..3]: lamp number * 2 + visible, or ~0 for none)
-	gi_parallel_for( (int)samples.size(), [&]( int i ) {
-		sample_t &smp = samples[i];
-		const gvec3 o = smp.pos + smp.normal * 1.5f;
-		smp.sig[0] = 2;
-		if ( gi_hasSun && gdot( smp.normal, gi_sunDir ) > 0.02f ) {
-			giHit hit;
-			const bool lit = !gi_trace( scene, o, gi_sunDir, 16384.0f, hit, false, DEVOGI_RAY_TMIN )
-				|| scene.surfs[scene.tris[hit.tri].surf].sky;
-			smp.sig[0] = lit ? 1 : 0;
-		}
-		int best[3] = { -1, -1, -1 };
-		float bestE[3] = { 0, 0, 0 };
-		for ( int li = 0; li < (int)gi_lights.size(); li++ ) {
-			const devoLight_t &lt = gi_lights[li];
-			const gvec3 target = lt.halfU > 0 ? lt.rectCentre + lt.normal * 1.0f : lt.origin;
-			gvec3 L = target - o;
-			const float d2 = gdot( L, L );
-			if ( d2 > lt.radius * lt.radius || d2 < 1.0f )
-				continue;
-			L = L * ( 1.0f / sqrtf( d2 ) );
-			const float cr = gdot( smp.normal, L );
-			const float ce = lt.size > 0 ? -gdot( lt.normal, L ) : 1.0f;
-			if ( cr <= 0 || ce <= 0 )
-				continue;
-			const float e = lt.photons * cr * ce / Q_max( d2, 16.0f );
-			if ( e < 1.0f )
-				continue;
-			for ( int k = 0; k < 3; k++ ) {
-				if ( e > bestE[k] ) {
-					for ( int m = 2; m > k; m-- ) { bestE[m] = bestE[m - 1]; best[m] = best[m - 1]; }
-					bestE[k] = e;
-					best[k] = li;
-					break;
-				}
-			}
-		}
-		for ( int k = 0; k < 3; k++ ) {
-			smp.sig[k + 1] = ~0u;
-			if ( best[k] < 0 )
-				continue;
-			const devoLight_t &lt = gi_lights[best[k]];
-			const gvec3 target = lt.halfU > 0 ? lt.rectCentre + lt.normal * 1.0f : lt.origin;
-			gvec3 L = target - o;
-			const float d = sqrtf( gdot( L, L ) );
-			giHit hit;
-			const bool lit = d - 0.5f <= DEVOGI_RAY_TMIN
-				|| !gi_trace( scene, o, L * ( 1.0f / d ), d - 0.5f, hit, true, DEVOGI_RAY_TMIN );
-			smp.sig[k + 1] = (uint32_t)best[k] * 2u + ( lit ? 1u : 0u );
-		}
-	} );
-
-	// shadow edges: neighbouring pixels of the same surface that see different things
-	std::vector<int> edges( numSurfs, 0 );
-	auto differs = [&]( const sample_t &a, const sample_t &b ) {
-		if ( a.sig[0] != b.sig[0] && a.sig[0] != 2 && b.sig[0] != 2 )
-			return true;
-		for ( int i = 1; i < 4; i++ )
-			for ( int j = 1; j < 4; j++ )
-				if ( a.sig[i] != ~0u && b.sig[j] != ~0u && ( a.sig[i] >> 1 ) == ( b.sig[j] >> 1 ) && a.sig[i] != b.sig[j] )
-					return true;
-		return false;
-	};
-	for ( const sample_t &smp : samples ) {
-		const int nb[2] = { smp.key + 1, smp.key + N };
-		for ( int k : nb ) {
-			auto it = at.find( k );
-			if ( it == at.end() )
-				continue;
-			const sample_t &o = samples[it->second];
-			if ( o.surf == smp.surf && differs( smp, o ) )
-				edges[smp.surf]++;
-		}
-	}
-
-	// first the surfaces with the most shadow edge for their size, until the budget is
-	// spent; then, with what is left, thin faces (2x)
-	double budget = (double)bspPages * N * N * DEVOGI_DETAIL_BUDGET;
-	int thin = 0, sharp = 0, edgeSurfs = 0;
-	std::vector<std::pair<float, int>> order;
-	for ( int s = 0; s < numSurfs; s++ ) {
-		if ( edges[s] > 0 && luxels[s] > 0 ) {
-			order.push_back( std::make_pair( -(float)edges[s] / sqrtf( (float)luxels[s] ), s ) );
-			edgeSurfs++;
-		}
-	}
-	std::sort( order.begin(), order.end() );
-	for ( const std::pair<float, int> &c : order ) {
-		const int s = c.second;
-		const float w = maxU[s] - minU[s] + 1, h = maxV[s] - minV[s] + 1;
-		const int scale = w * h <= 24.0f * 24.0f ? 4 : 2;
-		const double cost = (double)w * h * ( scale * scale - 1 );
-		if ( cost > budget )
-			continue;
-		budget -= cost;
-		detail[s] = scale;
-		sharp++;
-	}
-	for ( int s = 0; s < numSurfs; s++ ) {
-		if ( detail[s] > 1 || maxU[s] < minU[s] )
-			continue;
-		const float w = maxU[s] - minU[s], h = maxV[s] - minV[s];
-		if ( Q_min( w, h ) >= 1.5f || Q_max( w, h ) >= 32.0f )
-			continue;
-		const double cost = ( w * 2 + 4 ) * ( h * 2 + 4 );	// a sliver: one blurry row otherwise
-		if ( cost > budget )
-			break;
-		budget -= cost;
-		detail[s] = 2;
-		thin++;
-	}
-	dg_print( "DevoGI: more detail for %d of %d surfaces with sharp shadows, and %d thin faces\n", sharp, edgeSurfs, thin );
-	return detail;
-}
-
 bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &settings, int scale, dgResult &result )
 {
 	g_set = settings;
@@ -3951,12 +3762,13 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 
 	gi_build_geometry( bake.scene, fileBase, header );
 	gi_build_bvh( bake.scene );	// (the lightmap moves below don't change the tree)
-	numPages = gi_unshare_lightmaps( bake.scene, srcLightmaps, bspPages, gi_detail_scales( bake.scene, bspPages ),
+	// (every surface keeps the same resolution: no extra detail for some, detail = none)
+	numPages = gi_unshare_lightmaps( bake.scene, srcLightmaps, bspPages, std::vector<int>(),
 		result.lightmapMoves, movedSrc );
 	if ( numPages > bspPages ) {
 		srcLightmaps = movedSrc.data();
 		bake.numPages = numPages;
-		dg_print( "DevoGI: %d surfaces got their own lightmap spot (shared spots, more detail) on %d new page%s\n",
+		dg_print( "DevoGI: %d surfaces shared a lightmap spot with another one, they get their own on %d new page%s\n",
 			(int)result.lightmapMoves.size(), numPages - bspPages, numPages - bspPages > 1 ? "s" : "" );
 	}
 	const int outBytes = numPages * pageBytes;
@@ -4924,13 +4736,12 @@ The public side: resolution, cache key, cache file, light accessors
 ===========================================================================
 */
 
-// r_devoGI_scale rounded down to 1, 2, 4 or 8, within what the GPU can hold (maxScale)
+// r_devoGI_scale (1 to 16), within what the GPU can hold (maxScale)
 int DG_ChooseScale( const dgSettings &settings, int maxScale )
 {
-	int scale = 1;
-	while ( scale * 2 <= Com_Clampi( 1, 8, settings.scale ) && scale * 2 <= maxScale )
-		scale *= 2;
-	return scale;
+	// any whole number from 1 to 16: the same resolution increase for every surface,
+	// as long as one page still fits in a GPU texture (128 * scale <= its size limit)
+	return Com_Clampi( 1, Q_max( 1, Q_min( 16, maxScale ) ), settings.scale );
 }
 
 uint64_t DG_BspHash( const byte *bsp )
