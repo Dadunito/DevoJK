@@ -207,7 +207,11 @@
 				}
 
 				// sunny, skip lights with negligible intensity
-				if (attenuation < 0.001) {
+				// (DevoGI lamps keep their strength in the colour and their attenuation is
+				// plain 1 / distance^2 - below 0.001 from about 32 units on - so for them it
+				// is the light actually arriving that must be negligible)
+				float arriving = devoLamp ? attenuation * max( light.color.r, max( light.color.g, light.color.b ) ) : attenuation;
+				if (arriving < 0.001) {
 					continue;
 				}
 

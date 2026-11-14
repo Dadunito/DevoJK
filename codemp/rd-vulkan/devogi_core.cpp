@@ -4403,14 +4403,17 @@ static bool gi_parse_light_shader( const char *shaderName, giLightShader &ls ) {
 	int stageIndex = -1;
 	char glowMap[MAX_QPATH] = "";
 	bool glowKeyword = false;
+	gvec3 glowTint( 1, 1, 1 );		// the glowing stage's own colour (rgbGen const), on top of its texture
 	char stMap[MAX_QPATH] = "";
 	bool stLightmap = false, stAdditive = false, stGlow = false, stEnv = false;
+	gvec3 stTint( 1, 1, 1 );
 	auto endStage = [&]() {
 		if ( stLightmap )
 			hasLightmapStage = true;
 		else if ( stMap[0] && !stEnv && ( stGlow || stAdditive ) && !glowMap[0] ) {
 			Q_strncpyz( glowMap, stMap, sizeof( glowMap ) );
 			glowKeyword = stGlow;
+			glowTint = stTint;
 		}
 	};
 	auto rememberMap = [&]( const char *name ) {
@@ -4429,6 +4432,7 @@ static bool gi_parse_light_shader( const char *shaderName, giLightShader &ls ) {
 				stageIndex++;
 				stMap[0] = 0;
 				stLightmap = stAdditive = stGlow = stEnv = false;
+				stTint = gvec3( 1, 1, 1 );
 			}
 			continue;
 		}
@@ -4470,6 +4474,20 @@ static bool gi_parse_light_shader( const char *shaderName, giLightShader &ls ) {
 				if ( !Q_stricmp( g, "vertex" ) || !Q_stricmp( g, "exactvertex" ) || !Q_stricmp( g, "lightingdiffuse" )
 					|| !Q_stricmp( g, "oneminusvertex" ) || !Q_stricmp( g, "lightingdiffuseentity" ) )
 					litStage = true;
+				else if ( !Q_stricmp( g, "const" ) || !Q_stricmp( g, "constant" ) ) {
+					// rgbGen const ( r g b ): the stage is tinted this colour
+					float c3[3] = { 1, 1, 1 };
+					int n = 0;
+					while ( n < 3 ) {
+						const char *t = COM_ParseExt( &p, qfalse );
+						if ( !t[0] )
+							break;
+						if ( t[0] == '(' || t[0] == ')' )
+							continue;
+						c3[n++] = (float)atof( t );
+					}
+					stTint = gvec3( c3[0], c3[1], c3[2] );
+				}
 			}
 			else if ( !Q_stricmp( token, "tcgen" ) ) {
 				if ( !Q_stricmp( COM_ParseExt( &p, qfalse ), "environment" ) )
@@ -4520,9 +4538,15 @@ static bool gi_parse_light_shader( const char *shaderName, giLightShader &ls ) {
 		float brightness = 0;
 		gvec3 c;
 		if ( glowMap[0] && gi_image_color( glowMap, c, &brightness ) && brightness > 0.01f ) {
-			ls.value = g_set.glow * brightness;
+			// the glow's colour is its texture's, tinted by the stage's own colour if it has one
+			const gvec3 tinted( c.x * glowTint.x, c.y * glowTint.y, c.z * glowTint.z );
+			const float m = Q_max( tinted.x, Q_max( tinted.y, tinted.z ) );
+			const float cm = Q_max( c.x, Q_max( c.y, c.z ) );
+			if ( m <= 1e-4f || cm <= 1e-4f )
+				return false;
+			ls.value = g_set.glow * brightness * ( m / cm );
 			ls.subdivide = 32.0f;	// small fixtures: small patches
-			ls.color = c;
+			ls.color = tinted * ( 1.0f / m );
 			return true;
 		}
 		/*

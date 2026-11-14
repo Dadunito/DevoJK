@@ -253,7 +253,7 @@ STRUCT (
 	    UINT				( num_lights )
         PAD3                ( pad0 )
 	    VEC4				( devo_sun_dir )
-	    VEC4				( devo_sun_color )
+	    VEC4				( devo_sun_color )	// rgb: the sun; w: GPU light per lightmap step (for the highlight shoulder)
 	    // DevoGI sun shadow maps (two cascades side by side in one image):
 	    // world -> each cascade's clip space; params: x = 1 when valid,
 	    // y = one texel across the whole image (u), z = one texel (v), w = fade start;

@@ -644,6 +644,9 @@ void R_DevoGI_FillLights( const trRefdef_t *refdef, vkUniformLight_t *u )
 		u->devo_sun_dir[3] = 1.0f;	// live lighting on, but no sun
 		VectorClear( u->devo_sun_color );
 	}
+	// one lightmap step in GPU light: the shader rolls bright light off above 170 steps,
+	// like the bake does (gi_shoulder), so live sun on top of bounce light doesn't clip
+	u->devo_sun_color[3] = shift;
 
 	// the sun's real-time shadow maps, when both cascades have been drawn
 	if ( gi_shadowValid[0] && gi_shadowValid[1] && r_devoGI_sunShadow->integer && gi_live.hasSun ) {
