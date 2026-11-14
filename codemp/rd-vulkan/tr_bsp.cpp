@@ -368,14 +368,23 @@ static	void R_LoadLightmaps( world_t &worldData, lump_t *l, lump_t *surfs ) {
 		int perX = 1;
 		while ( perX < (int)ceilf( sqrtf( (float)atlasPages ) ) )
 			perX *= 2;
-		const int perY = (int)ceilf( (float)atlasPages / perX );
+		int perY = (int)ceilf( (float)atlasPages / perX );
 		const int maxScale = Q_max( 1, glConfig.maxTextureSize / DEFAULT_LIGHTMAP_SIZE );
 
-		int pageSize = DEFAULT_LIGHTMAP_SIZE;
-		devoGILightmaps = R_DevoGI_Process( worldData.name, fileBase, (const dheader_t *)fileBase, maxScale, &pageSize );
+		int pageSize = DEFAULT_LIGHTMAP_SIZE, devoPages = 0;
+		devoGILightmaps = R_DevoGI_Process( worldData.name, fileBase, (const dheader_t *)fileBase, maxScale, &pageSize, &devoPages );
 		if ( devoGILightmaps ) {
 			buf = devoGILightmaps;
 			lightmapSize = pageSize;
+			// DevoGI may add pages: surfaces that shared a lightmap spot get their own
+			// there (never on maps with deluxemaps, whose page count stays the same)
+			if ( !tr.worldDeluxeMapping && devoPages > numLightmaps ) {
+				numLightmaps = devoPages;
+				perX = 1;
+				while ( perX < (int)ceilf( sqrtf( (float)numLightmaps ) ) )
+					perX *= 2;
+				perY = (int)ceilf( (float)numLightmaps / perX );
+			}
 			if ( tr.worldInternalLightmapping && Q_max( perX, perY ) * lightmapSize > glConfig.maxTextureSize ) {
 				tr.worldInternalLightmapping = qfalse;	// one image per page
 				ri.Printf( PRINT_ALL, "DevoGI: %dx%d lightmaps exceed one %d atlas, using one image per page\n",

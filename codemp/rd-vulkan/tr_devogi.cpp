@@ -235,6 +235,8 @@ file is missing, the map is baked again and the file rewritten.
 
 // new vertex colours, from the bake or the cache, until R_DevoGI_PatchVertexColors
 static std::vector<byte> gi_vertexColors;
+// surfaces that get their own lightmap spot, also applied in R_DevoGI_PatchVertexColors
+static std::vector<dgLightmapMove> gi_lightmapMoves;
 
 /*
 Real-time lighting (r_devoGI_live 1). The bake's light split is kept here for the
@@ -283,10 +285,12 @@ static qboolean R_DevoGI_IsRend2Map( const char *mapName )
 	return qfalse;
 }
 
-byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader_t *header, int maxScale, int *outPageSize )
+byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader_t *header, int maxScale, int *outPageSize, int *outNumPages )
 {
 	*outPageSize = 128;
+	*outNumPages = 0;
 	gi_vertexColors.clear();
+	gi_lightmapMoves.clear();
 	gi_liveActive = false;
 	gi_live = dgLiveLighting();
 	gi_liveAlpha.clear();
@@ -336,6 +340,11 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 	}
 
 	gi_vertexColors.swap( result.vertexColors );
+	// the bake may have given some surfaces their own lightmap spot on new pages
+	// (see dgLightmapMove): the renderer loads that many pages, and the surfaces
+	// are moved before it builds them (R_DevoGI_PatchVertexColors)
+	gi_lightmapMoves.swap( result.lightmapMoves );
+	*outNumPages = DG_NumPages( result );
 
 	// ---- 3a. real-time lighting: the GPU gets bounce light only, the lamps come live ----
 	const int numPages = (int)( result.lightmaps.size() / ( (size_t)result.pageSize * result.pageSize * 3 ) );
@@ -680,12 +689,18 @@ void R_DevoGI_FillLights( const trRefdef_t *refdef, vkUniformLight_t *u )
 R_DevoGI_PatchVertexColors
 
 Copies the baked vertex colours into the loaded map data, right before the
-renderer builds its surfaces from it (called from RE_LoadWorldMap_Actual).
+renderer builds its surfaces from it (called from RE_LoadWorldMap_Actual), and
+moves the surfaces that got their own lightmap spot (see dgLightmapMove).
 ===========================================================================
 */
 
 void R_DevoGI_PatchVertexColors( byte *fileBase, const dheader_t *header )
 {
+	// surfaces that shared a lightmap spot with another one get their own
+	DG_ApplyLightmapMoves( fileBase, gi_lightmapMoves );
+	gi_lightmapMoves.clear();
+	gi_lightmapMoves.shrink_to_fit();
+
 	const lump_t &lv = header->lumps[LUMP_DRAWVERTS];
 	const int numVerts = lv.filelen / (int)sizeof( mapVert_t );
 	if ( gi_vertexColors.size() == (size_t)numVerts * 4 ) {

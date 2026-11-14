@@ -144,12 +144,32 @@ struct dgLiveLighting {
 	float					sunRgb[3] = { 0, 0, 0 };	// calibrated: light = sunRgb * cosR when lit
 };
 
+/*
+A surface that got its own spot in the lightmaps. The original compiler lets
+surfaces whose old light came out identical share one spot in a lightmap page
+(two stair steps, two bench ends). DevoGI lights every surface on its own, so
+each sharing surface (after the first) moves to a new page added after the
+BSP's own pages. A renderer applies these moves to the loaded BSP before it
+reads the surfaces (DG_ApplyLightmapMoves).
+*/
+struct dgLightmapMove {
+	int32_t	surf;			// BSP surface number
+	int32_t	page;			// its new lightmap page
+	int32_t	dx, dy;			// how far its lightmap coordinates shift, in pixels of a 128x128 page
+};
+
 struct dgResult {
 	int						pageSize = 128;		// pixels per side of each lightmap page
-	std::vector<uint8_t>	lightmaps;			// all pages, RGB, in the BSP's page order
+	std::vector<uint8_t>	lightmaps;			// all pages, RGB: the BSP's pages, then any new ones
 	std::vector<uint8_t>	vertexColors;		// RGBA per BSP draw vertex (may be empty)
+	std::vector<dgLightmapMove>	lightmapMoves;	// surfaces moved onto the new pages
 	dgLiveLighting			live;				// the same lighting split for real-time use
 };
+
+// number of lightmap pages in a result (the BSP's own plus the new ones)
+int			DG_NumPages( const dgResult &result );
+// moves surfaces to their own lightmap spots (see dgLightmapMove), in a BSP loaded in memory
+void		DG_ApplyLightmapMoves( uint8_t *bsp, const std::vector<dgLightmapMove> &moves );
 
 int			DG_ChooseScale( const dgSettings &settings, int maxScale );
 uint64_t	DG_BspHash( const uint8_t *bsp );

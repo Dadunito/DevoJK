@@ -396,7 +396,15 @@ void main() {
 			#else
 				lightColor = frag_color0.rgb;
 			#endif
-			diffuse = base;
+			// DevoJK: the vertex colour is this surface's light (map models are lit per
+			// vertex). "base" already has it multiplied in, so using base here would apply
+			// the light twice - squared, which made map models far too dark. As in rend2,
+			// the surface colour is the plain texture and the vertex colour is the light.
+			#if !defined(USE_CL0_IDENT) && !defined(USE_TX1) && !defined(USE_TX2)
+				diffuse = vec4( texture( texture0, frag_tex_coord0 ).rgb, base.a );
+			#else
+				diffuse = base;
+			#endif
 			ambientColor = vec3 (0.0);
 			attenuation = 1.0;
 		#endif

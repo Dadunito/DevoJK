@@ -17,7 +17,8 @@ Buffers (all std430, vec4 = 16 bytes):
          triangle; otherwise it is the index of another inner node. Keeping both
          boxes in the parent means one read decides where to go next.
   tris:  3 vec4 per triangle, in BVH leaf order
-           (v0.xyz, original triangle index) (e1.xyz, 1 = blocks rays) (e2.xyz, -)
+           (v0.xyz, original triangle index) (e1.xyz, 1 = blocks rays)
+           (e2.xyz, +1 / -1: the front is along / against e1 x e2)
   rays:  2 vec4 per ray (origin.xyz, tmin) (direction.xyz, tmax)
   hits:  1 vec4 per ray (t, u, v, triangle index or -1)
 
@@ -51,10 +52,12 @@ float rayBox( vec3 o, vec3 inv, vec3 mins, vec3 maxs, float tmax )
 }
 
 #define STACK_DEPTH 40
+#define BACKFACE_BIAS 0.25	// DEVOGI_BACKFACE_BIAS in devogi_core.cpp
 
 // ray state shared by the helpers below
 vec3	o, d, inv;
-float	tmin, best;
+float	tmin, best;		// best = distance of the best hit, back faces pushed back
+float	bestT;			// the real distance of that hit
 int		hitTri;
 float	hitU, hitV;
 
@@ -80,8 +83,13 @@ void testLeaf( int first, int count )
 		if ( v < 0.0 || u + v > 1.0 )
 			continue;
 		float tt = dot( e2, q ) * idet;
-		if ( tt > tmin && tt < best ) {
-			best = tt;
+		// a face seen from behind counts as a little farther away (as in gi_trace), so
+		// of two faces in the same spot the one looking at the ray wins.
+		// det = -dot( d, e1 x e2 ), so the ray sees the front when det * side > 0.
+		float score = ( params.anyHit != 0u || det * t2.w > 0.0 ) ? tt : tt + BACKFACE_BIAS;	// shadow rays take any hit
+		if ( tt > tmin && score < best ) {
+			best = score;
+			bestT = tt;
 			hitTri = floatBitsToInt( t0.w );
 			hitU = u;
 			hitV = v;
@@ -101,6 +109,7 @@ void main()
 	d = r1.xyz;
 	tmin = r0.w;
 	best = r1.w;
+	bestT = r1.w;
 	inv = 1.0 / vec3(
 		abs( d.x ) > 1e-9 ? d.x : 1e-9,
 		abs( d.y ) > 1e-9 ? d.y : 1e-9,
@@ -139,5 +148,5 @@ void main()
 		}
 	}
 
-	hits[i] = vec4( best, hitU, hitV, intBitsToFloat( hitTri ) );
+	hits[i] = vec4( bestT, hitU, hitV, intBitsToFloat( hitTri ) );
 }

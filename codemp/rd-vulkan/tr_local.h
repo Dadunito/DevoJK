@@ -2863,7 +2863,7 @@ compiler's -devogi stage); tr_devogi.cpp connects it to the renderer.
 How they plug into map loading:
   RE_LoadWorldMap_Actual -> R_DevoLights_Extract   find the lamps and the sun
   R_LoadLightmaps        -> R_DevoGI_Process       bake (or load) the new lightmaps
-  RE_LoadWorldMap_Actual -> R_DevoGI_PatchVertexColors  new vertex colours
+  RE_LoadWorldMap_Actual -> R_DevoGI_PatchVertexColors  new vertex colours, moved lightmap spots
   RE_BeginScene          -> R_DevoLights_AddToScene     optional live light preview
 Real-time lighting (r_devoGI_live 1):
   R_LoadLightmaps        -> R_DevoGI_LightmapAlpha  the sun's baked shadow per pixel
@@ -2871,7 +2871,7 @@ Real-time lighting (r_devoGI_live 1):
   vk_update_light_constants -> R_DevoGI_FillLights  this frame's lamps and the sun
 */
 void		R_DevoGI_Register( void );
-byte		*R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader_t *header, int maxScale, int *outPageSize );
+byte		*R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader_t *header, int maxScale, int *outPageSize, int *outNumPages );
 const char	*R_DevoGI_FindShaderText( const char *shaderName );
 void		R_DevoGI_PatchVertexColors( byte *fileBase, const dheader_t *header );
 void		R_DevoLights_Extract( const char *mapName, const byte *fileBase, const dheader_t *header );
