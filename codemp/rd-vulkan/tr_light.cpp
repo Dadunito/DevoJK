@@ -435,19 +435,39 @@ R_LightDirForPoint
 */
 int R_LightDirForPoint( vec3_t point, vec3_t lightDir, vec3_t normal, world_t &world )
 {
-	trRefEntity_t ent;
-	
-	if ( world.lightGridData == NULL )
-	  return qfalse;
+	vec3_t dir;
 
-	Com_Memset(&ent, 0, sizeof(ent));
-	VectorCopy( point, ent.e.origin );
-	R_SetupEntityLightingGrid( &ent, &world );
+	/*
+	DevoJK: the direction light comes from at this world vertex, for per-pixel
+	shading (normal maps, highlights). With DevoGI, it comes from DevoGI's light
+	probes, a little in front of the surface; the map's old light grid from q3map2
+	often points somewhere else entirely near floors and walls (its cells there are
+	half inside the geometry), which made one vertex shade differently from its
+	neighbours: a visible seam running across a wall from that corner.
+	*/
+	vec3_t probePoint, ambient, directed;
+	float sunVis;
+	VectorMA( point, 4.0f, normal, probePoint );
+	if ( !R_DevoGI_EntityLighting( probePoint, ambient, directed, dir, &sunVis ) ) {
+		trRefEntity_t ent;
 
-	if (DotProduct(ent.lightDir, normal) > 0.2f)
-		VectorCopy(ent.lightDir, lightDir);
-	else
-		VectorCopy(normal, lightDir);
+		if ( world.lightGridData == NULL )
+		  return qfalse;
+
+		Com_Memset(&ent, 0, sizeof(ent));
+		VectorCopy( point, ent.e.origin );
+		R_SetupEntityLightingGrid( &ent, &world );
+		VectorCopy( ent.lightDir, dir );
+	}
+
+	// light from the side or behind the surface can't light it: lean the direction
+	// over to the surface's own normal. (This used to switch over abruptly, so two
+	// neighbouring vertices just either side of the cut-off shaded very differently.)
+	const float w = Com_Clamp( 0.0f, 1.0f, ( DotProduct( dir, normal ) - 0.1f ) / 0.4f );
+	VectorScale( normal, 1.0f - w, lightDir );
+	VectorMA( lightDir, w, dir, lightDir );
+	if ( VectorNormalize( lightDir ) == 0 )
+		VectorCopy( normal, lightDir );
 
 	return qtrue;
 }

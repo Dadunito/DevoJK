@@ -164,6 +164,10 @@ static void MakeMeshNormals( int width, int height, srfVert_t ctrl[MAX_GRID_SIZE
 			count = 0;
 			dv = &ctrl[j][i];
 			VectorCopy( dv->xyz, base );
+			// DevoJK: the normal the map itself gives this point (interpolated from the
+			// compiler's), kept as a fallback for degenerate spots below
+			vec3_t mapNormal;
+			VectorCopy( dv->normal, mapNormal );
 			for ( k = 0 ; k < 8 ; k++ ) {
 				VectorClear( around[k] );
 				good[k] = qfalse;
@@ -214,12 +218,16 @@ static void MakeMeshNormals( int width, int height, srfVert_t ctrl[MAX_GRID_SIZE
 
 				count++;
 			}
-			if ( count == 0 ) {
-				//printf("bad normal\n");
-				//count = 1;
-				VectorSet( dv->normal, 0.0f, 0.0f, 1.0f );
-			}else{
-				VectorNormalize2( sum, dv->normal );
+			/*
+			DevoJK: a degenerate patch (several control points on one spot - the round
+			end caps of benches are made this way) can leave no usable neighbours, or
+			cross products that cancel out to nothing. Normalising nothing gave a zero
+			normal; the PBR shader turns that into NaN and the surface drew black. In
+			those cases use the normal the map gives this point instead.
+			*/
+			if ( count == 0 || VectorNormalize2( sum, dv->normal ) == 0 ) {
+				if ( VectorNormalize2( mapNormal, dv->normal ) == 0 )
+					VectorSet( dv->normal, 0.0f, 0.0f, 1.0f );
 			}
 
 			for ( k = 0; k < 3; k++ ) {

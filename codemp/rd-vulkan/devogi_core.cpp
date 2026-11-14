@@ -1351,6 +1351,8 @@ struct giTexel {
 	gvec3	normal;		// smooth shading normal
 	gvec3	faceNormal;	// normal of the flat triangle underneath (used for ray offsets)
 	float	size;		// edge length of this texel in game units
+	float	sizeMax;	// its longer side: a stretched texel (a steep slope whose lightmap
+						// was projected from above) is much longer one way than the other
 	bool	edge;		// its centre lies just outside its triangle (a border texel)
 	int		page;
 	int		x, y;
@@ -1391,6 +1393,10 @@ static void gi_rasterize_tri( giBake &bake, const giTri &t, int style, int page 
 	const gvec3 cr = gcross( t.e1, t.e2 );
 	const float worldArea = 0.5f * sqrtf( gdot( cr, cr ) );
 	const float texelSize = sqrtf( worldArea / ( 0.5f * fabsf( area ) ) );
+	// how far one pixel to the right / one pixel down goes in the world
+	const gvec3 perX = ( t.e1 * ( py[2] - py[0] ) - t.e2 * ( py[1] - py[0] ) ) * ( 1.0f / area );
+	const gvec3 perY = ( t.e2 * ( px[1] - px[0] ) - t.e1 * ( px[2] - px[0] ) ) * ( 1.0f / area );
+	const float texelSizeMax = Q_max( texelSize, Q_max( sqrtf( gdot( perX, perX ) ), sqrtf( gdot( perY, perY ) ) ) );
 
 	int x0 = Q_max( 0, (int)floorf( Q_min( px[0], Q_min( px[1], px[2] ) ) - 1 ) );
 	int y0 = Q_max( 0, (int)floorf( Q_min( py[0], Q_min( py[1], py[2] ) ) - 1 ) );
@@ -1423,6 +1429,7 @@ static void gi_rasterize_tri( giBake &bake, const giTri &t, int style, int page 
 				tx.normal = t.n;	// broken smoothing normals: use the flat face normal
 			tx.faceNormal = t.n;
 			tx.size = texelSize;
+			tx.sizeMax = texelSizeMax;
 			tx.edge = !inside;
 			tx.page = page;
 			tx.x = x;
@@ -1538,7 +1545,7 @@ static int gi_unshare_lightmaps( giScene &scene, const byte *src, int bspPages,
 	for ( int i = 0; i < numSurfs; i++ )
 		firstTri[i + 1] += firstTri[i];
 
-	// walk the surfaces in order: the first one to cover a pixel owns it. A surface is
+	// walk the surfaces, biggest first: the first one to cover a pixel owns it. A surface is
 	// a sharer if most of its pixels are already owned by another one, or if any pixel
 	// well inside it is also well inside another surface (the old compiler fits small
 	// surfaces into unused corners of big odd-shaped ones; two surfaces truly sharing
@@ -1547,7 +1554,23 @@ static int gi_unshare_lightmaps( giScene &scene, const byte *src, int bspPages,
 	std::vector<int> ownerInside( (size_t)bspPages * N * N, -1 );	// the same, clearly inside only
 	std::vector<int> toMove;
 	std::vector<int> mine, mineInside;
+
+	// biggest surfaces first: of two that share, the bigger one keeps its spot and the
+	// smaller one moves (a thin face drawn inside a big one's block can't claim it)
+	std::vector<std::pair<float, int>> bySize( numSurfs );
 	for ( int s = 0; s < numSurfs; s++ ) {
+		float lmArea = 0;
+		for ( int ti = firstTri[s]; ti < firstTri[s + 1]; ti++ ) {
+			const giTri &t = scene.tris[ti];
+			const float *a = scene.verts[t.vert[0]].lm[0], *b = scene.verts[t.vert[1]].lm[0], *c = scene.verts[t.vert[2]].lm[0];
+			lmArea += 0.5f * fabsf( ( b[0] - a[0] ) * ( c[1] - a[1] ) - ( c[0] - a[0] ) * ( b[1] - a[1] ) );
+		}
+		bySize[s] = std::make_pair( -lmArea, s );
+	}
+	std::sort( bySize.begin(), bySize.end() );
+
+	for ( const std::pair<float, int> &entry : bySize ) {
+		const int s = entry.second;
 		const giSurf &gs = scene.surfs[s];
 		const int page = gs.lightmapNum[0];
 		if ( page < 0 || page >= bspPages || gs.lightmapStyle[0] == LS_LSNONE || gs.sky )
@@ -1847,6 +1870,31 @@ struct giSpatialHash {
 		}
 	}
 
+	// calls f( item ) for everything in the cubes within "radius" of p
+	template<typename F>
+	void queryRadius( const gvec3 &p, float radius, F f ) const {
+		if ( items.empty() )
+			return;
+		const float inv = 1.0f / cell;
+		const int x0 = (int)floorf( ( p.x - radius ) * inv ), x1 = (int)floorf( ( p.x + radius ) * inv );
+		const int y0 = (int)floorf( ( p.y - radius ) * inv ), y1 = (int)floorf( ( p.y + radius ) * inv );
+		const int z0 = (int)floorf( ( p.z - radius ) * inv ), z1 = (int)floorf( ( p.z + radius ) * inv );
+		for ( int z = z0; z <= z1; z++ )
+			for ( int y = y0; y <= y1; y++ )
+				for ( int x = x0; x <= x1; x++ ) {
+					const uint64_t k = key( x, y, z );
+					size_t s = mix( k ) & mask;
+					while ( slotKey[s] != ~0ULL ) {
+						if ( slotKey[s] == k ) {
+							for ( int i = slotStart[s]; i < slotStart[s] + slotCount[s]; i++ )
+								f( items[i] );
+							break;
+						}
+						s = ( s + 1 ) & mask;
+					}
+				}
+	}
+
 	// calls f( item ) for everything in the 27 cubes around p (radius up to one cube)
 	template<typename F>
 	void query( const gvec3 &p, F f ) const {
@@ -1887,16 +1935,20 @@ polygons end up with matching light at their shared edge (no seams).
 template<typename T>
 static void gi_world_smooth( const giBake &bake, const giSpatialHash &hash, std::vector<T> &values, float radius ) {
 	std::vector<T> out( values.size() );
-	const float r2 = radius * radius;
+	const float aa = 1.0f + Com_Clamp( 0.25f, 4.0f, g_set.aa );
 	gi_parallel_for( (int)bake.texels.size(), [&]( int i ) {
 		const giTexel &tx = bake.texels[i];
+		// at least a few of its own texels wide: where the lightmap is stretched, a
+		// light change squeezed into one long texel shows as a staircase
+		const float r = Com_Clamp( radius, Q_max( radius, 24.0f ), tx.sizeMax * aa );
+		const float r2 = r * r;
 		T sum = T();
 		float wsum = 0;
-		hash.query( tx.pos, [&]( int o ) {
+		hash.queryRadius( tx.pos, r, [&]( int o ) {
 			const giTexel &ot = bake.texels[o];
 			const gvec3 d = ot.pos - tx.pos;
 			const float d2 = gdot( d, d );
-			if ( d2 > r2 || !gi_texels_compatible( tx, ot, radius * 0.75f ) )
+			if ( d2 > r2 || !gi_texels_compatible( tx, ot, r * 0.75f ) )
 				return;
 			const float w = 1.0f - d2 / r2;	// soft falloff towards the edge of the radius
 			sum += values[o] * w;
@@ -2207,6 +2259,40 @@ static void gi_build_light_grid( giLightGrid &g ) {
 }
 
 /*
+How much of a glowing rectangle a point sees (its "form factor", 0..1), exactly,
+with Lambert's formula for polygons: for each edge, the angle it spans as seen
+from the point, times how much that edge's plane faces the point's normal. Parts
+of the rectangle behind the point's surface are cut off first. The light from a
+lamp is then strength * pi * formFactor / area - no random samples, so no noise.
+*/
+static float gi_rect_form_factor( const gvec3 &p, const gvec3 &n, const gvec3 corner[4] ) {
+	// keep only the part in front of the point's surface (Sutherland-Hodgman clipping)
+	gvec3 poly[8];
+	int count = 0;
+	for ( int i = 0; i < 4; i++ ) {
+		const gvec3 &a = corner[i], &b = corner[( i + 1 ) & 3];
+		const float da = gdot( a - p, n ) - 0.01f, db = gdot( b - p, n ) - 0.01f;
+		if ( da >= 0 )
+			poly[count++] = a;
+		if ( ( da >= 0 ) != ( db >= 0 ) )
+			poly[count++] = a + ( b - a ) * ( da / ( da - db ) );
+	}
+	if ( count < 3 )
+		return 0.0f;
+	float sum = 0;
+	for ( int i = 0; i < count; i++ ) {
+		const gvec3 a = gnorm( poly[i] - p ), b = gnorm( poly[( i + 1 ) % count] - p );
+		const gvec3 c = gcross( a, b );
+		const float len = sqrtf( gdot( c, c ) );
+		if ( len < 1e-7f )
+			continue;
+		const float angle = acosf( Com_Clamp( -1.0f, 1.0f, gdot( a, b ) ) );
+		sum += angle * gdot( c, n ) / len;
+	}
+	return Q_min( 1.0f, fabsf( sum ) / 6.2831853f );
+}
+
+/*
 Direct light arriving at one point. Instead of returning a total, it calls
 emit( group, rgb ) for every light group that reaches the point. The full bake
 multiplies each group by its calibrated brightness; the calibration step uses
@@ -2297,7 +2383,7 @@ static void gi_direct_point( const giBake &bake, const giLightGrid &grid, const 
 
 				// one sample: from spot (ux, uy) of the texel to spot (jx, jy) of the lamp
 				// (all -0.5..0.5 each way)
-				auto lampSample = [&]( float ux, float uy, float jx, float jy, float &sum, int &vis, int &tested ) {
+				auto lampSample = [&]( float ux, float uy, float jx, float jy, float &sum, float &all, int &vis, int &tested ) {
 					gvec3 target = lt.origin;
 					if ( hasRect )
 						target = lt.rectCentre + lt.normal * 1.0f + lt.axisU * ( jx * 2.0f * lt.halfU ) + lt.axisV * ( jy * 2.0f * lt.halfV );
@@ -2317,6 +2403,7 @@ static void gi_direct_point( const giBake &bake, const giLightGrid &grid, const 
 					tested++;
 					// each sample has its own distance and angles (a lamp is not one point)
 					const float contrib = lt.photons * cr * ce / Q_max( ds2, 16.0f );
+					all += contrib;
 					giHit hit;
 					if ( ds - emitterClearance <= DEVOGI_RAY_TMIN
 						|| !gi_trace( scene, so, Ls, ds - emitterClearance, hit, true, DEVOGI_RAY_TMIN ) ) {
@@ -2325,7 +2412,7 @@ static void gi_direct_point( const giBake &bake, const giLightGrid &grid, const 
 					}
 				};
 
-				float sum = 0;
+				float sum = 0, all = 0;	// light of the samples that got through / of all of them
 				int vis = 0, tested = 0, taken = 0;
 				if ( !alwaysFull ) {
 					// 4 probes: from the texel's 4 quarters, towards the lamp's 4 quarters
@@ -2334,7 +2421,7 @@ static void gi_direct_point( const giBake &bake, const giLightGrid &grid, const 
 						const float qy = ( ( s >> 1 ) + gi_rand( rng ) ) * 0.5f - 0.5f;
 						const float jx = lt.size > 0 ? ( ( ( s >> 1 ) ^ 1 ) + gi_rand( rng ) ) * 0.5f - 0.5f : 0.0f;
 						const float jy = lt.size > 0 ? ( ( s & 1 ) + gi_rand( rng ) ) * 0.5f - 0.5f : 0.0f;
-						lampSample( qx, qy, jx, jy, sum, vis, tested );
+						lampSample( qx, qy, jx, jy, sum, all, vis, tested );
 					}
 				}
 				if ( alwaysFull || ( vis > 0 && vis < tested ) ) {
@@ -2349,11 +2436,29 @@ static void gi_direct_point( const giBake &bake, const giLightGrid &grid, const 
 						const float uy = ( ( ( t / strata ) % strata ) + gi_rand( rng ) ) / strata - 0.5f;
 						const float jx = lt.size > 0 ? ( ( s % strata ) + gi_rand( rng ) ) / strata - 0.5f : 0.0f;
 						const float jy = lt.size > 0 ? ( ( ( s / strata ) % strata ) + gi_rand( rng ) ) / strata - 0.5f : 0.0f;
-						lampSample( ux, uy, jx, jy, sum, vis, tested );
+						lampSample( ux, uy, jx, jy, sum, all, vis, tested );
 					}
 				}
-				if ( sum > 0 )
+				if ( sum <= 0 )
+					continue;
+				if ( hasRect ) {
+					// Close to a lamp, the light changes very fast across it, and averaging
+					// random samples there gave blotchy, noisy light. So the samples only say
+					// how much of the lamp is hidden (sum / all), and the light itself is
+					// computed exactly. Unshadowed, the result is perfectly smooth.
+					const gvec3 corner[4] = {
+						lt.rectCentre - lt.axisU * lt.halfU - lt.axisV * lt.halfV,
+						lt.rectCentre + lt.axisU * lt.halfU - lt.axisV * lt.halfV,
+						lt.rectCentre + lt.axisU * lt.halfU + lt.axisV * lt.halfV,
+						lt.rectCentre - lt.axisU * lt.halfU + lt.axisV * lt.halfV };
+					if ( gdot( o - lt.rectCentre, lt.normal ) <= 0 )
+						continue;	// behind the glowing surface
+					const float rectArea = 4.0f * lt.halfU * lt.halfV;
+					const float exact = lt.photons * 3.14159265f * gi_rect_form_factor( o, normal, corner ) / rectArea;
+					emit( lt.group, lt.color * ( exact * Q_min( 1.0f, sum / all ) ) );
+				} else {
 					emit( lt.group, lt.color * ( sum / (float)Q_max( 1, taken ) ) );
+				}
 			}
 		}
 	}

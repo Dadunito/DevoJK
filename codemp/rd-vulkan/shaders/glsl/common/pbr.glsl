@@ -22,11 +22,15 @@
 			n.z = sqrt(clamp((0.25 - n.x * n.x) - n.y * n.y, 0.0, 1.0));
 			n = n.x * vertexTangent.xyz + n.y * biTangent + n.z * vertexNormal;
 
-			return normalize(n);
+			// DevoJK: degenerate geometry (zero-length normal or tangent) must not give a
+			// NaN normal, which draws the surface black: fall back to the vertex normal
+			if ( dot( n, n ) > 1e-12 )
+				return normalize(n);
 		}
-	
-		else
+
+		if ( dot( vertexNormal, vertexNormal ) > 1e-12 )
 			return normalize(vertexNormal);
+		return vec3( 0.0, 0.0, 1.0 );
 	}
 
 	vec3 CalcDiffuse( in vec3 diffuse, in float NE, in float NL,
