@@ -48,6 +48,8 @@ set(MPVulkanRendererFiles
 	"${MPDir}/rd-vulkan/tr_devogi.cpp"
 	"${MPDir}/rd-vulkan/devogi_core.cpp"
 	"${MPDir}/rd-vulkan/devogi_core.h"
+	"${MPDir}/rd-vulkan/devogi_gpu.cpp"
+	"${MPDir}/rd-vulkan/devogi_gpu.h"
 	"${MPDir}/rd-vulkan/tr_cache.h"
 	"${MPDir}/rd-vulkan/tr_cache.cpp"
 	"${MPDir}/rd-vulkan/tr_cmds.cpp"

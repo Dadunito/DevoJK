@@ -1,0 +1,143 @@
+/*
+===========================================================================
+DevoGI GPU ray tracer - compute shader
+
+Traces a batch of rays through the bake's BVH (the same tree and the same
+triangle test as gi_trace in devogi_core.cpp) and writes the nearest hit of
+each ray. It works on any Vulkan GPU: no ray-tracing hardware needed.
+
+Compiled into devogi_trace_spv.h with:
+  glslangValidator -V --target-env vulkan1.0 --vn devogi_trace_spv -o devogi_trace_spv.h devogi_trace.comp
+
+Buffers (all std430, vec4 = 16 bytes):
+  nodes: 4 vec4 per inner BVH node, holding both of its children:
+           (left.mins.xyz,  left child)  (left.maxs.xyz,  left triangle count)
+           (right.mins.xyz, right child) (right.maxs.xyz, right triangle count)
+         a child with a triangle count > 0 is a leaf, and its "child" is its first
+         triangle; otherwise it is the index of another inner node. Keeping both
+         boxes in the parent means one read decides where to go next.
+  tris:  3 vec4 per triangle, in BVH leaf order
+           (v0.xyz, original triangle index) (e1.xyz, 1 = blocks rays) (e2.xyz, -)
+  rays:  2 vec4 per ray (origin.xyz, tmin) (direction.xyz, tmax)
+  hits:  1 vec4 per ray (t, u, v, triangle index or -1)
+
+Part of DevoJK by Devoted, licensed under GPLv2.
+===========================================================================
+*/
+
+#version 450
+
+layout( local_size_x = 64 ) in;
+
+layout( std430, binding = 0 ) readonly buffer Nodes { vec4 nodes[]; };
+layout( std430, binding = 1 ) readonly buffer Tris { vec4 tris[]; };
+layout( std430, binding = 2 ) readonly buffer Rays { vec4 rays[]; };
+layout( std430, binding = 3 ) writeonly buffer Hits { vec4 hits[]; };
+
+layout( push_constant ) uniform Params {
+	uint count;		// rays in this batch
+	uint anyHit;	// 1: stop at the first hit (shadow rays)
+} params;
+
+// where the ray enters the box, or a huge number if it misses it (before tmax)
+float rayBox( vec3 o, vec3 inv, vec3 mins, vec3 maxs, float tmax )
+{
+	vec3 t0 = ( mins - o ) * inv;
+	vec3 t1 = ( maxs - o ) * inv;
+	vec3 tn = min( t0, t1 ), tf = max( t0, t1 );
+	float enter = max( max( tn.x, tn.y ), max( tn.z, 0.0 ) );
+	float leave = min( min( tf.x, tf.y ), min( tf.z, tmax ) );
+	return enter <= leave ? enter : 1e30;
+}
+
+#define STACK_DEPTH 40
+
+// ray state shared by the helpers below
+vec3	o, d, inv;
+float	tmin, best;
+int		hitTri;
+float	hitU, hitV;
+
+// tests the triangles of one leaf (Moller-Trumbore, two-sided, as in gi_trace)
+void testLeaf( int first, int count )
+{
+	for ( int k = first; k < first + count; k++ ) {
+		vec4 t0 = tris[k * 3], t1 = tris[k * 3 + 1], t2 = tris[k * 3 + 2];
+		if ( t1.w < 0.5 )
+			continue;	// doesn't block light
+		vec3 e1 = t1.xyz, e2 = t2.xyz;
+		vec3 p = cross( d, e2 );
+		float det = dot( e1, p );
+		if ( abs( det ) < 1e-9 )
+			continue;
+		float idet = 1.0 / det;
+		vec3 s = o - t0.xyz;
+		float u = dot( s, p ) * idet;
+		if ( u < 0.0 || u > 1.0 )
+			continue;
+		vec3 q = cross( s, e1 );
+		float v = dot( d, q ) * idet;
+		if ( v < 0.0 || u + v > 1.0 )
+			continue;
+		float tt = dot( e2, q ) * idet;
+		if ( tt > tmin && tt < best ) {
+			best = tt;
+			hitTri = floatBitsToInt( t0.w );
+			hitU = u;
+			hitV = v;
+		}
+	}
+}
+
+void main()
+{
+	// a 2D dispatch, so big batches stay under the per-dimension group limit
+	uint i = gl_WorkGroupID.y * ( gl_NumWorkGroups.x * 64u ) + gl_GlobalInvocationID.x;
+	if ( i >= params.count )
+		return;
+
+	vec4 r0 = rays[i * 2u], r1 = rays[i * 2u + 1u];
+	o = r0.xyz;
+	d = r1.xyz;
+	tmin = r0.w;
+	best = r1.w;
+	inv = 1.0 / vec3(
+		abs( d.x ) > 1e-9 ? d.x : 1e-9,
+		abs( d.y ) > 1e-9 ? d.y : 1e-9,
+		abs( d.z ) > 1e-9 ? d.z : 1e-9 );
+	hitTri = -1;
+	hitU = hitV = 0.0;
+
+	// walk the tree: always into the nearer child, the farther one waits on a short stack
+	int stack[STACK_DEPTH];
+	int sp = 0;
+	int cur = 0;
+	while ( true ) {
+		vec4 a0 = nodes[cur * 4], a1 = nodes[cur * 4 + 1], b0 = nodes[cur * 4 + 2], b1 = nodes[cur * 4 + 3];
+		int la = floatBitsToInt( a0.w ), lc = floatBitsToInt( a1.w );
+		int ra = floatBitsToInt( b0.w ), rc = floatBitsToInt( b1.w );
+		float dl = rayBox( o, inv, a0.xyz, a1.xyz, best );
+		float dr = rayBox( o, inv, b0.xyz, b1.xyz, best );
+
+		// leaves are tested right away
+		if ( dl < 1e29 && lc > 0 ) { testLeaf( la, lc ); dl = 1e30; }
+		if ( dr < 1e29 && rc > 0 ) { testLeaf( ra, rc ); dr = 1e30; }
+		if ( params.anyHit != 0u && hitTri >= 0 )
+			break;
+
+		if ( dl < 1e29 && dr < 1e29 ) {
+			if ( dl <= dr ) { cur = la; if ( sp < STACK_DEPTH ) stack[sp++] = ra; }
+			else { cur = ra; if ( sp < STACK_DEPTH ) stack[sp++] = la; }
+		} else if ( dl < 1e29 ) {
+			cur = la;
+		} else if ( dr < 1e29 ) {
+			cur = ra;
+		} else {
+			if ( sp == 0 )
+				break;
+			cur = stack[--sp];
+		}
+	}
+
+	hits[i] = vec4( best, hitU, hitV, intBitsToFloat( hitTri ) );
+}

@@ -56,6 +56,7 @@ This file is part of DevoJK by Devoted, licensed under GPLv2.
 */
 
 #include "devogi_core.h"
+#include "devogi_gpu.h"
 
 #include <cstdarg>
 #include <cstdio>
@@ -319,7 +320,7 @@ static_assert( sizeof( dsurface_t ) == 148, "dsurface_t must match the BSP file"
 #include <vector>
 
 // Bump this whenever the bake changes in a way that should invalidate old .devogi files.
-#define DEVOGI_VERSION		15
+#define DEVOGI_VERSION		16
 
 #define DEVOGI_BSP_LM_SIZE	128			// lightmap page size stored in every Q3/JA BSP
 #define DEVOGI_LM_SIZE		gi_lmSize	// page size we are baking right now (128 * scale)
@@ -431,6 +432,22 @@ static void gi_basis( const gvec3 &n, gvec3 &t, gvec3 &b ) {
 }
 
 // 64-bit FNV-1a hash, used for cache keys
+/*
+A point on the sun's disc, for soft sun shadows: (jx, jy) in -0.5..0.5 is spread
+evenly over a round disc (Shirley's concentric mapping) about 1 degree across - the
+real sun is 0.53 degrees, a little more keeps distant shadow edges smooth.
+*/
+static inline void gi_sun_disc( float jx, float jy, float &dx, float &dy ) {
+	const float a = jx * 2.0f, b = jy * 2.0f;	// -1..1
+	float r, phi;
+	if ( a == 0.0f && b == 0.0f ) { dx = dy = 0.0f; return; }
+	if ( fabsf( a ) > fabsf( b ) ) { r = a; phi = 0.78539816f * ( b / a ); }
+	else { r = b; phi = 1.57079633f - 0.78539816f * ( a / b ); }
+	const float radius = 0.0087f;	// radians: half of 1 degree
+	dx = r * cosf( phi ) * radius;
+	dy = r * sinf( phi ) * radius;
+}
+
 static uint64_t gi_fnv( uint64_t h, const void *data, size_t len ) {
 	const byte *p = (const byte *)data;
 	for ( size_t i = 0; i < len; i++ ) {
@@ -719,7 +736,7 @@ static void gi_build_bvh( giScene &scene ) {
 	scene.nodes.push_back( giBVHNode() );
 	stack.push_back( { 0, 0, n } );
 
-	// split every box in half along its longest axis until at most 4 triangles remain
+	// split every box (with the surface area heuristic, below) until at most 4 triangles remain
 	while ( !stack.empty() ) {
 		buildItem it = stack.back();
 		stack.pop_back();
@@ -743,12 +760,85 @@ static void gi_build_bvh( giScene &scene ) {
 			continue;
 		}
 
-		gvec3 ext = cmaxs - cmins;
-		int axis = ( ext.x > ext.y && ext.x > ext.z ) ? 0 : ( ext.y > ext.z ? 1 : 2 );
-		int mid = it.first + it.count / 2;
-		std::nth_element( scene.triIndex.begin() + it.first, scene.triIndex.begin() + mid,
-			scene.triIndex.begin() + it.first + it.count,
-			[&]( int a, int b ) { return centers[a][axis] < centers[b][axis]; } );
+		/*
+		Where to split: the surface area heuristic (SAH). A ray hits a box with a chance
+		that grows with the box's surface area, so the best split keeps big boxes with
+		few triangles and many triangles in small boxes. 16 candidate planes per axis
+		are tried ("binning"); the cheapest wins. A tree built this way sends a ray
+		through far fewer boxes than simply cutting the triangles in half.
+		*/
+		const int BINS = 16;
+		int axis = -1, splitBin = -1;
+		float bestCost = DEVOGI_INF;
+		for ( int ax = 0; ax < 3; ax++ ) {
+			const float lo = cmins[ax], hi = cmaxs[ax];
+			if ( hi - lo < 1e-4f )
+				continue;
+			const float scale = BINS / ( hi - lo );
+			gvec3 bmin[BINS], bmax[BINS];
+			int bcount[BINS] = {};
+			for ( int k = 0; k < BINS; k++ ) {
+				bmin[k] = gvec3( DEVOGI_INF, DEVOGI_INF, DEVOGI_INF );
+				bmax[k] = gvec3( -DEVOGI_INF, -DEVOGI_INF, -DEVOGI_INF );
+			}
+			for ( int i = it.first; i < it.first + it.count; i++ ) {
+				const int t = scene.triIndex[i];
+				const int k = Com_Clampi( 0, BINS - 1, (int)( ( centers[t][ax] - lo ) * scale ) );
+				bcount[k]++;
+				bmin[k] = gmin( bmin[k], tmins[t] );
+				bmax[k] = gmax( bmax[k], tmaxs[t] );
+			}
+			// sweep from the right, then from the left: cost of every split plane
+			auto area = []( const gvec3 &mn, const gvec3 &mx ) {
+				const gvec3 e = mx - mn;
+				return e.x < 0 ? 0.0f : e.x * e.y + e.y * e.z + e.z * e.x;
+			};
+			float rightArea[BINS];
+			int rightCount[BINS];
+			gvec3 rmn( DEVOGI_INF, DEVOGI_INF, DEVOGI_INF ), rmx( -DEVOGI_INF, -DEVOGI_INF, -DEVOGI_INF );
+			int rc = 0;
+			for ( int k = BINS - 1; k > 0; k-- ) {
+				rc += bcount[k];
+				rmn = gmin( rmn, bmin[k] );
+				rmx = gmax( rmx, bmax[k] );
+				rightArea[k] = area( rmn, rmx );
+				rightCount[k] = rc;
+			}
+			gvec3 lmn( DEVOGI_INF, DEVOGI_INF, DEVOGI_INF ), lmx( -DEVOGI_INF, -DEVOGI_INF, -DEVOGI_INF );
+			int lc = 0;
+			for ( int k = 1; k < BINS; k++ ) {
+				lc += bcount[k - 1];
+				lmn = gmin( lmn, bmin[k - 1] );
+				lmx = gmax( lmx, bmax[k - 1] );
+				if ( !lc || !rightCount[k] )
+					continue;
+				const float cost = lc * area( lmn, lmx ) + rightCount[k] * rightArea[k];
+				if ( cost < bestCost ) {
+					bestCost = cost;
+					axis = ax;
+					splitBin = k;
+				}
+			}
+		}
+
+		int mid;
+		if ( axis >= 0 ) {
+			const float lo = cmins[axis], scale = BINS / ( cmaxs[axis] - cmins[axis] );
+			mid = (int)( std::partition( scene.triIndex.begin() + it.first, scene.triIndex.begin() + it.first + it.count,
+				[&]( int t ) { return Com_Clampi( 0, BINS - 1, (int)( ( centers[t][axis] - lo ) * scale ) ) < splitBin; } )
+				- scene.triIndex.begin() );
+		} else {
+			mid = it.first;
+		}
+		if ( mid <= it.first || mid >= it.first + it.count ) {
+			// no useful plane (all centres in one spot): cut the list in half
+			gvec3 ext = cmaxs - cmins;
+			axis = ( ext.x > ext.y && ext.x > ext.z ) ? 0 : ( ext.y > ext.z ? 1 : 2 );
+			mid = it.first + it.count / 2;
+			std::nth_element( scene.triIndex.begin() + it.first, scene.triIndex.begin() + mid,
+				scene.triIndex.begin() + it.first + it.count,
+				[&]( int a, int b ) { return centers[a][axis] < centers[b][axis]; } );
+		}
 
 		int left = (int)scene.nodes.size();
 		scene.nodes.push_back( giBVHNode() );
@@ -1751,12 +1841,14 @@ static void gi_direct_point( const giBake &bake, const giLightGrid &grid, const 
 	if ( gi_hasSun ) {
 		const float cosS = gdot( normal, gi_sunDir );
 		if ( cosS > 0 ) {
-			// the sun is a small disc (~1.5 degrees), which gives sunlight soft edges too
+			// the sun is a small round disc (about 1 degree, see gi_sun_disc): soft sun edges
 			gvec3 st, sb;
 			gi_basis( gi_sunDir, st, sb );
 			// one sample: from spot (ux, uy) of the texel towards spot (jx, jy) of the sun disc
 			auto sunVisible = [&]( float ux, float uy, float jx, float jy ) {
-				const gvec3 dir = gnorm( gi_sunDir + st * ( jx * 0.05f ) + sb * ( jy * 0.05f ) );
+				float dx, dy;
+				gi_sun_disc( jx, jy, dx, dy );
+				const gvec3 dir = gnorm( gi_sunDir + st * dx + sb * dy );
 				giHit hit;
 				// sunlight arrives if the ray leaves the map or reaches a sky surface
 				return !gi_trace( scene, origin( ux, uy ), dir, 16384.0f, hit, false, DEVOGI_RAY_TMIN )
@@ -1962,40 +2054,91 @@ static gvec3 gi_hit_radiance( const giBake &bake, const giHit &hit, int styleVal
 	return L * scene.shaders[s.shader].albedo;
 }
 
-// bounce light and ambient occlusion at one point: out[0..2] = rgb, out[3] = 1 open .. 0 enclosed
-static void gi_gather_point( const giBake &bake, const gvec3 &pos, const gvec3 &normal, const gvec3 &faceNormal,
-	int styleValue, uint32_t seed, int rays, float out[4], bool allowSheen = true ) {
-	const giScene &scene = bake.scene;
-	const float aoDist = Q_max( 8.0f, g_set.aoDistance );
+/*
+Bounce light at one point ("a gather"): rays go out over the half-sphere above the
+surface, each brings back the light of whatever it hits, and the average is the
+light arriving there. Out of the same rays comes ambient occlusion (how much nearby
+geometry surrounds the point). It is done in three steps, so the expensive middle
+one can run on the CPU or, in big batches, on the GPU (devogi_gpu.cpp):
+
+  1. gi_gather_rays: make the rays (always the same for the same point and seed)
+  2. trace them: gi_trace on the CPU, or DG_GpuTrace for thousands of points at once
+  3. gi_gather_shade: turn the hits into light
+*/
+
+// one gather to do: where, which way, how many rays, and where the answer goes
+struct giGatherJob {
+	gvec3		pos, normal, faceNormal;
+	int			styleValue;
+	uint32_t	seed;
+	int			rays;
+	bool		sheen;		// add the glossy sheen cone (not for light probes)
+	float		*out;		// rgb + ambient occlusion (1 open .. 0 enclosed)
+};
+
+static inline int gi_gather_cone_rays( const giGatherJob &job ) {
+	const float sheen = Com_Clamp( 0.0f, 0.5f, g_set.sheen );
+	return ( sheen > 0 && job.sheen ) ? Q_max( 4, job.rays / 8 ) : 0;
+}
+
+// 1. the rays of one gather: job.rays bounce rays, then the sheen cone rays
+static void gi_gather_rays( const giGatherJob &job, dgGpuRay *out ) {
 	gvec3 t, b;
-	gi_basis( normal, t, b );
-	uint32_t rng = gi_hash( seed );
+	gi_basis( job.normal, t, b );
+	uint32_t rng = gi_hash( job.seed );
 	// rays start just off the flat face (a curved surface's smooth normal could point into
 	// its own neighbouring facets)
-	const gvec3 o = pos + faceNormal * 1.0f;
-	gvec3 sum;
-	float occlusion = 0;
-	for ( int r = 0; r < rays; r++ ) {
+	const gvec3 o = job.pos + job.faceNormal * 1.0f;
+	auto put = [&]( dgGpuRay &r, const gvec3 &d, float tmax ) {
+		r.origin[0] = o.x; r.origin[1] = o.y; r.origin[2] = o.z;
+		r.dir[0] = d.x; r.dir[1] = d.y; r.dir[2] = d.z;
+		r.tmin = DEVOGI_RAY_TMIN;
+		r.tmax = tmax;
+	};
+	for ( int r = 0; r < job.rays; r++ ) {
 		// cosine-weighted direction: more rays near the normal, where light counts most
 		const float u1 = gi_rand( rng ), u2 = gi_rand( rng );
 		const float rr = sqrtf( u1 ), phi = 6.2831853f * u2;
 		const float lx = rr * cosf( phi ), ly = rr * sinf( phi ), lz = sqrtf( Q_max( 0.0f, 1.0f - u1 ) );
-		gvec3 d = gnorm( t * lx + b * ly + normal * lz );
-		const float below = gdot( d, faceNormal );
+		gvec3 d = gnorm( t * lx + b * ly + job.normal * lz );
+		const float below = gdot( d, job.faceNormal );
 		if ( below < 0 )
-			d = gnorm( d - faceNormal * ( 2.0f * below ) );	// mirrored back above the surface
-		giHit hit;
-		if ( !gi_trace( scene, o, d, 8192.0f, hit, false, DEVOGI_RAY_TMIN ) )
+			d = gnorm( d - job.faceNormal * ( 2.0f * below ) );	// mirrored back above the surface
+		put( out[r], d, 8192.0f );
+	}
+	// the sheen cone: within ~20 degrees of the normal
+	const int cone = gi_gather_cone_rays( job );
+	for ( int r = 0; r < cone; r++ ) {
+		const float u1 = gi_rand( rng ) * 0.12f, u2 = gi_rand( rng );
+		const float rr = sqrtf( u1 ), phi = 6.2831853f * u2;
+		const gvec3 d = gnorm( t * ( rr * cosf( phi ) ) + b * ( rr * sinf( phi ) ) + job.normal * sqrtf( 1.0f - u1 ) );
+		put( out[job.rays + r], d, 1024.0f );
+	}
+}
+
+// 3. the light of one gather from its traced rays
+static void gi_gather_shade( const giBake &bake, const giGatherJob &job, const dgGpuRay *rays, const dgGpuHit *hits ) {
+	const giScene &scene = bake.scene;
+	const float aoDist = Q_max( 8.0f, g_set.aoDistance );
+	auto hitOf = [&]( const dgGpuHit &h ) { giHit g; g.t = h.t; g.tri = h.tri; g.u = h.u; g.v = h.v; return g; };
+
+	gvec3 sum;
+	float occlusion = 0;
+	for ( int r = 0; r < job.rays; r++ ) {
+		if ( hits[r].tri < 0 )
 			continue;	// left the map
+		const giHit hit = hitOf( hits[r] );
 		const giTri &ht = scene.tris[hit.tri];
+		const gvec3 d( rays[r].dir[0], rays[r].dir[1], rays[r].dir[2] );
 		const bool sky = scene.surfs[ht.surf].sky;
 		if ( !sky && hit.t < aoDist )
 			occlusion += 1.0f - hit.t / aoDist;	// near geometry blocks more
 		if ( !sky && gdot( ht.n, d ) > 0 )
 			continue;	// hit the back of something: no light comes from there
-		sum += gi_hit_radiance( bake, hit, styleValue );
+		sum += gi_hit_radiance( bake, hit, job.styleValue );
 	}
-	const float inv = 1.0f / rays;
+	float *out = job.out;
+	const float inv = 1.0f / job.rays;
 	out[0] = sum.x * inv;
 	out[1] = sum.y * inv;
 	out[2] = sum.z * inv;
@@ -2009,25 +2152,22 @@ static void gi_gather_point( const giBake &bake, const gvec3 &pos, const gvec3 &
 	bright wall, or a wall facing a red one, gets that faint, polished pick-up.
 	(The renderer's cubemaps, r_cubeMapping, are the real view-dependent reflections.)
 	*/
-	const float sheen = Com_Clamp( 0.0f, 0.5f, g_set.sheen );
-	if ( sheen > 0 && allowSheen ) {
-		const int coneRays = Q_max( 4, rays / 8 );
+	const int coneRays = gi_gather_cone_rays( job );
+	if ( coneRays ) {
+		const float sheen = Com_Clamp( 0.0f, 0.5f, g_set.sheen );
 		gvec3 cone;
 		int got = 0;
-		for ( int r = 0; r < coneRays; r++ ) {
-			// within ~20 degrees of the normal
-			const float u1 = gi_rand( rng ) * 0.12f, u2 = gi_rand( rng );
-			const float rr = sqrtf( u1 ), phi = 6.2831853f * u2;
-			gvec3 d = gnorm( t * ( rr * cosf( phi ) ) + b * ( rr * sinf( phi ) ) + normal * sqrtf( 1.0f - u1 ) );
-			giHit hit;
-			if ( !gi_trace( scene, o, d, 1024.0f, hit, false, DEVOGI_RAY_TMIN ) )
+		for ( int r = job.rays; r < job.rays + coneRays; r++ ) {
+			if ( hits[r].tri < 0 )
 				continue;
+			const giHit hit = hitOf( hits[r] );
 			const giTri &ht = scene.tris[hit.tri];
+			const gvec3 d( rays[r].dir[0], rays[r].dir[1], rays[r].dir[2] );
 			if ( !scene.surfs[ht.surf].sky && gdot( ht.n, d ) > 0 )
 				continue;
 			// nearer faces reflect more strongly than far ones
 			const float fade = 1.0f / ( 1.0f + hit.t / 256.0f );
-			cone += gi_hit_radiance( bake, hit, styleValue ) * fade;
+			cone += gi_hit_radiance( bake, hit, job.styleValue ) * fade;
 			got++;
 		}
 		if ( got ) {
@@ -2039,17 +2179,104 @@ static void gi_gather_point( const giBake &bake, const gvec3 &pos, const gvec3 &
 	}
 }
 
+// 2 on the CPU: traces the rays of one ray list with gi_trace
+static void gi_trace_cpu( const giScene &scene, const dgGpuRay *rays, dgGpuHit *hits, int count ) {
+	for ( int r = 0; r < count; r++ ) {
+		const gvec3 o( rays[r].origin[0], rays[r].origin[1], rays[r].origin[2] );
+		const gvec3 d( rays[r].dir[0], rays[r].dir[1], rays[r].dir[2] );
+		giHit hit;
+		if ( gi_trace( scene, o, d, rays[r].tmax, hit, false, rays[r].tmin ) ) {
+			hits[r].t = hit.t; hits[r].u = hit.u; hits[r].v = hit.v; hits[r].tri = hit.tri;
+		} else {
+			hits[r].t = rays[r].tmax; hits[r].u = hits[r].v = 0; hits[r].tri = -1;
+		}
+	}
+}
+
+// one gather on the CPU, all three steps
+static void gi_gather_point( const giBake &bake, const gvec3 &pos, const gvec3 &normal, const gvec3 &faceNormal,
+	int styleValue, uint32_t seed, int rays, float out[4], bool allowSheen = true ) {
+	giGatherJob job = { pos, normal, faceNormal, styleValue, seed, rays, allowSheen, out };
+	const int total = rays + gi_gather_cone_rays( job );
+	static thread_local std::vector<dgGpuRay> rayBuf;
+	static thread_local std::vector<dgGpuHit> hitBuf;
+	rayBuf.resize( total );
+	hitBuf.resize( total );
+	gi_gather_rays( job, rayBuf.data() );
+	gi_trace_cpu( bake.scene, rayBuf.data(), hitBuf.data(), total );
+	gi_gather_shade( bake, job, rayBuf.data(), hitBuf.data() );
+}
+
+/*
+Many gathers at once. On the GPU, the rays of thousands of points are traced in one
+go (a few million rays per batch); on the CPU every point is done on its own. Both
+give the same result. Progress is reported for big runs.
+*/
+static bool gi_gpuActive;	// the GPU tracer is running for this bake
+
+static void gi_gather_many( const giBake &bake, const std::vector<giGatherJob> &jobs, bool report ) {
+	if ( !gi_gpuActive ) {
+		gi_parallel_for( (int)jobs.size(), [&]( int i ) {
+			const giGatherJob &j = jobs[i];
+			gi_gather_point( bake, j.pos, j.normal, j.faceNormal, j.styleValue, j.seed, j.rays, j.out, j.sheen );
+		}, report );
+		return;
+	}
+
+	const size_t maxRays = 4u * 1024u * 1024u;		// rays per round trip to the GPU
+	std::vector<size_t> first( jobs.size() + 1, 0 );
+	for ( size_t i = 0; i < jobs.size(); i++ )
+		first[i + 1] = first[i] + jobs[i].rays + gi_gather_cone_rays( jobs[i] );
+
+	std::vector<dgGpuRay> rays;
+	std::vector<dgGpuHit> hits;
+	size_t start = 0;
+	while ( start < jobs.size() ) {
+		size_t end = start + 1;
+		while ( end < jobs.size() && first[end + 1] - first[start] <= maxRays )
+			end++;
+		const size_t base = first[start], count = first[end] - base;
+		rays.resize( count );
+		hits.resize( count );
+
+		gi_parallel_for( (int)( end - start ), [&]( int k ) {
+			gi_gather_rays( jobs[start + k], &rays[first[start + k] - base] );
+		} );
+		if ( !DG_GpuTrace( rays.data(), hits.data(), count, false ) ) {
+			// the GPU gave up: this batch and the rest on the CPU
+			gi_gpuActive = false;
+			gi_parallel_for( (int)( jobs.size() - start ), [&]( int k ) {
+				const giGatherJob &j = jobs[start + k];
+				gi_gather_point( bake, j.pos, j.normal, j.faceNormal, j.styleValue, j.seed, j.rays, j.out, j.sheen );
+			} );
+			return;
+		}
+		gi_parallel_for( (int)( end - start ), [&]( int k ) {
+			const size_t at = first[start + k] - base;
+			gi_gather_shade( bake, jobs[start + k], &rays[at], &hits[at] );
+		} );
+
+		start = end;
+		if ( report )
+			gi_progress_draw( (float)start / jobs.size(), false );
+	}
+}
+
 static void gi_gather( giBake &bake, const giSpatialHash &gridHash, const std::vector<int> &gridPoints,
 	const std::vector<gvec3> &texelPos, float radius, int rays ) {
 	const size_t n = bake.texels.size();
 	std::vector<float> gathered( n * 4, 0.0f );
 
 	// 1. gather at the grid points (the expensive part)
-	gi_parallel_for( (int)gridPoints.size(), [&]( int k ) {
-		const int i = gridPoints[k];
-		const giTexel &tx = bake.texels[i];
-		gi_gather_point( bake, tx.pos, tx.normal, tx.faceNormal, tx.styleValue, (uint32_t)i * 9781u + 1u, rays, &gathered[(size_t)i * 4] );
-	}, true );
+	{
+		std::vector<giGatherJob> jobs( gridPoints.size() );
+		for ( size_t k = 0; k < gridPoints.size(); k++ ) {
+			const int i = gridPoints[k];
+			const giTexel &tx = bake.texels[i];
+			jobs[k] = { tx.pos, tx.normal, tx.faceNormal, tx.styleValue, (uint32_t)i * 9781u + 1u, rays, true, &gathered[(size_t)i * 4] };
+		}
+		gi_gather_many( bake, jobs, true );
+	}
 
 	// 2. every texel takes a smooth, distance-weighted mix of the grid points around it in
 	// the world. This removes the noise and fills the gaps in one go, across polygons.
@@ -2077,27 +2304,43 @@ static void gi_gather( giBake &bake, const giSpatialHash &gridHash, const std::v
 			lonely[i] = 1;	// no grid point nearby (a thin strip): gather it directly below
 		}
 	} );
-	gi_parallel_for( (int)n, [&]( int i ) {
-		if ( !lonely[i] )
-			return;
-		const giTexel &tx = bake.texels[i];
-		gi_gather_point( bake, tx.pos, tx.normal, tx.faceNormal, tx.styleValue, (uint32_t)i * 9781u + 1u, rays, &bake.indirect[(size_t)i * 4] );
-	} );
+	{
+		std::vector<giGatherJob> jobs;
+		for ( size_t i = 0; i < n; i++ ) {
+			if ( !lonely[i] )
+				continue;
+			const giTexel &tx = bake.texels[i];
+			jobs.push_back( { tx.pos, tx.normal, tx.faceNormal, tx.styleValue, (uint32_t)i * 9781u + 1u, rays, true, &bake.indirect[i * 4] } );
+		}
+		gi_gather_many( bake, jobs, false );
+	}
 	(void)texelPos;
 }
 
 static bool gi_relit;	// direct light was traced with real shadows (no fake contact darkening needed)
 
 // light = direct + bounce, with ambient occlusion keeping corners dark
+/*
+How much ambient occlusion darkens bounce light, from the occlusion ao (1 open .. 0
+enclosed). The bounce gather already sees the geometry around a spot (a ray that
+hits a wall brings that wall's light instead of the sky's), so occlusion on top of
+it is only a gentle extra: at r_devoGI_ao 1, a spot half enclosed keeps 75% of its
+bounce light. (It used to be ao squared, which left floors next to walls far too
+dark - they are almost always near something.)
+*/
+static inline float gi_ao_factor( float ao ) {
+	const float strength = Com_Clamp( 0.0f, 2.0f, g_set.ao ) * 0.5f;
+	return Q_max( 0.0f, 1.0f - strength * ( 1.0f - Com_Clamp( 0.0f, 1.0f, ao ) ) );
+}
+
 static void gi_compose( giBake &bake, float intensity ) {
-	const float aoIndirect = Com_Clamp( 0.0f, 2.0f, g_set.ao );
 	const float aoDirect = gi_relit ? 0.0f : Com_Clamp( 0.0f, 1.0f, g_set.aoDirect );
 	bake.light = bake.direct;
 	for ( size_t i = 0; i < bake.texels.size(); i++ ) {
 		const giTexel &tx = bake.texels[i];
 		float *px = &bake.light[( ( (size_t)tx.page * DEVOGI_LM_SIZE + tx.y ) * DEVOGI_LM_SIZE + tx.x ) * 3];
 		const float ao = Com_Clamp( 0.0f, 1.0f, bake.indirect[i * 4 + 3] );
-		const float bounceScale = intensity * powf( ao, aoIndirect * 2.0f );
+		const float bounceScale = intensity * gi_ao_factor( ao );
 		const float directScale = 1.0f - aoDirect * ( 1.0f - ao );
 		px[0] = px[0] * directScale + bake.indirect[i * 4 + 0] * bounceScale;
 		px[1] = px[1] * directScale + bake.indirect[i * 4 + 1] * bounceScale;
@@ -2260,12 +2503,11 @@ The alpha channel holds how much of the sun each spot sees (0..255): until the
 renderer has its own sun shadows, that baked mask is the sun's shadow.
 */
 static void gi_build_bounce_maps( giBake &bake, dgLiveLighting &live, bool relight, float exposure, float intensity ) {
-	const float aoIndirect = Com_Clamp( 0.0f, 2.0f, g_set.ao );
 	std::vector<float> img( bake.owner.size() * 3, 0.0f );
 	for ( size_t i = 0; i < bake.texels.size(); i++ ) {
 		const giTexel &tx = bake.texels[i];
 		const float ao = Com_Clamp( 0.0f, 1.0f, bake.indirect[i * 4 + 3] );
-		float k = intensity * powf( ao, aoIndirect * 2.0f );
+		float k = intensity * gi_ao_factor( ao );
 		if ( relight && tx.styleValue == 0 )
 			k *= exposure;
 		float *px = &img[( ( (size_t)tx.page * DEVOGI_LM_SIZE + tx.y ) * DEVOGI_LM_SIZE + tx.x ) * 3];
@@ -2390,21 +2632,35 @@ static void gi_build_probes( giBake &bake, dgLiveLighting &live, float intensity
 			int seen = 0;
 			for ( int k = 0; k < 16; k++ ) {
 				const float jx = ( ( k & 3 ) + 0.5f ) / 4.0f - 0.5f, jy = ( ( k >> 2 ) + 0.5f ) / 4.0f - 0.5f;
-				const gvec3 d = gnorm( gi_sunDir + st * ( jx * 0.05f ) + sb * ( jy * 0.05f ) );
+				float dx, dy;
+				gi_sun_disc( jx, jy, dx, dy );
+				const gvec3 d = gnorm( gi_sunDir + st * dx + sb * dy );
 				giHit hit;
 				if ( !gi_trace( scene, pos, d, 16384.0f, hit, false ) || scene.surfs[scene.tris[hit.tri].surf].sky )
 					seen++;
 			}
 			sunVis[i] = (uint8_t)( seen * 255 / 16 );
 		}
-		for ( int a = 0; a < 6; a++ ) {
-			float g[4];
-			gi_gather_point( bake, pos, axes[a], axes[a], 0, (uint32_t)i * 2654435761u + (uint32_t)a * 97u, probeRays, g, false );
-			cube[(size_t)i * 18 + a * 3 + 0] = g[0] * intensity;
-			cube[(size_t)i * 18 + a * 3 + 1] = g[1] * intensity;
-			cube[(size_t)i * 18 + a * 3 + 2] = g[2] * intensity;
-		}
 	}, true );
+
+	// the bounce light from 6 directions of every probe in open space, all at once
+	{
+		std::vector<float> g( count * 6 * 4, 0.0f );
+		std::vector<giGatherJob> jobs;
+		for ( size_t i = 0; i < count; i++ ) {
+			if ( !valid[i] )
+				continue;
+			const int x = (int)( i % dims[0] ), y = (int)( ( i / dims[0] ) % dims[1] ), z = (int)( i / ( (size_t)dims[0] * dims[1] ) );
+			const gvec3 pos( mins.x + x * spacing, mins.y + y * spacing, mins.z + z * spacing );
+			for ( int a = 0; a < 6; a++ )
+				jobs.push_back( { pos, axes[a], axes[a], 0, (uint32_t)i * 2654435761u + (uint32_t)a * 97u, probeRays, false, &g[( i * 6 + a ) * 4] } );
+		}
+		gi_gather_many( bake, jobs, false );
+		for ( size_t i = 0; i < count; i++ )
+			for ( int a = 0; a < 6; a++ )
+				for ( int k = 0; k < 3; k++ )
+					cube[i * 18 + a * 3 + k] = g[( i * 6 + a ) * 4 + k] * intensity;
+	}
 
 	// invalid probes take the average of their valid (or already filled) neighbours
 	std::vector<uint8_t> have = valid;
@@ -2639,7 +2895,9 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 			if ( gi_sky_sun_color( in[i].shader, tint ) )
 				break;
 		}
-		bake.skyColor = tint * ( 64.0f * Q_max( 0.0f, g_set.sky ) );
+		// at r_devoGI_sky 0.5, open sky gives shade outdoors roughly a fifth to a quarter
+		// of full sunlight, like a clear day (it used to be half that: near-black shade)
+		bake.skyColor = tint * ( 128.0f * Q_max( 0.0f, g_set.sky ) );
 	}
 
 	COM_StripExtension( COM_SkipPath( (char *)mapName ), gi_progressMap, sizeof( gi_progressMap ) );
@@ -2648,6 +2906,32 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 
 	gi_build_geometry( bake.scene, fileBase, header );
 	gi_build_bvh( bake.scene );
+
+	// the GPU tracer: the BVH and the triangles go to the GPU once, then the bounce
+	// light (the bulk of the work) is traced there in big batches
+	gi_gpuActive = false;
+	if ( g_set.gpu ) {
+		const giScene &sc = bake.scene;
+		std::vector<float> nodes( sc.nodes.size() * 8 ), tris( sc.triIndex.size() * 12 );
+		for ( size_t i = 0; i < sc.nodes.size(); i++ ) {
+			const giBVHNode &nd = sc.nodes[i];
+			float *o = &nodes[i * 8];
+			int32_t left = nd.left, cnt = nd.count;
+			o[0] = nd.mins.x; o[1] = nd.mins.y; o[2] = nd.mins.z; memcpy( &o[3], &left, 4 );
+			o[4] = nd.maxs.x; o[5] = nd.maxs.y; o[6] = nd.maxs.z; memcpy( &o[7], &cnt, 4 );
+		}
+		for ( size_t k = 0; k < sc.triIndex.size(); k++ ) {
+			const int32_t ti = sc.triIndex[k];
+			const giTri &t = sc.tris[ti];
+			const bool blocks = sc.surfs[t.surf].occluder || sc.surfs[t.surf].sky;
+			float *o = &tris[k * 12];
+			o[0] = t.v0.x; o[1] = t.v0.y; o[2] = t.v0.z; memcpy( &o[3], &ti, 4 );
+			o[4] = t.e1.x; o[5] = t.e1.y; o[6] = t.e1.z; o[7] = blocks ? 1.0f : 0.0f;
+			o[8] = t.e2.x; o[9] = t.e2.y; o[10] = t.e2.z; o[11] = 0.0f;
+		}
+		gi_gpuActive = DG_GpuBegin( nodes.data(), sc.nodes.size(), tris.data(), sc.triIndex.size(),
+			[]( const char *text ) { dg_print( "%s", text ); } );
+	}
 	gi_build_bsp_owner( bake );		// at the BSP's own 128 resolution
 	gi_lmSize = pageSize;
 	gi_build_texels( bake );		// at bake resolution
@@ -2896,18 +3180,27 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 			} );
 
 			// vertex-lit models (crates, ships, lamps...): the same direct and bounce light per vertex
-			const float aoIndirect = Com_Clamp( 0.0f, 2.0f, g_set.ao );
 			const float aoDirect = Com_Clamp( 0.0f, 1.0f, g_set.aoDirect );
 			gi_progress_stage( "Models and vertex colours", 0.92f, 0.04f );
+			// bounce light at every vertex first, all at once (twice the rays: a vertex
+			// has no neighbours to average with)
+			std::vector<float> gathered( list.size() * 4, 0.0f );
+			{
+				std::vector<giGatherJob> jobs( list.size() );
+				for ( size_t i = 0; i < list.size(); i++ ) {
+					giVert gv;
+					gi_load_vert( gv, dv[list[i]] );
+					jobs[i] = { gv.xyz, gv.normal, gv.normal, 0, (uint32_t)list[i] * 7919u + 13u, rays * 2, true, &gathered[i * 4] };
+				}
+				gi_gather_many( bake, jobs, false );
+			}
 			gi_parallel_for( (int)list.size(), [&]( int i ) {
 				const int v = list[i];
 				giVert gv;
 				gi_load_vert( gv, dv[v] );
-				float g[4];
-				// twice the rays: a vertex has no neighbours to average with
-				gi_gather_point( bake, gv.xyz, gv.normal, gv.normal, 0, (uint32_t)v * 7919u + 13u, rays * 2, g );
+				const float *g = &gathered[(size_t)i * 4];
 				const float ao = Com_Clamp( 0.0f, 1.0f, g[3] );
-				const float bounceScale = intensity * powf( ao, aoIndirect * 2.0f );
+				const float bounceScale = intensity * gi_ao_factor( ao );
 				float c[3];
 				if ( relight ) {
 					gvec3 total;
@@ -2967,6 +3260,8 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 		}
 	}
 
+	DG_GpuEnd();
+	gi_gpuActive = false;
 	delete bakePtr;
 	gi_lmSize = DEVOGI_BSP_LM_SIZE;
 

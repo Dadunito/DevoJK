@@ -45,6 +45,7 @@ struct dgSettings {
 	int		relight		= 1;		// trace direct light from the map's own lights
 	int		entityLights = 1;		// use light entities left in the BSP
 	int		threads		= 0;		// worker threads (0 = all CPU cores)
+	int		gpu			= 1;		// trace the bake's rays on the GPU when there is one (same result, faster)
 };
 
 // What the core needs from whoever runs it (the renderer or the compiler).
