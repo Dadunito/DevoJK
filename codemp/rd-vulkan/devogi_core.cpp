@@ -320,7 +320,7 @@ static_assert( sizeof( dsurface_t ) == 148, "dsurface_t must match the BSP file"
 #include <vector>
 
 // Bump this whenever the bake changes in a way that should invalidate old .devogi files.
-#define DEVOGI_VERSION		16
+#define DEVOGI_VERSION		17
 
 #define DEVOGI_BSP_LM_SIZE	128			// lightmap page size stored in every Q3/JA BSP
 #define DEVOGI_LM_SIZE		gi_lmSize	// page size we are baking right now (128 * scale)
@@ -491,7 +491,8 @@ static int						gi_numGroups = 2;	// shaders + light entities + sun
 static int						gi_entityGroup = 0;
 static int						gi_sunGroup = 1;
 static char						gi_lightsMap[MAX_QPATH];
-static std::vector<std::string>	gi_groupNames;		// readable name per group, for the bake log
+static std::vector<std::string>	gi_groupNames;
+static std::vector<std::string>	gi_emitTexture;		// per shader: the texture a big unlit surface glows with ("" = none)		// readable name per group, for the bake log
 static uint64_t					gi_lightsHash;		// changes whenever the light sources change
 
 /*
@@ -507,6 +508,7 @@ uses. Every triangle remembers which surface it came from.
 struct giVert {
 	gvec3	xyz;
 	gvec3	normal;
+	float	st[2];					// texture coordinates (where a glowing texture is sampled)
 	float	lm[MAXLIGHTMAPS][2];	// lightmap coordinates, per light style slot (0..1 across a page)
 	float	color[MAXLIGHTMAPS][3];	// q3map2's baked vertex colours, per light style slot
 };
@@ -530,6 +532,10 @@ struct giShader {
 	int		surfaceFlags;
 	int		contentFlags;
 	gvec3	albedo;		// how much light the surface reflects, per colour channel
+	// a big unlit surface (a fake sky box, a large light panel): it shines with its own
+	// texture, pixel by pixel - brighter pixels give more light (see gi_emit_radiance)
+	int					emitW = 0, emitH = 0;
+	std::vector<gvec3>	emit;
 };
 
 struct giBVHNode {
@@ -559,6 +565,8 @@ static giVert gi_patch_eval( const giVert *c[9], float u, float v ) {
 			float w = bu[i] * bv[j];
 			out.xyz += p->xyz * w;
 			out.normal += p->normal * w;
+			out.st[0] += p->st[0] * w;
+			out.st[1] += p->st[1] * w;
 			for ( int s = 0; s < MAXLIGHTMAPS; s++ ) {
 				out.lm[s][0] += p->lm[s][0] * w;
 				out.lm[s][1] += p->lm[s][1] * w;
@@ -594,6 +602,8 @@ static void gi_add_tri( giScene &scene, int surf, int a, int b, int c ) {
 static void gi_load_vert( giVert &out, const mapVert_t &in ) {
 	out.xyz = gvec3( LittleFloat( in.xyz[0] ), LittleFloat( in.xyz[1] ), LittleFloat( in.xyz[2] ) );
 	out.normal = gnorm( gvec3( LittleFloat( in.normal[0] ), LittleFloat( in.normal[1] ), LittleFloat( in.normal[2] ) ) );
+	out.st[0] = LittleFloat( in.st[0] );
+	out.st[1] = LittleFloat( in.st[1] );
 	for ( int s = 0; s < MAXLIGHTMAPS; s++ ) {
 		out.lm[s][0] = LittleFloat( in.lightmap[s][0] );
 		out.lm[s][1] = LittleFloat( in.lightmap[s][1] );
@@ -1010,7 +1020,8 @@ static bool gi_sky_sun_color( const char *shaderName, gvec3 &tint ) {
 			return false;
 		if ( token[0] == '{' ) { depth++; continue; }
 		if ( token[0] == '}' ) { if ( --depth <= 0 ) return false; continue; }
-		if ( !Q_stricmp( token, "q3map_sun" ) || !Q_stricmp( token, "q3map_sunExt" ) || !Q_stricmp( token, "sun" ) ) {
+		if ( !Q_stricmp( token, "q3map_sun" ) || !Q_stricmp( token, "q3map_sunExt" ) || !Q_stricmp( token, "sun" )
+			|| !Q_stricmp( token, "q3gl2_sun" ) ) {
 			float c[3];
 			for ( int i = 0; i < 3; i++ )
 				c[i] = atof( COM_ParseExt( &p, qfalse ) );
@@ -1021,6 +1032,122 @@ static bool gi_sky_sun_color( const char *shaderName, gvec3 &tint ) {
 			return true;
 		}
 	}
+}
+
+/*
+The sky as a light source. Its light comes from the sky box images themselves
+(skyParms <farbox>: six faces _rt _bk _lf _ft _up _dn), looked up by direction,
+so a bright horizon, a sunset side or a dark storm half light the level the way
+they look. Each face is boiled down to 16x16 average colours. Without images the
+sky shines in one colour (its first texture's average, or the sun's colour).
+*/
+struct giSky {
+	bool	images = false;
+	gvec3	face[6][16][16];
+	gvec3	uniform = gvec3( 0.5f, 0.5f, 0.5f );
+	float	scale = 0.0f;		// image colour (0..1) -> light, in lightmap units
+};
+static giSky gi_sky;
+
+// loads one sky box face into 16x16 averages; false if the image is missing
+static bool gi_sky_face( const char *name, gvec3 out[16][16] ) {
+	byte *pic = NULL;
+	int w = 0, h = 0;
+	dg_load_image( name, &pic, &w, &h );
+	if ( !pic || w <= 0 || h <= 0 ) {
+		if ( pic )
+			dg_free_image( pic );
+		return false;
+	}
+	for ( int by = 0; by < 16; by++ ) {
+		for ( int bx = 0; bx < 16; bx++ ) {
+			double r = 0, g = 0, b = 0;
+			int n = 0;
+			const int x0 = bx * w / 16, x1 = Q_max( x0 + 1, ( bx + 1 ) * w / 16 );
+			const int y0 = by * h / 16, y1 = Q_max( y0 + 1, ( by + 1 ) * h / 16 );
+			const int step = Q_max( 1, ( x1 - x0 ) / 8 );
+			for ( int y = y0; y < y1; y += step )
+				for ( int x = x0; x < x1; x += step, n++ ) {
+					const byte *px = &pic[( (size_t)y * w + x ) * 4];
+					r += px[0]; g += px[1]; b += px[2];
+				}
+			out[by][bx] = n ? gvec3( (float)( r / n / 255.0 ), (float)( g / n / 255.0 ), (float)( b / n / 255.0 ) ) : gvec3();
+		}
+	}
+	dg_free_image( pic );
+	return true;
+}
+
+// reads a sky shader: its sky box images (skyParms) or, failing that, its first texture
+static void gi_sky_setup( const char *shaderName, const gvec3 &tint ) {
+	gi_sky.images = false;
+	gi_sky.uniform = tint;
+	const char *p = R_DevoGI_FindShaderText( shaderName );
+	char farbox[MAX_QPATH] = "";
+	int depth = 0;
+	while ( p ) {
+		const char *token = COM_ParseExt( &p, qtrue );
+		if ( !token[0] )
+			break;
+		if ( token[0] == '{' ) { depth++; continue; }
+		if ( token[0] == '}' ) { if ( --depth <= 0 ) break; continue; }
+		if ( depth == 1 && !Q_stricmp( token, "skyparms" ) ) {
+			token = COM_ParseExt( &p, qfalse );
+			if ( token[0] && token[0] != '-' )
+				Q_strncpyz( farbox, token, sizeof( farbox ) );
+		}
+	}
+	if ( farbox[0] ) {
+		// the face order and orientation of Q3's sky box (tr_sky.c)
+		static const char *suffix[6] = { "rt", "bk", "lf", "ft", "up", "dn" };
+		bool all = true;
+		for ( int f = 0; f < 6 && all; f++ ) {
+			char name[MAX_QPATH];
+			Com_sprintf( name, sizeof( name ), "%s_%s", farbox, suffix[f] );
+			all = gi_sky_face( name, gi_sky.face[f] );
+		}
+		gi_sky.images = all;
+	}
+	if ( !gi_sky.images ) {
+		char tex[MAX_QPATH];
+		gi_shader_texture( shaderName, tex, sizeof( tex ) );
+		if ( Q_stricmp( tex, shaderName ) ) {
+			gvec3 c = gi_shader_albedo( tex );
+			if ( c.x + c.y + c.z > 0.05f )
+				gi_sky.uniform = c;
+		}
+	}
+}
+
+// the light the sky sends from direction d (pointing away from the scene, into the sky)
+static gvec3 gi_sky_radiance( const gvec3 &d ) {
+	if ( !gi_sky.images )
+		return gi_sky.uniform * gi_sky.scale;
+	// which face, and where on it (the inverse of tr_sky.c's MakeSkyVec)
+	const float ax = fabsf( d.x ), ay = fabsf( d.y ), az = fabsf( d.z );
+	int f;
+	float s, t;
+	if ( ax >= ay && ax >= az ) {
+		if ( d.x > 0 ) { f = 0; s = -d.y / ax; t = d.z / ax; }
+		else { f = 1; s = d.y / ax; t = d.z / ax; }
+	} else if ( ay >= az ) {
+		if ( d.y > 0 ) { f = 2; s = d.x / ay; t = d.z / ay; }
+		else { f = 3; s = -d.x / ay; t = d.z / ay; }
+	} else {
+		if ( d.z > 0 ) { f = 4; s = -d.y / az; t = -d.x / az; }
+		else { f = 5; s = -d.y / az; t = d.x / az; }
+	}
+	const int x = Com_Clampi( 0, 15, (int)( ( s + 1.0f ) * 0.5f * 16.0f ) );
+	const int y = Com_Clampi( 0, 15, (int)( ( 1.0f - ( t + 1.0f ) * 0.5f ) * 16.0f ) );
+	return gi_sky.face[f][y][x] * gi_sky.scale;
+}
+
+// the light a glowing (unlit) surface sends out at texture coordinates (s, t)
+static inline gvec3 gi_emit_radiance( const giShader &sh, float s, float t ) {
+	const float fs = s - floorf( s ), ft = t - floorf( t );
+	const int x = Com_Clampi( 0, sh.emitW - 1, (int)( fs * sh.emitW ) );
+	const int y = Com_Clampi( 0, sh.emitH - 1, (int)( ft * sh.emitH ) );
+	return sh.emit[(size_t)y * sh.emitW + x];
 }
 
 /*
@@ -1481,7 +1608,8 @@ static void gi_fix_texel_positions( giBake &bake ) {
 		giTexel &tx = bake.texels[i];
 		gvec3 t, b;
 		gi_basis( tx.faceNormal, t, b );
-		const float reach = tx.size * 0.75f + 1.0f;	// the corner of a texel is ~0.7 texels away
+		// the corner of a texel is ~0.7 texels away; look a little further for safety
+		const float reach = tx.size * 1.0f + 2.0f;
 		for ( int pass = 0; pass < 2; pass++ ) {
 			const gvec3 o = tx.pos + tx.faceNormal * 0.1f;
 			const gvec3 dirs[4] = { t, t * -1.0f, b, b * -1.0f };
@@ -1493,8 +1621,9 @@ static void gi_fix_texel_positions( giBake &bake ) {
 				const giTri &ht = scene.tris[hit.tri];
 				if ( scene.surfs[ht.surf].sky || gdot( ht.n, d ) <= 0 )
 					continue;	// a wall's front face: we are outside it, all good
-				// we hit the back of a wall: step out through it, a little past its surface
-				tx.pos = o + d * ( hit.t + 0.5f ) - tx.faceNormal * 0.1f;
+				// we hit the back of a wall: step out through it, with a safety margin past
+				// its surface so no ray from here can slip under the wall's edge
+				tx.pos = o + d * ( hit.t + Q_max( 1.0f, tx.size * 0.5f ) ) - tx.faceNormal * 0.1f;
 				fixedOne = true;
 				break;
 			}
@@ -2011,12 +2140,12 @@ the nearest gathered points in world space - fast, smooth and seam-free.
 */
 
 // light leaving the point where a bounce ray landed (for one light style)
-static gvec3 gi_hit_radiance( const giBake &bake, const giHit &hit, int styleValue ) {
+static gvec3 gi_hit_radiance( const giBake &bake, const giHit &hit, int styleValue, const gvec3 &dir ) {
 	const giScene &scene = bake.scene;
 	const giTri &t = scene.tris[hit.tri];
 	const giSurf &s = scene.surfs[t.surf];
 	if ( s.sky )
-		return styleValue == 0 ? bake.skyColor : gvec3();	// the open sky glows softly
+		return styleValue == 0 ? gi_sky_radiance( dir ) : gvec3();	// the open sky
 
 	const giVert &a = scene.verts[t.vert[0]];
 	const giVert &b = scene.verts[t.vert[1]];
@@ -2051,7 +2180,15 @@ static gvec3 gi_hit_radiance( const giBake &bake, const giHit &hit, int styleVal
 				   a.color[slot][1] * w0 + b.color[slot][1] * w1 + c.color[slot][1] * w2,
 				   a.color[slot][2] * w0 + b.color[slot][2] * w1 + c.color[slot][2] * w2 );
 	}
-	return L * scene.shaders[s.shader].albedo;
+	const giShader &sh = scene.shaders[s.shader];
+	L = L * sh.albedo;
+	// a glowing surface adds its own light, from the texture pixel that was hit
+	if ( sh.emitW && styleValue == 0 ) {
+		const float es = a.st[0] * w0 + b.st[0] * w1 + c.st[0] * w2;
+		const float et = a.st[1] * w0 + b.st[1] * w1 + c.st[1] * w2;
+		L += gi_emit_radiance( sh, es, et );
+	}
+	return L;
 }
 
 /*
@@ -2135,7 +2272,7 @@ static void gi_gather_shade( const giBake &bake, const giGatherJob &job, const d
 			occlusion += 1.0f - hit.t / aoDist;	// near geometry blocks more
 		if ( !sky && gdot( ht.n, d ) > 0 )
 			continue;	// hit the back of something: no light comes from there
-		sum += gi_hit_radiance( bake, hit, job.styleValue );
+		sum += gi_hit_radiance( bake, hit, job.styleValue, d );
 	}
 	float *out = job.out;
 	const float inv = 1.0f / job.rays;
@@ -2167,7 +2304,7 @@ static void gi_gather_shade( const giBake &bake, const giGatherJob &job, const d
 				continue;
 			// nearer faces reflect more strongly than far ones
 			const float fade = 1.0f / ( 1.0f + hit.t / 256.0f );
-			cone += gi_hit_radiance( bake, hit, job.styleValue ) * fade;
+			cone += gi_hit_radiance( bake, hit, job.styleValue, d ) * fade;
 			got++;
 		}
 		if ( got ) {
@@ -2180,12 +2317,12 @@ static void gi_gather_shade( const giBake &bake, const giGatherJob &job, const d
 }
 
 // 2 on the CPU: traces the rays of one ray list with gi_trace
-static void gi_trace_cpu( const giScene &scene, const dgGpuRay *rays, dgGpuHit *hits, int count ) {
+static void gi_trace_cpu( const giScene &scene, const dgGpuRay *rays, dgGpuHit *hits, int count, bool anyHit = false ) {
 	for ( int r = 0; r < count; r++ ) {
 		const gvec3 o( rays[r].origin[0], rays[r].origin[1], rays[r].origin[2] );
 		const gvec3 d( rays[r].dir[0], rays[r].dir[1], rays[r].dir[2] );
 		giHit hit;
-		if ( gi_trace( scene, o, d, rays[r].tmax, hit, false, rays[r].tmin ) ) {
+		if ( gi_trace( scene, o, d, rays[r].tmax, hit, anyHit, rays[r].tmin ) ) {
 			hits[r].t = hit.t; hits[r].u = hit.u; hits[r].v = hit.v; hits[r].tri = hit.tri;
 		} else {
 			hits[r].t = rays[r].tmax; hits[r].u = hits[r].v = 0; hits[r].tri = -1;
@@ -2213,6 +2350,7 @@ go (a few million rays per batch); on the CPU every point is done on its own. Bo
 give the same result. Progress is reported for big runs.
 */
 static bool gi_gpuActive;	// the GPU tracer is running for this bake
+static float gi_bounceBlurRadius;	// how wide the bounce light is blurred (gi_blur_grid), in game units
 
 static void gi_gather_many( const giBake &bake, const std::vector<giGatherJob> &jobs, bool report ) {
 	if ( !gi_gpuActive ) {
@@ -2262,6 +2400,127 @@ static void gi_gather_many( const giBake &bake, const std::vector<giGatherJob> &
 	}
 }
 
+// traces any number of rays, on the GPU when it runs, otherwise on all CPU cores
+static void gi_trace_many( const giBake &bake, const dgGpuRay *rays, dgGpuHit *hits, size_t count, bool anyHit ) {
+	if ( gi_gpuActive && DG_GpuTrace( rays, hits, count, anyHit ) )
+		return;
+	gi_gpuActive = false;
+	const int chunk = 4096;
+	gi_parallel_for( (int)( ( count + chunk - 1 ) / chunk ), [&]( int c ) {
+		const size_t first = (size_t)c * chunk;
+		const int n = (int)Q_min( (size_t)chunk, count - first );
+		gi_trace_cpu( bake.scene, rays + first, hits + first, n, anyHit );
+	} );
+}
+
+/*
+Blurring the bounce light. Bounce light is soft by nature, but traced with a
+limited number of rays it comes out grainy - so it is blurred, a lot, across the
+whole neighbourhood of every sample point. A blur that wide would also mix light
+from the other side of a thin wall into a room (two spots on one floor plane
+either side of a wall look like neighbours), so two points are only mixed when a
+straight line between them is free: light never blurs through walls. The test
+rays are traced in big batches (on the GPU when it runs). Three passes of radius R
+blur about as much as one pass of 1.7 R, at a third of the cost and memory.
+*/
+static void gi_blur_grid( const giBake &bake, const std::vector<int> &gridPoints, const std::vector<gvec3> &texelPos,
+	std::vector<float> &gathered, float radius, int passes ) {
+	if ( gridPoints.empty() || radius <= 0 )
+		return;
+	giSpatialHash hash;
+	hash.build( texelPos, gridPoints, radius );
+	const float r2 = radius * radius;
+
+	// the neighbours of every grid point (same kind of surface, within the radius)
+	std::vector<std::vector<int>> near( gridPoints.size() );
+	std::vector<int> slotOf( bake.texels.size(), -1 );
+	for ( size_t k = 0; k < gridPoints.size(); k++ )
+		slotOf[gridPoints[k]] = (int)k;
+	gi_parallel_for( (int)gridPoints.size(), [&]( int k ) {
+		const giTexel &tx = bake.texels[gridPoints[k]];
+		hash.query( tx.pos, [&]( int o ) {
+			if ( o == gridPoints[k] )
+				return;
+			const giTexel &ot = bake.texels[o];
+			const gvec3 d = ot.pos - tx.pos;
+			if ( gdot( d, d ) > r2 || !gi_texels_compatible( tx, ot, radius * 0.5f ) )
+				return;
+			near[k].push_back( slotOf[o] );
+		} );
+	} );
+
+	// which of those can see each other (tested once, used for every pass)
+	std::vector<size_t> first( gridPoints.size() + 1, 0 );
+	for ( size_t k = 0; k < gridPoints.size(); k++ )
+		first[k + 1] = first[k] + near[k].size();
+	std::vector<char> visible( first.back(), 1 );
+	{
+		const size_t batchPairs = 4u * 1024u * 1024u;
+		std::vector<dgGpuRay> rays;
+		std::vector<dgGpuHit> hits;
+		size_t start = 0;
+		while ( start < gridPoints.size() ) {
+			size_t end = start;
+			while ( end < gridPoints.size() && first[end + 1] - first[start] <= batchPairs )
+				end++;
+			if ( end == start )
+				end = start + 1;
+			const size_t base = first[start], count = first[end] - base;
+			rays.resize( count );
+			hits.resize( count );
+			gi_parallel_for( (int)( end - start ), [&]( int kk ) {
+				const size_t k = start + kk;
+				const giTexel &a = bake.texels[gridPoints[k]];
+				const gvec3 from = a.pos + a.faceNormal * 2.0f;
+				for ( size_t j = 0; j < near[k].size(); j++ ) {
+					const giTexel &b = bake.texels[gridPoints[near[k][j]]];
+					const gvec3 to = b.pos + b.faceNormal * 2.0f;
+					gvec3 d = to - from;
+					const float len = sqrtf( gdot( d, d ) );
+					d = len > 1e-4f ? d * ( 1.0f / len ) : a.faceNormal;
+					dgGpuRay &r = rays[first[k] + j - base];
+					r.origin[0] = from.x; r.origin[1] = from.y; r.origin[2] = from.z;
+					r.dir[0] = d.x; r.dir[1] = d.y; r.dir[2] = d.z;
+					r.tmin = 0.05f;
+					r.tmax = Q_max( 0.1f, len - 0.25f );
+				}
+			} );
+			gi_trace_many( bake, rays.data(), hits.data(), count, true );
+			for ( size_t q = 0; q < count; q++ )
+				visible[base + q] = hits[q].tri < 0;
+			start = end;
+		}
+	}
+
+	// the blur itself: a soft, distance-weighted mix of the visible neighbours
+	std::vector<float> value( gridPoints.size() * 4 ), next( gridPoints.size() * 4 );
+	for ( size_t k = 0; k < gridPoints.size(); k++ )
+		memcpy( &value[k * 4], &gathered[(size_t)gridPoints[k] * 4], 4 * sizeof( float ) );
+	for ( int pass = 0; pass < passes; pass++ ) {
+		gi_parallel_for( (int)gridPoints.size(), [&]( int k ) {
+			const giTexel &tx = bake.texels[gridPoints[k]];
+			float sum[4] = { value[k * 4], value[k * 4 + 1], value[k * 4 + 2], value[k * 4 + 3] };
+			float wsum = 1.0f;
+			for ( size_t j = 0; j < near[k].size(); j++ ) {
+				if ( !visible[first[k] + j] )
+					continue;
+				const int o = near[k][j];
+				const gvec3 d = bake.texels[gridPoints[o]].pos - tx.pos;
+				const float f = 1.0f - gdot( d, d ) / r2;
+				const float w = f * f;
+				for ( int c = 0; c < 4; c++ )
+					sum[c] += value[(size_t)o * 4 + c] * w;
+				wsum += w;
+			}
+			for ( int c = 0; c < 4; c++ )
+				next[(size_t)k * 4 + c] = sum[c] / wsum;
+		} );
+		value.swap( next );
+	}
+	for ( size_t k = 0; k < gridPoints.size(); k++ )
+		memcpy( &gathered[(size_t)gridPoints[k] * 4], &value[k * 4], 4 * sizeof( float ) );
+}
+
 static void gi_gather( giBake &bake, const giSpatialHash &gridHash, const std::vector<int> &gridPoints,
 	const std::vector<gvec3> &texelPos, float radius, int rays ) {
 	const size_t n = bake.texels.size();
@@ -2277,6 +2536,9 @@ static void gi_gather( giBake &bake, const giSpatialHash &gridHash, const std::v
 		}
 		gi_gather_many( bake, jobs, true );
 	}
+
+	// 1b. blur it, a lot, but never through walls
+	gi_blur_grid( bake, gridPoints, texelPos, gathered, gi_bounceBlurRadius, 3 );
 
 	// 2. every texel takes a smooth, distance-weighted mix of the grid points around it in
 	// the world. This removes the noise and fills the gaps in one go, across polygons.
@@ -2314,7 +2576,6 @@ static void gi_gather( giBake &bake, const giSpatialHash &gridHash, const std::v
 		}
 		gi_gather_many( bake, jobs, false );
 	}
-	(void)texelPos;
 }
 
 static bool gi_relit;	// direct light was traced with real shadows (no fake contact darkening needed)
@@ -2354,7 +2615,9 @@ static void gi_dilate( giBake &bake, std::vector<float> &img, std::vector<char> 
 	std::vector<char> filled( bake.owner.size() );
 	for ( size_t i = 0; i < bake.owner.size(); i++ )
 		filled[i] = bake.owner[i] >= 0;
-	const int passes = Q_max( 2, DEVOGI_LM_SIZE / DEVOGI_BSP_LM_SIZE / 2 );
+	// as many pixels as one original lightmap texel is wide (8 at 8x): the GPU's texture
+	// filtering never reaches past a polygon into black
+	const int passes = Q_max( 2, DEVOGI_LM_SIZE / DEVOGI_BSP_LM_SIZE );
 	for ( int pass = 0; pass < passes; pass++ ) {
 		std::vector<char> next = filled;
 		for ( int p = 0; p < bake.numPages; p++ ) {
@@ -2568,7 +2831,8 @@ part of itself from the matching directions, so a red wall on its left tints its
 left side. Probes inside walls or outside the map are marked invalid and get the
 average of their valid neighbours, so a renderer can sample anywhere.
 */
-static void gi_build_probes( giBake &bake, dgLiveLighting &live, float intensity, int rays ) {
+static void gi_build_probes( giBake &bake, dgLiveLighting &live, float intensity, int rays,
+	const giLightGrid *lightGrid, const std::vector<float> &groupScale, float exposure ) {
 	const giScene &scene = bake.scene;
 	if ( scene.verts.empty() )
 		return;
@@ -2706,6 +2970,35 @@ static void gi_build_probes( giBake &bake, dgLiveLighting &live, float intensity
 	live.probeValid.swap( valid );
 	live.probeSun.swap( sunVis );
 
+	/*
+	The direct light too (lamps and the sun, with their shadows), from the same 6
+	directions: with it, the probes hold all the light at that spot, and models
+	(players, weapons, items) can be lit exactly like the walls around them - instead
+	of by the map's old light grid from q3map2.
+	*/
+	live.probesDirect.assign( count * 18, 0 );
+	if ( lightGrid ) {
+		std::vector<float> direct( count * 18, 0.0f );
+		gi_parallel_for( (int)count, [&]( int i ) {
+			if ( !live.probeValid[i] )
+				return;
+			const int x = (int)( i % dims[0] ), y = (int)( ( i / dims[0] ) % dims[1] ), z = (int)( i / ( (size_t)dims[0] * dims[1] ) );
+			const gvec3 pos( mins.x + x * spacing, mins.y + y * spacing, mins.z + z * spacing );
+			for ( int a = 0; a < 6; a++ ) {
+				gvec3 total;
+				gi_direct_point( bake, *lightGrid, pos, axes[a], axes[a], (uint32_t)i * 40503u + (uint32_t)a * 131u, 0.0f,
+					[&]( int group, const gvec3 &rgb ) {
+						total += rgb * ( group < (int)groupScale.size() ? groupScale[group] : 1.0f );
+					} );
+				direct[(size_t)i * 18 + a * 3 + 0] = total.x * exposure;
+				direct[(size_t)i * 18 + a * 3 + 1] = total.y * exposure;
+				direct[(size_t)i * 18 + a * 3 + 2] = total.z * exposure;
+			}
+		} );
+		for ( size_t k = 0; k < count * 18; k++ )
+			live.probesDirect[k] = gi_float_to_half( direct[k] );
+	}
+
 	size_t numValid = 0;
 	for ( uint8_t v : live.probeValid )
 		numValid += v;
@@ -2810,14 +3103,14 @@ static void gi_build_fixtures( dgLiveLighting &live, float exposure, const std::
 		n, (int)live.fixtures.size(), gi_hasSun ? ", plus the sun" : "" );
 }
 
-static void gi_build_live( giBake &bake, dgLiveLighting &live, bool relight, float exposure, float intensity,
+static void gi_build_live( giBake &bake, dgLiveLighting &live, const giLightGrid *lightGrid, bool relight, float exposure, float intensity,
 	int rays, const std::vector<float> &groupScale ) {
 	live = dgLiveLighting();
 	live.relit = relight;
 	gi_build_bounce_maps( bake, live, relight, exposure, intensity );
 	if ( relight )
 		gi_build_fixtures( live, exposure, groupScale );
-	gi_build_probes( bake, live, intensity, rays );
+	gi_build_probes( bake, live, intensity, rays, relight ? lightGrid : NULL, groupScale, exposure );
 }
 
 /*
@@ -2883,21 +3176,69 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 		}
 	}
 
-	// the open sky glows softly, tinted like the sun
+	// the open sky: its light from its sky box images (or one colour), see gi_sky_setup.
+	// At r_devoGI_sky 0.5 a white sky pixel gives 128 - shade outdoors then gets roughly
+	// a fifth of full sunlight, like a clear day.
 	{
 		gvec3 tint( 1, 1, 1 );
 		const lump_t &l = header->lumps[LUMP_SHADERS];
 		const dshader_t *in = (const dshader_t *)( fileBase + l.fileofs );
 		const int count = l.filelen / sizeof( dshader_t );
+		int skyShader = -1;
 		for ( int i = 0; i < count; i++ ) {
 			if ( !( LittleLong( in[i].surfaceFlags ) & SURF_SKY ) )
 				continue;
-			if ( gi_sky_sun_color( in[i].shader, tint ) )
+			if ( skyShader < 0 )
+				skyShader = i;
+			if ( gi_sky_sun_color( in[i].shader, tint ) ) {
+				skyShader = i;
 				break;
+			}
 		}
-		// at r_devoGI_sky 0.5, open sky gives shade outdoors roughly a fifth to a quarter
-		// of full sunlight, like a clear day (it used to be half that: near-black shade)
-		bake.skyColor = tint * ( 128.0f * Q_max( 0.0f, g_set.sky ) );
+		gi_sky = giSky();
+		gi_sky.scale = 256.0f * Q_max( 0.0f, g_set.sky );
+		if ( skyShader >= 0 )
+			gi_sky_setup( in[skyShader].shader, tint );
+		bake.skyColor = gi_sky.uniform * gi_sky.scale;
+		dg_print( "DevoGI: sky light from %s\n", gi_sky.images ? "its sky box images" : "one colour" );
+
+		// big unlit surfaces glow with their own texture (see DG_ExtractLights)
+		int glowing = 0;
+		for ( int i = 0; i < count && i < (int)gi_emitTexture.size(); i++ ) {
+			if ( gi_emitTexture[i].empty() )
+				continue;
+			byte *pic = NULL;
+			int w = 0, h = 0;
+			dg_load_image( gi_emitTexture[i].c_str(), &pic, &w, &h );
+			if ( !pic || w <= 0 || h <= 0 ) {
+				if ( pic )
+					dg_free_image( pic );
+				continue;
+			}
+			giShader &sh = bake.scene.shaders[i];
+			sh.emitW = Q_min( w, 64 );
+			sh.emitH = Q_min( h, 64 );
+			sh.emit.assign( (size_t)sh.emitW * sh.emitH, gvec3() );
+			for ( int y = 0; y < sh.emitH; y++ ) {
+				for ( int x = 0; x < sh.emitW; x++ ) {
+					// average the block of pixels this cell covers
+					const int x0 = x * w / sh.emitW, x1 = Q_max( x0 + 1, ( x + 1 ) * w / sh.emitW );
+					const int y0 = y * h / sh.emitH, y1 = Q_max( y0 + 1, ( y + 1 ) * h / sh.emitH );
+					double r = 0, g = 0, b = 0;
+					int n = 0;
+					for ( int yy = y0; yy < y1; yy++ )
+						for ( int xx = x0; xx < x1; xx++, n++ ) {
+							const byte *px = &pic[( (size_t)yy * w + xx ) * 4];
+							r += px[0]; g += px[1]; b += px[2];
+						}
+					sh.emit[(size_t)y * sh.emitW + x] = gvec3( (float)( r / n ), (float)( g / n ), (float)( b / n ) ) * ( gi_sky.scale / 255.0f );
+				}
+			}
+			dg_free_image( pic );
+			glowing++;
+		}
+		if ( glowing )
+			dg_print( "DevoGI: %d big unlit surfaces glow with their own texture\n", glowing );
 	}
 
 	COM_StripExtension( COM_SkipPath( (char *)mapName ), gi_progressMap, sizeof( gi_progressMap ) );
@@ -3075,6 +3416,9 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 			gridPoints.push_back( (int)i );
 	}
 	const float bounceRadius = bake.texelSize * stride * 2.5f;
+	// the wide blur of the bounce light: three passes of 32 units at 8x (about 55 units
+	// in all), never less than 24 units per pass at low resolutions
+	gi_bounceBlurRadius = Com_Clamp( 24.0f, 48.0f, bake.texelSize * stride * 4.0f );
 	giSpatialHash gridHash;
 	gridHash.build( texelPos, gridPoints, bounceRadius );
 
@@ -3182,7 +3526,7 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 			// vertex-lit models (crates, ships, lamps...): the same direct and bounce light per vertex
 			const float aoDirect = Com_Clamp( 0.0f, 1.0f, g_set.aoDirect );
 			gi_progress_stage( "Models and vertex colours", 0.92f, 0.04f );
-			// bounce light at every vertex first, all at once (twice the rays: a vertex
+			// bounce light at every vertex first, all at once (four times the rays: a vertex
 			// has no neighbours to average with)
 			std::vector<float> gathered( list.size() * 4, 0.0f );
 			{
@@ -3190,7 +3534,7 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 				for ( size_t i = 0; i < list.size(); i++ ) {
 					giVert gv;
 					gi_load_vert( gv, dv[list[i]] );
-					jobs[i] = { gv.xyz, gv.normal, gv.normal, 0, (uint32_t)list[i] * 7919u + 13u, rays * 2, true, &gathered[i * 4] };
+					jobs[i] = { gv.xyz, gv.normal, gv.normal, 0, (uint32_t)list[i] * 7919u + 13u, rays * 4, true, &gathered[i * 4] };
 				}
 				gi_gather_many( bake, jobs, false );
 			}
@@ -3226,7 +3570,7 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 	}
 
 	// ---- the same lighting, split for real-time use (see gi_build_live) ----
-	gi_build_live( bake, result.live, relight, exposure, intensity, rays, groupScale );
+	gi_build_live( bake, result.live, &lightGrid, relight, exposure, intensity, rays, groupScale );
 
 	// ---- 3. back to lightmap bytes ----
 	result.lightmaps.assign( outBytes, 0 );
@@ -3299,6 +3643,8 @@ struct giLightShader {
 	float	value;		// q3map_surfacelight (or the inferred glow strength)
 	float	subdivide;	// q3map_lightsubdivide: patch size in game units
 	gvec3	color;
+	bool	unlit;		// no lightmap and no vertex light: it shows its texture as it is
+	char	texture[MAX_QPATH];	// its main texture
 };
 
 // average colour of an image (brightest channel = 1), and optionally its average brightness 0..1
@@ -3337,6 +3683,8 @@ static bool gi_parse_light_shader( const char *shaderName, giLightShader &ls ) {
 	ls.value = 0;
 	ls.subdivide = 120.0f;	// q3map2's default
 	ls.color = gvec3( 1, 1, 1 );
+	ls.unlit = false;
+	ls.texture[0] = 0;
 	const char *p = R_DevoGI_FindShaderText( shaderName );
 	if ( !p )
 		return false;
@@ -3477,11 +3825,20 @@ static bool gi_parse_light_shader( const char *shaderName, giLightShader &ls ) {
 			ls.color = c;
 			return true;
 		}
+		/*
+		An unlit surface - no lightmap and no vertex light, so it shows its texture as it
+		is - is treated as a light: a fake sky cube, a lamp the designers simply left
+		unlit so it pops out. The lighter the texture, the brighter. (Very dark ones are
+		left alone.) Small ones become lamps with soft shadows; big ones glow through
+		the bounce light instead (see DG_ExtractLights).
+		*/
 		if ( !hasLightmapStage && !litStage && !firstStageBlended && firstMap[0]
-			&& gi_image_color( firstMap, c, &brightness ) && brightness > 0.45f ) {
+			&& gi_image_color( firstMap, c, &brightness ) && brightness > 0.05f ) {
 			ls.value = g_set.glow * brightness;
 			ls.subdivide = 32.0f;
 			ls.color = c;
+			ls.unlit = true;
+			Q_strncpyz( ls.texture, firstMap, sizeof( ls.texture ) );
 			return true;
 		}
 	}
@@ -3520,7 +3877,8 @@ static bool gi_parse_sun( const char *shaderName, gvec3 &color, float &intensity
 			return false;
 		if ( token[0] == '{' ) { depth++; continue; }
 		if ( token[0] == '}' ) { if ( --depth <= 0 ) return false; continue; }
-		if ( depth == 1 && ( !Q_stricmp( token, "q3map_sun" ) || !Q_stricmp( token, "q3map_sunExt" ) || !Q_stricmp( token, "sun" ) ) ) {
+		if ( depth == 1 && ( !Q_stricmp( token, "q3map_sun" ) || !Q_stricmp( token, "q3map_sunExt" ) || !Q_stricmp( token, "sun" )
+			|| !Q_stricmp( token, "q3gl2_sun" ) ) ) {
 			float c[3];
 			for ( int i = 0; i < 3; i++ )
 				c[i] = atof( COM_ParseExt( &p, qfalse ) );
@@ -3542,6 +3900,9 @@ void DG_ExtractLights( const char *mapName, const byte *fileBase, const dgSettin
 	gi_lights.clear();
 	gi_hasSun = false;
 	Q_strncpyz( gi_lightsMap, mapName, sizeof( gi_lightsMap ) );
+	gi_lightsHash = 0;
+	if ( !fileBase )
+		return;		// no map: no lights (DevoGI is off for it)
 	const int startTime = dg_ms();
 
 	// shaders: which ones emit light, and where is the sun?
@@ -3581,8 +3942,28 @@ void DG_ExtractLights( const char *mapName, const byte *fileBase, const dgSettin
 	}
 
 	// surface lights: cut every emitting surface into patches of the shader's subdivide size
+	gi_emitTexture.assign( Q_max( 1, numShaders ), std::string() );
 	if ( numEmitting ) {
 		gi_build_geometry( scene, fileBase, header );
+
+		// big unlit surfaces (a whole fake sky box, a large glowing panel) would become
+		// thousands of little lamps: instead they glow through the bounce light, pixel
+		// by pixel, like the real sky does
+		{
+			std::vector<float> surfArea( scene.surfs.size(), 0.0f );
+			for ( const giTri &t : scene.tris )
+				surfArea[t.surf] += 0.5f * sqrtf( gdot( gcross( t.e1, t.e2 ), gcross( t.e1, t.e2 ) ) );
+			for ( size_t si = 0; si < scene.surfs.size(); si++ ) {
+				const int sh = scene.surfs[si].shader;
+				if ( sh < 0 || sh >= numShaders || !emits[sh] || !lightShaders[sh].unlit )
+					continue;
+				if ( surfArea[si] > 256.0f * 256.0f ) {
+					gi_emitTexture[sh] = lightShaders[sh].texture;
+					emits[sh] = 0;
+					numEmitting--;
+				}
+			}
+		}
 
 		struct accum_t { gvec3 c, n; float area; int shader; };
 		std::vector<accum_t> patches;
@@ -3731,7 +4112,8 @@ kinds of data can be added later without breaking the layout:
   "BNCE"  int32 bouncePageSize, int32 relit, then the bounce lightmaps (RGBA,
           A = sun visibility)
   "PRBE"  float origin[3], float spacing, int32 dims[3], then 18 half floats
-          per probe, one valid byte per probe, one sun-visibility byte per probe
+          per probe (bounce light), one valid byte per probe, one sun-visibility
+          byte per probe, then 18 half floats per probe (direct light)
   "LITE"  int32 count, count x dgFixture, int32 hasSun, float sunDir[3],
           float sunRgb[3]
 
@@ -3791,6 +4173,7 @@ std::vector<byte> DG_WriteCache( uint64_t bspHash, uint64_t settingsHash, const 
 	gi_put( file, live.probes.data(), live.probes.size() * 2 );
 	gi_put( file, live.probeValid.data(), live.probeValid.size() );
 	gi_put( file, live.probeSun.data(), live.probeSun.size() );
+	gi_put( file, live.probesDirect.data(), live.probesDirect.size() * 2 );
 	gi_section_end( file, s );
 
 	s = gi_section_begin( file, "LITE" );
@@ -3834,12 +4217,15 @@ static bool gi_read_sections( const byte *p, const byte *end, dgLiveLighting &li
 			if ( !get( live.probeOrigin, 12 ) || !get( &live.probeSpacing, 4 ) || !get( live.probeDims, 12 ) )
 				return false;
 			const size_t count = (size_t)Q_max( 0, live.probeDims[0] ) * Q_max( 0, live.probeDims[1] ) * Q_max( 0, live.probeDims[2] );
-			if ( (size_t)( qend - q ) != count * 18 * 2 + count * 2 )
+			if ( (size_t)( qend - q ) != count * 18 * 2 * 2 + count * 2 )
 				return false;
 			live.probes.resize( count * 18 );
 			get( live.probes.data(), count * 36 );
 			live.probeValid.assign( q, q + count );
-			live.probeSun.assign( q + count, qend );
+			live.probeSun.assign( q + count, q + count * 2 );
+			q += count * 2;
+			live.probesDirect.resize( count * 18 );
+			get( live.probesDirect.data(), count * 36 );
 		}
 		else if ( !memcmp( tag, "LITE", 4 ) ) {
 			int32_t n = 0, sun = 0;

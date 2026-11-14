@@ -135,6 +135,8 @@ struct dgLiveLighting {
 	std::vector<uint16_t>	probes;				// 18 half floats per probe
 	std::vector<uint8_t>	probeValid;			// 0 = inside a wall (filled from neighbours)
 	std::vector<uint8_t>	probeSun;			// how much of the sun each probe sees, 0..255
+	std::vector<uint16_t>	probesDirect;		// the direct light (lamps, sun) the same way: 18 half floats
+												// per probe; bounce + direct = all the light, for models
 	std::vector<dgFixture>	fixtures;
 	bool					hasSun = false;
 	float					sunDir[3] = { 0, 0, 1 };	// towards the sun

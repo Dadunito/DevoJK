@@ -254,6 +254,32 @@ static float R_DevoGI_Shift( void ) {
 	return powf( 2.0f, (float)( r_mapOverBrightBits->integer - tr.overbrightBits ) );
 }
 
+/*
+Maps made for rend2 (the modern OpenJK renderer) already bring their own,
+better lighting: HDR lightmaps (maps/<name>/lm_0000.hdr), an HDR light grid
+(lightgrid.raw), HDR vertex light (vertlight.raw) and reflection probes
+(cubemaps/<name>/env.json). DevoGI on top of those would only fight them, so it
+stays off for such maps - it is meant for the older maps that have none of this.
+*/
+static qboolean R_DevoGI_IsRend2Map( const char *mapName )
+{
+	char base[MAX_QPATH];
+	COM_StripExtension( COM_SkipPath( (char *)mapName ), base, sizeof( base ) );
+	static const char *patterns[] = {
+		"maps/%s/lm_0000.hdr", "maps/%s/lm_0000.tga", "maps/%s/lightgrid.raw",
+		"maps/%s/vertlight.raw", "cubemaps/%s/env.json",
+	};
+	for ( const char *pattern : patterns ) {
+		char f[MAX_QPATH];
+		Com_sprintf( f, sizeof( f ), pattern, base );
+		if ( ri.FS_ReadFile( f, NULL ) > 0 ) {
+			ri.Printf( PRINT_ALL, "DevoGI: %s brings its own rend2 lighting (%s), DevoGI stays off\n", base, f );
+			return qtrue;
+		}
+	}
+	return qfalse;
+}
+
 byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader_t *header, int maxScale, int *outPageSize )
 {
 	*outPageSize = 128;
@@ -263,6 +289,8 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 	gi_liveAlpha.clear();
 	gi_shadowValid[0] = gi_shadowValid[1] = false;
 	if ( !r_devoGI || !r_devoGI->integer )
+		return NULL;
+	if ( R_DevoGI_IsRend2Map( mapName ) )
 		return NULL;
 	if ( header->lumps[LUMP_LIGHTMAPS].filelen < 128 * 128 * 3 )
 		return NULL;	// maps with external lightmap images are not supported yet
@@ -339,6 +367,10 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 		ri.Printf( PRINT_ALL, "DevoGI: real-time lighting needs a relit map; using the full bake\n" );
 
 	// ---- 3b. the full bake: hand the lightmaps to R_LoadLightmaps ----
+	// (the light probes stay: models are lit from them, see R_DevoGI_EntityLighting)
+	result.live.bounce.clear();
+	result.live.bounce.shrink_to_fit();
+	gi_live = std::move( result.live );
 	byte *out = (byte *)Z_Malloc( (int)result.lightmaps.size(), TAG_BSP, qfalse );
 	memcpy( out, result.lightmaps.data(), result.lightmaps.size() );
 	*outPageSize = result.pageSize;
@@ -396,16 +428,22 @@ static float R_DevoGI_Half( uint16_t h )
 }
 
 /*
-Light for a model (player, weapon, item) from the 8 light probes around it:
-the bounce light arriving from all around (the average of the 6 directions each
-probe stores), and how much of the sun it sees. Direct light from the lamps and
-the sun is added per pixel on the GPU. Values are in the 0..255 range the
-renderer uses for model lighting. Returns false when live lighting is off.
+Light for a model (player, weapon, item) from the 8 light probes around it, so
+models get exactly the light the walls around them got, instead of the map's
+old light grid from q3map2. Each probe holds the light arriving from 6
+directions; blended between the 8 probes, that "ambient cube" becomes the
+game's model lighting: an ambient part (what the model's darkest side gets), a
+directed part, and the direction it comes from.
+  - full bake (r_devoGI_live 0): bounce + direct light (lamps, sun)
+  - live lighting: bounce light only; lamps and the sun are added per pixel
+Values are in the 0..255 range the renderer uses for model lighting. Returns
+false when the map has no DevoGI light probes.
 */
-qboolean R_DevoGI_EntityLighting( const vec3_t point, vec3_t ambient, vec3_t directed, float *sunVis )
+qboolean R_DevoGI_EntityLighting( const vec3_t point, vec3_t ambient, vec3_t directed, vec3_t lightDir, float *sunVis )
 {
-	if ( !gi_liveActive || gi_live.probes.empty() )
+	if ( gi_live.probes.empty() || gi_live.probeValid.empty() )
 		return qfalse;
+	const bool withDirect = !gi_liveActive && gi_live.probesDirect.size() == gi_live.probes.size();
 	const int *dims = gi_live.probeDims;
 	float f[3];
 	int c0[3];
@@ -414,7 +452,7 @@ qboolean R_DevoGI_EntityLighting( const vec3_t point, vec3_t ambient, vec3_t dir
 		c0[k] = Com_Clampi( 0, Q_max( 0, dims[k] - 2 ), (int)floorf( g ) );
 		f[k] = Com_Clamp( 0.0f, 1.0f, g - c0[k] );
 	}
-	float sum[3] = { 0, 0, 0 }, sun = 0, wsum = 0;
+	float cube[6][3] = {}, sun = 0, wsum = 0;
 	for ( int corner = 0; corner < 8; corner++ ) {
 		const int x = Q_min( dims[0] - 1, c0[0] + ( corner & 1 ) );
 		const int y = Q_min( dims[1] - 1, c0[1] + ( ( corner >> 1 ) & 1 ) );
@@ -423,20 +461,56 @@ qboolean R_DevoGI_EntityLighting( const vec3_t point, vec3_t ambient, vec3_t dir
 		const size_t i = ( (size_t)z * dims[1] + y ) * dims[0] + x;
 		if ( !gi_live.probeValid[i] )
 			w *= 0.05f;		// a probe inside a wall only counts if nothing better is near
-		for ( int a = 0; a < 6; a++ )
-			for ( int k = 0; k < 3; k++ )
-				sum[k] += w * R_DevoGI_Half( gi_live.probes[i * 18 + a * 3 + k] ) / 6.0f;
+		for ( int a = 0; a < 6; a++ ) {
+			for ( int k = 0; k < 3; k++ ) {
+				float v = R_DevoGI_Half( gi_live.probes[i * 18 + a * 3 + k] );
+				if ( withDirect )
+					v += R_DevoGI_Half( gi_live.probesDirect[i * 18 + a * 3 + k] );
+				cube[a][k] += w * v;
+			}
+		}
 		sun += w * ( gi_live.probeSun.size() > i ? gi_live.probeSun[i] / 255.0f : 1.0f );
 		wsum += w;
 	}
 	if ( wsum <= 0 )
 		return qfalse;
-	const float shift = R_DevoGI_Shift();
-	for ( int k = 0; k < 3; k++ ) {
-		ambient[k] = sum[k] / wsum * shift;
-		directed[k] = 0;	// lamps and the sun are added per pixel instead
-	}
+	const float shift = R_DevoGI_Shift() / wsum;
+	for ( int a = 0; a < 6; a++ )
+		for ( int k = 0; k < 3; k++ )
+			cube[a][k] *= shift;
 	*sunVis = sun / wsum;
+
+	if ( !withDirect ) {
+		// live lighting: only the soft bounce light, the same from all sides
+		for ( int k = 0; k < 3; k++ ) {
+			ambient[k] = ( cube[0][k] + cube[1][k] + cube[2][k] + cube[3][k] + cube[4][k] + cube[5][k] ) / 6.0f;
+			directed[k] = 0;
+		}
+		return qtrue;
+	}
+
+	// where most light comes from: the brightness difference between opposite sides
+	auto luma = []( const float *c ) { return 0.2126f * c[0] + 0.7152f * c[1] + 0.0722f * c[2]; };
+	vec3_t dir = { luma( cube[0] ) - luma( cube[1] ), luma( cube[2] ) - luma( cube[3] ), luma( cube[4] ) - luma( cube[5] ) };
+	if ( VectorNormalize( dir ) < 1e-3f )
+		VectorSet( dir, 0, 0, 1 );
+	// the ambient cube seen from a direction n: sum of n.x^2 * (+X or -X side) and so on
+	auto look = [&]( const vec3_t n, float out[3] ) {
+		for ( int k = 0; k < 3; k++ ) {
+			out[k] = n[0] * n[0] * cube[n[0] > 0 ? 0 : 1][k]
+				   + n[1] * n[1] * cube[n[1] > 0 ? 2 : 3][k]
+				   + n[2] * n[2] * cube[n[2] > 0 ? 4 : 5][k];
+		}
+	};
+	vec3_t back = { -dir[0], -dir[1], -dir[2] };
+	float lit[3], shade[3];
+	look( dir, lit );
+	look( back, shade );
+	for ( int k = 0; k < 3; k++ ) {
+		ambient[k] = shade[k];							// the dark side gets this
+		directed[k] = Q_max( 0.0f, lit[k] - shade[k] );	// the lit side gets this on top
+	}
+	VectorCopy( dir, lightDir );
 	return qtrue;
 }
 
@@ -636,6 +710,10 @@ void R_DevoLights_Extract( const char *mapName, const byte *fileBase, const dhea
 {
 	(void)header;	// the core reads the header from the start of the file
 	DG_SetHost( &gi_host );
+	if ( r_devoGI && r_devoGI->integer && R_DevoGI_IsRend2Map( mapName ) ) {
+		DG_ExtractLights( mapName, NULL, R_DevoGI_Settings() );	// no lights: nothing for DevoGI to do
+		return;
+	}
 	DG_ExtractLights( mapName, fileBase, R_DevoGI_Settings() );
 }
 

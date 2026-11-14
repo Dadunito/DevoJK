@@ -2867,7 +2867,7 @@ How they plug into map loading:
   RE_BeginScene          -> R_DevoLights_AddToScene     optional live light preview
 Real-time lighting (r_devoGI_live 1):
   R_LoadLightmaps        -> R_DevoGI_LightmapAlpha  the sun's baked shadow per pixel
-  R_SetupEntityLighting  -> R_DevoGI_EntityLighting light probes for models
+  R_SetupEntityLighting  -> R_DevoGI_EntityLighting light probes for models (both modes)
   vk_update_light_constants -> R_DevoGI_FillLights  this frame's lamps and the sun
 */
 void		R_DevoGI_Register( void );
@@ -2879,7 +2879,7 @@ void		R_DevoLights_AddToScene( const vec3_t viewOrg, int freeSlots );
 void		R_DevoLights_List_f( void );
 float		R_DevoGI_LightmapAlpha( int page, int pixel );
 qboolean	R_DevoGI_LiveActive( void );
-qboolean	R_DevoGI_EntityLighting( const vec3_t point, vec3_t ambient, vec3_t directed, float *sunVis );
+qboolean	R_DevoGI_EntityLighting( const vec3_t point, vec3_t ambient, vec3_t directed, vec3_t lightDir, float *sunVis );
 void		R_DevoGI_FillLights( const trRefdef_t *refdef, vkUniformLight_t *uniform );
 qboolean	R_DevoGI_SunShadowView( const viewParms_t *mainView, viewParms_t *out, int cascade );
 void		R_DevoGI_SunShadowDrawn( const viewParms_t *view );

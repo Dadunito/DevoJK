@@ -286,10 +286,10 @@ void R_SetupEntityLighting( const trRefdef_t *refdef, trRefEntity_t *ent ) {
 	if (!(refdef->rdflags & RDF_NOWORLDMODEL)
 		&& tr.world->lightGridData) {
 		R_SetupEntityLightingGrid( ent, tr.world );
-		// DevoGI live lighting: bounce light from the light probes instead of the old
-		// light grid (the lamps and the sun are added per pixel on the GPU)
+		// DevoGI: light from DevoGI's light probes instead of the old light grid, so
+		// models match the new lighting of the walls around them
 		ent->devoSunVis = 1.0f;
-		R_DevoGI_EntityLighting( lightOrigin, ent->ambientLight, ent->directedLight, &ent->devoSunVis );
+		R_DevoGI_EntityLighting( lightOrigin, ent->ambientLight, ent->directedLight, ent->lightDir, &ent->devoSunVis );
 	}
 	else {
 		ent->ambientLight[0] = ent->ambientLight[1] =
