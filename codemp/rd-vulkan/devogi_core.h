@@ -120,8 +120,9 @@ lightmaps (surfaces) and probes (models and players).
 */
 struct dgLiveLighting {
 	bool					relit = false;		// false: the map couldn't be relit, use the full bake
-	// bounce light only, RGB, linear, in lightmap units (same layout as the
-	// lightmaps, at bouncePageSize pixels per page - bounce light is smooth)
+	// bounce light only, RGBA: RGB linear in lightmap units (same layout as the
+	// lightmaps, at bouncePageSize pixels per page - bounce light is smooth), and
+	// A = how much of the sun each spot sees (0..255), the sun's baked shadow
 	int						bouncePageSize = 0;
 	std::vector<uint8_t>	bounce;
 	// a grid of light probes: bounce light arriving from 6 directions (an "ambient cube":
@@ -132,6 +133,7 @@ struct dgLiveLighting {
 	int						probeDims[3] = { 0, 0, 0 };		// probes along x, y, z (x fastest)
 	std::vector<uint16_t>	probes;				// 18 half floats per probe
 	std::vector<uint8_t>	probeValid;			// 0 = inside a wall (filled from neighbours)
+	std::vector<uint8_t>	probeSun;			// how much of the sun each probe sees, 0..255
 	std::vector<dgFixture>	fixtures;
 	bool					hasSun = false;
 	float					sunDir[3] = { 0, 0, 1 };	// towards the sun

@@ -365,8 +365,17 @@ void main() {
 		float sqrLightDist = dot(L, L);
 		L /= sqrt(sqrLightDist);
 		
+		// DevoGI real-time lighting (r_devoGI_live): lightmaps hold bounce light only, and
+		// the map's lamps and sun are added live below
+		bool  devoLive = u_lights.devo_sun_dir.w > 0.5;
+		float devoSunVis = 1.0;
+		bool  devoAllowed = false;
+
 		#if defined(USE_LIGHTMAP) && defined(USE_TX1)
-			vec3 lightmapColor = texture(texture1, frag_tex_coord1).rgb;
+			vec4 lightmapSample = texture(texture1, frag_tex_coord1);
+			vec3 lightmapColor = lightmapSample.rgb;
+			devoSunVis = lightmapSample.a;		// the sun's baked shadow
+			devoAllowed = true;
 			lightColor = lightmapColor * frag_color0.rgb;
 			diffuse = color0;
 			ambientColor = vec3 (0.0);
@@ -374,6 +383,8 @@ void main() {
 		#elif defined(USE_LIGHT_VECTOR)
 			lightColor = u_entity.directedLight.rgb;
 			ambientColor = u_entity.ambientLight.rgb;
+			devoSunVis = u_entity.ambientLight.w;	// from the light probes
+			devoAllowed = true;
 			diffuse = base;
 			attenuation = 1.0;
 		#elif defined(USE_LIGHT_VERTEX)
@@ -394,6 +405,14 @@ void main() {
 			float surfNL = clamp(dot(var_Normal.xyz, L), 0.0, 1.0);
 			lightColor /= max( surfNL, 0.25 );
 			ambientColor = max( ambientColor - lightColor * surfNL, 0.0 );
+		#endif
+
+		#if defined(USE_LIGHTMAP) && defined(USE_TX1)
+			if ( devoLive ) {
+				// bounce light comes from all around: no direction to split it into
+				ambientColor = lightmapColor * frag_color0.rgb;
+				lightColor = vec3(0.0);
+			}
 		#endif
 
 		lightColor *= M_PI;
@@ -475,7 +494,8 @@ void main() {
 
 			
 		#ifdef VK_DLIGHT_GPU
-			out_color.rgb += CalcDynamicLightContribution(roughness, N, E, u_camera.viewOrigin.xyz, viewDir, NE, diffuse.rgb, specular.rgb, var_Normal.xyz);
+			out_color.rgb += CalcDynamicLightContribution(roughness, N, E, u_camera.viewOrigin.xyz, viewDir, NE, diffuse.rgb, specular.rgb, var_Normal.xyz,
+				devoSunVis, devoLive && devoAllowed);
 		#endif
 
 		if ( env_texture_set > -1 )

@@ -223,6 +223,7 @@ typedef struct trRefEntity_s {
 	vec3_t		ambientLight;	// color normalized to 0-255
 	int			ambientLightInt;	// 32 bit rgba packed
 	vec3_t		directedLight;
+	float		devoSunVis;		// DevoGI live lighting: how much of the sun the model sees, 0..1
 
 #ifdef USE_PMLIGHT
 	vec3_t		shadowLightDir;	// normalized direction towards light
@@ -2856,6 +2857,10 @@ How they plug into map loading:
   R_LoadLightmaps        -> R_DevoGI_Process       bake (or load) the new lightmaps
   RE_LoadWorldMap_Actual -> R_DevoGI_PatchVertexColors  new vertex colours
   RE_BeginScene          -> R_DevoLights_AddToScene     optional live light preview
+Real-time lighting (r_devoGI_live 1):
+  R_LoadLightmaps        -> R_DevoGI_LightmapAlpha  the sun's baked shadow per pixel
+  R_SetupEntityLighting  -> R_DevoGI_EntityLighting light probes for models
+  vk_update_light_constants -> R_DevoGI_FillLights  this frame's lamps and the sun
 */
 void		R_DevoGI_Register( void );
 byte		*R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader_t *header, int maxScale, int *outPageSize );
@@ -2864,6 +2869,10 @@ void		R_DevoGI_PatchVertexColors( byte *fileBase, const dheader_t *header );
 void		R_DevoLights_Extract( const char *mapName, const byte *fileBase, const dheader_t *header );
 void		R_DevoLights_AddToScene( const vec3_t viewOrg, int freeSlots );
 void		R_DevoLights_List_f( void );
+float		R_DevoGI_LightmapAlpha( int page, int pixel );
+qboolean	R_DevoGI_LiveActive( void );
+qboolean	R_DevoGI_EntityLighting( const vec3_t point, vec3_t ambient, vec3_t directed, float *sunVis );
+void		R_DevoGI_FillLights( const trRefdef_t *refdef, vkUniformLight_t *uniform );
 
 // Vulkan
 void		RB_AddDrawItem( Pass *pass, const DrawItem& drawItem );

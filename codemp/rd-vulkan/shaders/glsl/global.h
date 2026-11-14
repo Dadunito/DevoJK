@@ -234,15 +234,24 @@ STRUCT (
 #ifdef VK_DLIGHT_GPU
     #define LIGHT_ENTRY_T(n) vkUniformLightEntry_t n;
 
+    // origin.w is the light type: 0 = the game's dynamic lights (q3 falloff),
+    // 1 = a DevoGI glowing lamp surface (faces normal.xyz), 2 = a DevoGI lamp that
+    // shines everywhere. For DevoGI lamps normal.w softens the light right at the
+    // lamp (its area), and the light fades out smoothly before radius.
     STRUCT (  
 	    VEC4				( origin )
 	    VEC3				( color )
 	    FLOAT				( radius )
+	    VEC4				( normal )
     , vkUniformLightEntry_t )
 
+    // devo_sun_dir.w = 1 when DevoGI real-time lighting is on (r_devoGI_live):
+    // lightmaps then hold bounce light only, with the sun's baked shadow in alpha
     STRUCT (  
 	    UINT				( num_lights )
         PAD3                ( pad0 )
+	    VEC4				( devo_sun_dir )
+	    VEC4				( devo_sun_color )
 	    LIGHT_ENTRY_T		( light[64] )
     , vkUniformLight_t )
 

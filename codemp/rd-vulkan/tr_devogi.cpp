@@ -65,6 +65,7 @@ static cvar_t *r_devoLights;
 static cvar_t *r_devoLights_max;
 static cvar_t *r_devoLights_intensity;
 static cvar_t *r_devoLights_range;
+static cvar_t *r_devoGI_live;
 
 void R_DevoGI_Register( void )
 {
@@ -85,6 +86,7 @@ void R_DevoGI_Register( void )
 	r_devoGI_entityLights	= ri.Cvar_Get( "r_devoGI_entityLights",	"1",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI uses light entities kept in the BSP as light sources" );
 	r_devoGI_threads		= ri.Cvar_Get( "r_devoGI_threads",		"0",	CVAR_ARCHIVE, "DevoGI bake threads (0 = all CPU cores)" );
 	r_devoGI_progress		= ri.Cvar_Get( "r_devoGI_progress",		"1",	CVAR_ARCHIVE, "DevoGI: show a progress screen with a percentage while a map bakes" );
+	r_devoGI_live			= ri.Cvar_Get( "r_devoGI_live",			"0",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI real-time lighting (work in progress): the map's lamps and the sun are drawn live, only bounce light comes from the bake\n 0: full bake (fastest)\n 1: live lamps and sun (no lamp shadows yet)" );
 	r_devoGI_rebuild		= ri.Cvar_Get( "r_devoGI_rebuild",		"0",	CVAR_TEMP, "Set to 1 to force DevoGI to bake the next map that loads again" );
 	r_devoLights_glow		= ri.Cvar_Get( "r_devoLights_glow",		"4000",	CVAR_ARCHIVE | CVAR_LATCH, "DevoLights: starting strength of glowing lamp textures without q3map_surfacelight (the bake then matches each lamp type to the original map); 0 = they give no light" );
 	r_devoLights			= ri.Cvar_Get( "r_devoLights",			"0",	CVAR_ARCHIVE, "DevoLights: preview the map's own lights as live dynamic lights (no shadows yet)\n 0: off\n 1: on" );
@@ -220,10 +222,29 @@ file is missing, the map is baked again and the file rewritten.
 // new vertex colours, from the bake or the cache, until R_DevoGI_PatchVertexColors
 static std::vector<byte> gi_vertexColors;
 
+/*
+Real-time lighting (r_devoGI_live 1). The bake's light split is kept here for the
+whole map: the lamps and the sun are handed to the GPU every frame (see
+R_DevoGI_FillLights), models read the light probes, and the lightmaps the GPU
+gets hold bounce light only, with the sun's baked shadow in their alpha channel.
+*/
+static bool					gi_liveActive;
+static dgLiveLighting		gi_live;
+static std::vector<byte>	gi_liveAlpha;		// sun visibility per bounce-lightmap pixel
+static int					gi_livePageSize;
+
+// lightmap bytes -> the GPU's lightmap values (the map's overbright shift, as R_LoadLightmaps does)
+static float R_DevoGI_Shift( void ) {
+	return powf( 2.0f, (float)( r_mapOverBrightBits->integer - tr.overbrightBits ) );
+}
+
 byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader_t *header, int maxScale, int *outPageSize )
 {
 	*outPageSize = 128;
 	gi_vertexColors.clear();
+	gi_liveActive = false;
+	gi_live = dgLiveLighting();
+	gi_liveAlpha.clear();
 	if ( !r_devoGI || !r_devoGI->integer )
 		return NULL;
 	if ( header->lumps[LUMP_LIGHTMAPS].filelen < 128 * 128 * 3 )
@@ -266,12 +287,203 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 		ri.Printf( PRINT_ALL, "DevoGI: saved %s\n", cacheName );
 	}
 
-	// ---- 3. hand the lightmaps to R_LoadLightmaps, keep the vertex colours for later ----
+	gi_vertexColors.swap( result.vertexColors );
+
+	// ---- 3a. real-time lighting: the GPU gets bounce light only, the lamps come live ----
+	const int numPages = (int)( result.lightmaps.size() / ( (size_t)result.pageSize * result.pageSize * 3 ) );
+	const int bs = result.live.bouncePageSize;
+	// live light is drawn by the renderer's GPU light path (r_normalMapping/r_specularMapping
+	// on, r_dlightMethod 1); without it the full bake is the only option
+	const bool gpuLights = vk.useGPUDLight ? true : false;
+	if ( r_devoGI_live->integer && !gpuLights )
+		ri.Printf( PRINT_ALL, "DevoGI: real-time lighting needs r_normalMapping 1, r_specularMapping 1 and r_dlightMethod 1; using the full bake\n" );
+	if ( r_devoGI_live->integer && gpuLights && result.live.relit && bs > 0
+		&& result.live.bounce.size() == (size_t)numPages * bs * bs * 4 ) {
+		const size_t pixels = (size_t)numPages * bs * bs;
+		byte *out = (byte *)Z_Malloc( (int)( pixels * 3 ), TAG_BSP, qfalse );
+		gi_liveAlpha.resize( pixels );
+		for ( size_t i = 0; i < pixels; i++ ) {
+			out[i * 3 + 0] = result.live.bounce[i * 4 + 0];
+			out[i * 3 + 1] = result.live.bounce[i * 4 + 1];
+			out[i * 3 + 2] = result.live.bounce[i * 4 + 2];
+			gi_liveAlpha[i] = result.live.bounce[i * 4 + 3];
+		}
+		result.live.bounce.clear();
+		result.live.bounce.shrink_to_fit();
+		gi_live = std::move( result.live );
+		gi_livePageSize = bs;
+		gi_liveActive = true;
+		ri.Printf( PRINT_ALL, "DevoGI: real-time lighting: %d lamps%s live, bounce light baked (%dx%d)\n",
+			(int)gi_live.fixtures.size(), gi_live.hasSun ? " and the sun" : "", bs, bs );
+		*outPageSize = bs;
+		return out;
+	}
+	if ( r_devoGI_live->integer && gpuLights )
+		ri.Printf( PRINT_ALL, "DevoGI: real-time lighting needs a relit map; using the full bake\n" );
+
+	// ---- 3b. the full bake: hand the lightmaps to R_LoadLightmaps ----
 	byte *out = (byte *)Z_Malloc( (int)result.lightmaps.size(), TAG_BSP, qfalse );
 	memcpy( out, result.lightmaps.data(), result.lightmaps.size() );
-	gi_vertexColors.swap( result.vertexColors );
 	*outPageSize = result.pageSize;
 	return out;
+}
+
+/*
+===========================================================================
+Real-time lighting (r_devoGI_live 1)
+
+Stage 2 of moving DevoGI to live light: the lamps and the sun are drawn by
+the GPU every frame, per pixel, with the same strength the bake gave them,
+while bounce light still comes from the bake. Lamp shadows come next; until
+then the sun uses its baked shadow (the alpha channel of the lightmaps, and
+the light probes for models).
+===========================================================================
+*/
+
+// the sun's baked visibility for one lightmap pixel, 0..1 (1 when live lighting is off)
+float R_DevoGI_LightmapAlpha( int page, int pixel )
+{
+	if ( !gi_liveActive || gi_liveAlpha.empty() )
+		return 1.0f;
+	const size_t i = (size_t)page * gi_livePageSize * gi_livePageSize + pixel;
+	return i < gi_liveAlpha.size() ? gi_liveAlpha[i] / 255.0f : 1.0f;
+}
+
+qboolean R_DevoGI_LiveActive( void )
+{
+	return gi_liveActive ? qtrue : qfalse;
+}
+
+// a half float (from the probes) -> float
+static float R_DevoGI_Half( uint16_t h )
+{
+	const uint32_t sign = ( h & 0x8000u ) << 16;
+	int exp = ( h >> 10 ) & 0x1f;
+	uint32_t mant = h & 0x3ffu;
+	uint32_t bits;
+	if ( exp == 0 ) {
+		if ( !mant )
+			bits = sign;
+		else {	// a denormal: normalise it
+			exp = 1;
+			while ( !( mant & 0x400u ) ) { mant <<= 1; exp--; }
+			mant &= 0x3ffu;
+			bits = sign | ( (uint32_t)( exp + 112 ) << 23 ) | ( mant << 13 );
+		}
+	} else {
+		bits = sign | ( (uint32_t)( exp + 112 ) << 23 ) | ( mant << 13 );
+	}
+	float f;
+	memcpy( &f, &bits, 4 );
+	return f;
+}
+
+/*
+Light for a model (player, weapon, item) from the 8 light probes around it:
+the bounce light arriving from all around (the average of the 6 directions each
+probe stores), and how much of the sun it sees. Direct light from the lamps and
+the sun is added per pixel on the GPU. Values are in the 0..255 range the
+renderer uses for model lighting. Returns false when live lighting is off.
+*/
+qboolean R_DevoGI_EntityLighting( const vec3_t point, vec3_t ambient, vec3_t directed, float *sunVis )
+{
+	if ( !gi_liveActive || gi_live.probes.empty() )
+		return qfalse;
+	const int *dims = gi_live.probeDims;
+	float f[3];
+	int c0[3];
+	for ( int k = 0; k < 3; k++ ) {
+		const float g = ( point[k] - gi_live.probeOrigin[k] ) / gi_live.probeSpacing;
+		c0[k] = Com_Clampi( 0, Q_max( 0, dims[k] - 2 ), (int)floorf( g ) );
+		f[k] = Com_Clamp( 0.0f, 1.0f, g - c0[k] );
+	}
+	float sum[3] = { 0, 0, 0 }, sun = 0, wsum = 0;
+	for ( int corner = 0; corner < 8; corner++ ) {
+		const int x = Q_min( dims[0] - 1, c0[0] + ( corner & 1 ) );
+		const int y = Q_min( dims[1] - 1, c0[1] + ( ( corner >> 1 ) & 1 ) );
+		const int z = Q_min( dims[2] - 1, c0[2] + ( corner >> 2 ) );
+		float w = ( ( corner & 1 ) ? f[0] : 1 - f[0] ) * ( ( corner & 2 ) ? f[1] : 1 - f[1] ) * ( ( corner & 4 ) ? f[2] : 1 - f[2] );
+		const size_t i = ( (size_t)z * dims[1] + y ) * dims[0] + x;
+		if ( !gi_live.probeValid[i] )
+			w *= 0.05f;		// a probe inside a wall only counts if nothing better is near
+		for ( int a = 0; a < 6; a++ )
+			for ( int k = 0; k < 3; k++ )
+				sum[k] += w * R_DevoGI_Half( gi_live.probes[i * 18 + a * 3 + k] ) / 6.0f;
+		sun += w * ( gi_live.probeSun.size() > i ? gi_live.probeSun[i] / 255.0f : 1.0f );
+		wsum += w;
+	}
+	if ( wsum <= 0 )
+		return qfalse;
+	const float shift = R_DevoGI_Shift();
+	for ( int k = 0; k < 3; k++ ) {
+		ambient[k] = sum[k] / wsum * shift;
+		directed[k] = 0;	// lamps and the sun are added per pixel instead
+	}
+	*sunVis = sun / wsum;
+	return qtrue;
+}
+
+/*
+The lamps for this frame. The GPU's light list holds 64 lights and the game's
+own dynamic lights (blaster bolts, sabers) come first, so we pick the lamps
+that matter most from where the camera is: in reach, in a part of the map the
+camera can see, and bright for their distance. Each lamp fades out smoothly
+before its reach, so lamps entering or leaving the list don't pop.
+*/
+void R_DevoGI_FillLights( const trRefdef_t *refdef, vkUniformLight_t *u )
+{
+	u->devo_sun_dir[3] = 0.0f;
+	if ( !gi_liveActive || ( refdef->rdflags & RDF_NOWORLDMODEL ) || !tr.world )
+		return;
+	const float shift = R_DevoGI_Shift() / 255.0f;	// lightmap units -> GPU colour
+
+	if ( gi_live.hasSun ) {
+		VectorCopy( gi_live.sunDir, u->devo_sun_dir );
+		u->devo_sun_dir[3] = 1.0f;
+		VectorScale( gi_live.sunRgb, shift, u->devo_sun_color );
+	} else {
+		u->devo_sun_dir[3] = 1.0f;	// live lighting on, but no sun
+		VectorClear( u->devo_sun_color );
+	}
+
+	const int maxLights = (int)ARRAY_LEN( u->light );
+	const int room = maxLights - (int)u->num_lights;
+	if ( room <= 0 )
+		return;
+
+	static std::vector<std::pair<float, int>> cand;
+	cand.clear();
+	for ( int i = 0; i < (int)gi_live.fixtures.size(); i++ ) {
+		const dgFixture &fx = gi_live.fixtures[i];
+		vec3_t d;
+		VectorSubtract( fx.origin, refdef->vieworg, d );
+		const float d2 = DotProduct( d, d );
+		if ( d2 > fx.reach * fx.reach )
+			continue;
+		if ( !R_inPVS( refdef->vieworg, fx.origin, NULL ) )
+			continue;	// in a part of the map the camera can't see
+		const float power = Q_max( fx.rgb[0], Q_max( fx.rgb[1], fx.rgb[2] ) );
+		cand.push_back( std::make_pair( power / ( d2 + 128.0f * 128.0f ), i ) );
+	}
+	if ( (int)cand.size() > room ) {
+		std::nth_element( cand.begin(), cand.begin() + room, cand.end(),
+			[]( const std::pair<float, int> &a, const std::pair<float, int> &b ) { return a.first > b.first; } );
+		cand.resize( room );
+	}
+
+	for ( const auto &c : cand ) {
+		const dgFixture &fx = gi_live.fixtures[c.second];
+		vkUniformLightEntry_t &e = u->light[u->num_lights++];
+		VectorCopy( fx.origin, e.origin );
+		const bool area = fx.halfU > 0 || fx.halfV > 0;
+		e.origin[3] = area ? 1.0f : 2.0f;	// light type: 1 = glowing surface, 2 = shines everywhere
+		VectorScale( fx.rgb, shift, e.color );
+		e.radius = fx.reach;
+		VectorCopy( fx.normal, e.normal );
+		// a glowing rectangle seen from close by: its light spreads over its area, like
+		// a disc of the same size (this keeps the light finite right at the lamp)
+		e.normal[3] = 16.0f + 4.0f * fx.halfU * fx.halfV / (float)M_PI;
+	}
 }
 
 /*

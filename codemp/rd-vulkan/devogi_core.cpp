@@ -319,7 +319,7 @@ static_assert( sizeof( dsurface_t ) == 148, "dsurface_t must match the BSP file"
 #include <vector>
 
 // Bump this whenever the bake changes in a way that should invalidate old .devogi files.
-#define DEVOGI_VERSION		14
+#define DEVOGI_VERSION		15
 
 #define DEVOGI_BSP_LM_SIZE	128			// lightmap page size stored in every Q3/JA BSP
 #define DEVOGI_LM_SIZE		gi_lmSize	// page size we are baking right now (128 * scale)
@@ -1046,6 +1046,7 @@ struct giBake {
 	std::vector<float>			direct;		// direct light, per page pixel rgb
 	std::vector<float>			light;		// direct + bounce light so far, per page pixel rgb
 	std::vector<float>			indirect;	// bounce light per texel: rgb + ambient occlusion
+	std::vector<float>			sunVis;		// how much of the sun each texel sees, 0..1 (for live light)
 	int							numPages;
 	gvec3						skyColor;
 	float						texelSize;	// typical texel size (median), for filter radii
@@ -2255,6 +2256,8 @@ static uint16_t gi_float_to_half( float f ) {
 Bounce lightmaps: the bounce part of every texel (with its ambient occlusion and
 exposure, exactly as the full bake mixed it in), stored at half the resolution of
 the full lightmaps - bounce light is soft, so that loses nothing visible.
+The alpha channel holds how much of the sun each spot sees (0..255): until the
+renderer has its own sun shadows, that baked mask is the sun's shadow.
 */
 static void gi_build_bounce_maps( giBake &bake, dgLiveLighting &live, bool relight, float exposure, float intensity ) {
 	const float aoIndirect = Com_Clamp( 0.0f, 2.0f, g_set.ao );
@@ -2273,16 +2276,26 @@ static void gi_build_bounce_maps( giBake &bake, dgLiveLighting &live, bool relig
 	std::vector<char> filled;
 	gi_dilate( bake, img, &filled );
 
+	// the sun's visibility goes into the alpha channel, grown into empty pixels the same way
+	std::vector<float> vis( bake.owner.size() * 3, 0.0f );
+	if ( !bake.sunVis.empty() ) {
+		for ( size_t i = 0; i < bake.texels.size(); i++ ) {
+			const giTexel &tx = bake.texels[i];
+			vis[( ( (size_t)tx.page * DEVOGI_LM_SIZE + tx.y ) * DEVOGI_LM_SIZE + tx.x ) * 3] = bake.sunVis[i];
+		}
+		gi_dilate( bake, vis );
+	}
+
 	// average each 2x2 block, counting only pixels that hold light (empty space would
 	// darken the edges of every polygon)
 	const int f = DEVOGI_LM_SIZE > DEVOGI_BSP_LM_SIZE ? 2 : 1;
 	const int bs = DEVOGI_LM_SIZE / f;
 	live.bouncePageSize = bs;
-	live.bounce.assign( (size_t)bake.numPages * bs * bs * 3, 0 );
+	live.bounce.assign( (size_t)bake.numPages * bs * bs * 4, 0 );
 	for ( int p = 0; p < bake.numPages; p++ ) {
 		for ( int y = 0; y < bs; y++ ) {
 			for ( int x = 0; x < bs; x++ ) {
-				float sum[3] = { 0, 0, 0 };
+				float sum[4] = { 0, 0, 0, 0 };
 				int n = 0;
 				for ( int dy = 0; dy < f; dy++ ) {
 					for ( int dx = 0; dx < f; dx++ ) {
@@ -2290,14 +2303,16 @@ static void gi_build_bounce_maps( giBake &bake, dgLiveLighting &live, bool relig
 						if ( !filled[q] )
 							continue;
 						sum[0] += img[q * 3]; sum[1] += img[q * 3 + 1]; sum[2] += img[q * 3 + 2];
+						sum[3] += vis[q * 3];
 						n++;
 					}
 				}
 				if ( !n )
 					continue;
-				uint8_t *o = &live.bounce[( ( (size_t)p * bs + y ) * bs + x ) * 3];
+				uint8_t *o = &live.bounce[( ( (size_t)p * bs + y ) * bs + x ) * 4];
 				for ( int k = 0; k < 3; k++ )
 					o[k] = (uint8_t)Com_Clampi( 0, 255, (int)( sum[k] / n + 0.5f ) );
+				o[3] = (uint8_t)Com_Clampi( 0, 255, (int)( sum[3] / n * 255.0f + 0.5f ) );
 			}
 		}
 	}
@@ -2342,6 +2357,7 @@ static void gi_build_probes( giBake &bake, dgLiveLighting &live, float intensity
 
 	std::vector<float> cube( count * 18, 0.0f );
 	std::vector<uint8_t> valid( count, 0 );
+	std::vector<uint8_t> sunVis( count, 0 );
 	const gvec3 axes[6] = { gvec3( 1, 0, 0 ), gvec3( -1, 0, 0 ), gvec3( 0, 1, 0 ), gvec3( 0, -1, 0 ), gvec3( 0, 0, 1 ), gvec3( 0, 0, -1 ) };
 	const int probeRays = Q_max( 32, rays / 2 );	// a probe has no neighbours to blend with
 
@@ -2367,6 +2383,20 @@ static void gi_build_probes( giBake &bake, dgLiveLighting &live, float intensity
 		if ( bad * 10 > tested * 3 )
 			return;
 		valid[i] = 1;
+		if ( gi_hasSun ) {
+			// how much of the sun is visible from here: 16 rays spread over the sun's disc
+			gvec3 st, sb;
+			gi_basis( gi_sunDir, st, sb );
+			int seen = 0;
+			for ( int k = 0; k < 16; k++ ) {
+				const float jx = ( ( k & 3 ) + 0.5f ) / 4.0f - 0.5f, jy = ( ( k >> 2 ) + 0.5f ) / 4.0f - 0.5f;
+				const gvec3 d = gnorm( gi_sunDir + st * ( jx * 0.05f ) + sb * ( jy * 0.05f ) );
+				giHit hit;
+				if ( !gi_trace( scene, pos, d, 16384.0f, hit, false ) || scene.surfs[scene.tris[hit.tri].surf].sky )
+					seen++;
+			}
+			sunVis[i] = (uint8_t)( seen * 255 / 16 );
+		}
 		for ( int a = 0; a < 6; a++ ) {
 			float g[4];
 			gi_gather_point( bake, pos, axes[a], axes[a], 0, (uint32_t)i * 2654435761u + (uint32_t)a * 97u, probeRays, g, false );
@@ -2386,6 +2416,7 @@ static void gi_build_probes( giBake &bake, dgLiveLighting &live, float intensity
 				continue;
 			const int x = (int)( i % dims[0] ), y = (int)( ( i / dims[0] ) % dims[1] ), z = (int)( i / ( (size_t)dims[0] * dims[1] ) );
 			float sum[18] = {};
+			int sunSum = 0;
 			int n = 0;
 			const int nb[6][3] = { { 1, 0, 0 }, { -1, 0, 0 }, { 0, 1, 0 }, { 0, -1, 0 }, { 0, 0, 1 }, { 0, 0, -1 } };
 			for ( const auto &o : nb ) {
@@ -2397,11 +2428,13 @@ static void gi_build_probes( giBake &bake, dgLiveLighting &live, float intensity
 					continue;
 				for ( int k = 0; k < 18; k++ )
 					sum[k] += cube[j * 18 + k];
+				sunSum += sunVis[j];
 				n++;
 			}
 			if ( n ) {
 				for ( int k = 0; k < 18; k++ )
 					cube[i * 18 + k] = sum[k] / n;
+				sunVis[i] = (uint8_t)( sunSum / n );
 				next[i] = 1;
 				changed = true;
 			}
@@ -2415,6 +2448,7 @@ static void gi_build_probes( giBake &bake, dgLiveLighting &live, float intensity
 	for ( size_t k = 0; k < count * 18; k++ )
 		live.probes[k] = gi_float_to_half( cube[k] );
 	live.probeValid.swap( valid );
+	live.probeSun.swap( sunVis );
 
 	size_t numValid = 0;
 	for ( uint8_t v : live.probeValid )
@@ -2674,15 +2708,27 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 
 		gi_progress_stage( "Direct light and soft shadows", 0.12f, 0.33f );
 		std::vector<gvec3> directLight( n );
+		bake.sunVis.assign( n, 0.0f );
 		gi_parallel_for( (int)n, [&]( int i ) {
 			const giTexel &tx = bake.texels[i];
 			if ( tx.styleValue != 0 )
 				return;	// switchable lamps keep their original light
-			gvec3 total;
+			gvec3 total, sun;
 			gi_direct_point( bake, lightGrid, tx.pos, tx.normal, tx.faceNormal, (uint32_t)i * 2654435761u, tx.size,
-				[&]( int group, const gvec3 &rgb ) { total += rgb * groupScale[group]; } );
+				[&]( int group, const gvec3 &rgb ) {
+					total += rgb * groupScale[group];
+					if ( group == gi_sunGroup )
+						sun += rgb;
+				} );
 			directLight[i] = total;
+			// the sun's visibility: what arrived, divided by what would arrive with nothing in
+			// the way (a real-time renderer draws the sun live and uses this as its shadow)
+			if ( gi_hasSun ) {
+				const float full = gi_luma( gi_sunColor ) * gi_sunIntensity * gdot( tx.normal, gi_sunDir );
+				bake.sunVis[i] = full > 1e-4f ? Com_Clamp( 0.0f, 1.0f, gi_luma( sun ) / full ) : 0.0f;
+			}
 		}, true );
+		gi_world_smooth( bake, texelHash, bake.sunVis, directRadius );
 
 		// gentle world-space smoothing: soft, anti-aliased shadow edges with no polygon seams
 		gi_world_smooth( bake, texelHash, directLight, directRadius );
@@ -3387,9 +3433,10 @@ uint64_t DG_SettingsHash( const dgSettings &settings, int scale )
 After the lightmaps and vertex colours, the file holds tagged sections, so new
 kinds of data can be added later without breaking the layout:
 
-  "BNCE"  int32 bouncePageSize, int32 relit, then the bounce lightmaps (RGB)
+  "BNCE"  int32 bouncePageSize, int32 relit, then the bounce lightmaps (RGBA,
+          A = sun visibility)
   "PRBE"  float origin[3], float spacing, int32 dims[3], then 18 half floats
-          per probe, then one valid byte per probe
+          per probe, one valid byte per probe, one sun-visibility byte per probe
   "LITE"  int32 count, count x dgFixture, int32 hasSun, float sunDir[3],
           float sunRgb[3]
 
@@ -3448,6 +3495,7 @@ std::vector<byte> DG_WriteCache( uint64_t bspHash, uint64_t settingsHash, const 
 	gi_put( file, live.probeDims, sizeof( live.probeDims ) );
 	gi_put( file, live.probes.data(), live.probes.size() * 2 );
 	gi_put( file, live.probeValid.data(), live.probeValid.size() );
+	gi_put( file, live.probeSun.data(), live.probeSun.size() );
 	gi_section_end( file, s );
 
 	s = gi_section_begin( file, "LITE" );
@@ -3491,11 +3539,12 @@ static bool gi_read_sections( const byte *p, const byte *end, dgLiveLighting &li
 			if ( !get( live.probeOrigin, 12 ) || !get( &live.probeSpacing, 4 ) || !get( live.probeDims, 12 ) )
 				return false;
 			const size_t count = (size_t)Q_max( 0, live.probeDims[0] ) * Q_max( 0, live.probeDims[1] ) * Q_max( 0, live.probeDims[2] );
-			if ( (size_t)( qend - q ) != count * 18 * 2 + count )
+			if ( (size_t)( qend - q ) != count * 18 * 2 + count * 2 )
 				return false;
 			live.probes.resize( count * 18 );
 			get( live.probes.data(), count * 36 );
-			live.probeValid.assign( q, qend );
+			live.probeValid.assign( q, q + count );
+			live.probeSun.assign( q + count, qend );
 		}
 		else if ( !memcmp( tag, "LITE", 4 ) ) {
 			int32_t n = 0, sun = 0;

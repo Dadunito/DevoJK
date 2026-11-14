@@ -594,7 +594,8 @@ static	void R_LoadLightmaps( world_t &worldData, lump_t *l, lump_t *surfs ) {
 							color[1] = avg;
 							color[2] = avg;
 						}
-						color[3] = 1.0f;
+						// DevoGI live lighting keeps the sun's baked shadow in the alpha channel
+						color[3] = R_DevoGI_LightmapAlpha( tr.worldDeluxeMapping ? i * 2 : i, j );
 
 						R_ColorShiftLightingFloats(color, color, 1.0f / 255.0f);
 
@@ -633,7 +634,8 @@ static	void R_LoadLightmaps( world_t &worldData, lump_t *l, lump_t *surfs ) {
 						else
 						{
 							R_ColorShiftLightingBytes( &buf_p[j * numColorComponents], &image[j * 4], qfalse );
-							image[j * 4 + 3] = 255;
+							// DevoGI live lighting keeps the sun's baked shadow in the alpha channel
+							image[j * 4 + 3] = (byte)( R_DevoGI_LightmapAlpha( tr.worldDeluxeMapping ? i * 2 : i, j ) * 255.0f + 0.5f );
 						}
 					}
 				}

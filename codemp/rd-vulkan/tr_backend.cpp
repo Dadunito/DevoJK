@@ -393,7 +393,7 @@ static void vk_update_light_constants( const trRefdef_t *refdef ) {
 	uint32_t i;
 	size_t size;
 
-	size = sizeof(vec4_t);
+	size = offsetof( vkUniformLight_t, light );	// the header: counts and the DevoGI sun
 
 	if ( vk.useGPUDLight )
 	{
@@ -408,7 +408,11 @@ static void vk_update_light_constants( const trRefdef_t *refdef ) {
 			uniform.light[i].radius = light->radius;
 		}
 
-		size += (i * sizeof(vkUniformLightEntry_t));
+		// DevoGI live lighting: the map's lamps and the sun join the list
+		R_DevoGI_FillLights( refdef, &uniform );
+		i = uniform.num_lights;
+
+		size = offsetof( vkUniformLight_t, light ) + ( i * sizeof(vkUniformLightEntry_t) );
 	} 
 	else 
 	{
@@ -431,6 +435,8 @@ static void vk_update_entity_light_constants( vkUniformEntity_t &uniform, const 
 	static const float normalizeFactor = 1.0f / 255.0f;
 
 	VectorScale(refEntity->ambientLight, normalizeFactor, uniform.ambientLight);
+	// DevoGI live lighting: the model's view of the sun (its baked shadow), from the probes
+	uniform.ambientLight[3] = R_DevoGI_LiveActive() ? refEntity->devoSunVis : 1.0f;
 	VectorScale(refEntity->directedLight, normalizeFactor, uniform.directedLight);
 	VectorCopy(refEntity->lightDir, uniform.localLightOrigin);
 
