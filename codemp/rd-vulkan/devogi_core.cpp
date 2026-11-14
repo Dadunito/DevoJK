@@ -244,6 +244,7 @@ struct lump_t {
 
 #define LUMP_ENTITIES		0
 #define LUMP_SHADERS		1
+#define LUMP_MODELS			7
 #define LUMP_DRAWVERTS		10
 #define LUMP_DRAWINDEXES	11
 #define LUMP_SURFACES		13
@@ -254,6 +255,12 @@ struct dheader_t {
 	int		ident;
 	int		version;
 	lump_t	lumps[HEADER_LUMPS];
+};
+
+struct dmodel_t {
+	float	mins[3], maxs[3];
+	int		firstSurface, numSurfaces;
+	int		firstBrush, numBrushes;
 };
 
 struct dshader_t {
@@ -311,6 +318,7 @@ static_assert( sizeof( dsurface_t ) == 148, "dsurface_t must match the BSP file"
 
 #include <algorithm>
 #include <functional>
+#include <unordered_map>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -320,7 +328,7 @@ static_assert( sizeof( dsurface_t ) == 148, "dsurface_t must match the BSP file"
 #include <vector>
 
 // Bump this whenever the bake changes in a way that should invalidate old .devogi files.
-#define DEVOGI_VERSION		18
+#define DEVOGI_VERSION		19
 
 #define DEVOGI_BSP_LM_SIZE	128			// lightmap page size stored in every Q3/JA BSP
 #define DEVOGI_LM_SIZE		gi_lmSize	// page size we are baking right now (128 * scale)
@@ -613,6 +621,70 @@ static void gi_load_vert( giVert &out, const mapVert_t &in ) {
 	}
 }
 
+/*
+Smooth shading. Round walls and pillars in old maps are usually flat brush faces
+standing in a circle, and each face has one flat normal - so light falls on
+every face a step brighter or darker than the next, in visible stripes. q3map2
+can smooth this ("phong" shading); here it is done for every map: where flat
+faces meet at less than 40 degrees, the corners they share get the average
+normal of those faces (weighted by area), and light runs in a smooth gradient
+across them. Real corners stay sharp. Patches and models keep their own smooth
+normals, which the BSP already has.
+*/
+static void gi_smooth_normals( giScene &scene, const dsurface_t *in, int numSurfs ) {
+	const float cosLimit = 0.766f;	// cos( 40 degrees )
+	const size_t nv = scene.verts.size();
+
+	// the flat face each vertex of a planar surface belongs to
+	std::vector<int> vertTri( nv, -1 );
+	for ( size_t t = 0; t < scene.tris.size(); t++ ) {
+		const giTri &tri = scene.tris[t];
+		if ( LittleLong( in[tri.surf].surfaceType ) != MST_PLANAR || scene.surfs[tri.surf].sky )
+			continue;
+		for ( int k = 0; k < 3; k++ )
+			if ( vertTri[tri.vert[k]] < 0 )
+				vertTri[tri.vert[k]] = (int)t;
+	}
+
+	// every triangle corner, found by its position (to an eighth of a unit)
+	auto key = []( const gvec3 &p ) {
+		const int64_t x = (int64_t)floorf( p.x * 8.0f + 0.5f ), y = (int64_t)floorf( p.y * 8.0f + 0.5f ), z = (int64_t)floorf( p.z * 8.0f + 0.5f );
+		return (uint64_t)( x * 73856093LL ) ^ (uint64_t)( y * 19349663LL ) ^ (uint64_t)( z * 83492791LL );
+	};
+	std::unordered_map<uint64_t, std::vector<int>> corners;
+	corners.reserve( scene.tris.size() * 2 );
+	for ( size_t t = 0; t < scene.tris.size(); t++ ) {
+		const giTri &tri = scene.tris[t];
+		if ( LittleLong( in[tri.surf].surfaceType ) != MST_PLANAR || scene.surfs[tri.surf].sky )
+			continue;
+		for ( int k = 0; k < 3; k++ )
+			corners[key( scene.verts[tri.vert[k]].xyz )].push_back( (int)t );
+	}
+
+	for ( size_t v = 0; v < nv; v++ ) {
+		if ( vertTri[v] < 0 )
+			continue;
+		giVert &gv = scene.verts[v];
+		const gvec3 own = scene.tris[vertTri[v]].n;
+		if ( gdot( gv.normal, own ) < 0.999f )
+			continue;	// already smoothed by the map compiler: keep it
+		const auto it = corners.find( key( gv.xyz ) );
+		if ( it == corners.end() )
+			continue;
+		gvec3 sum;
+		for ( int t : it->second ) {
+			const giTri &tri = scene.tris[t];
+			if ( gdot( tri.n, own ) < cosLimit )
+				continue;	// a real corner: stays sharp
+			const gvec3 cr = gcross( tri.e1, tri.e2 );
+			sum += tri.n * sqrtf( gdot( cr, cr ) );	// bigger faces count more
+		}
+		if ( gdot( sum, sum ) > 1e-8f )
+			gv.normal = gnorm( sum );
+	}
+	(void)numSurfs;
+}
+
 static void gi_build_geometry( giScene &scene, const byte *fileBase, const dheader_t *header ) {
 	const lump_t &ls = header->lumps[LUMP_SURFACES];
 	const lump_t &lv = header->lumps[LUMP_DRAWVERTS];
@@ -626,6 +698,19 @@ static void gi_build_geometry( giScene &scene, const byte *fileBase, const dhead
 	const int numIndexes = li.filelen / sizeof( int );
 
 	scene.surfs.resize( numSurfs );
+
+	// the world is model 0; doors, lifts and other movers are models 1 and up. Like
+	// q3map2, only the world blocks light: a closed door must not leave the floor
+	// under it and the faces inside its frame in the dark.
+	int worldFirst = 0, worldCount = numSurfs;
+	{
+		const lump_t &lm = header->lumps[LUMP_MODELS];
+		if ( lm.filelen >= (int)sizeof( dmodel_t ) ) {
+			const dmodel_t *models = (const dmodel_t *)( fileBase + lm.fileofs );
+			worldFirst = LittleLong( models[0].firstSurface );
+			worldCount = LittleLong( models[0].numSurfaces );
+		}
+	}
 
 	for ( int i = 0; i < numSurfs; i++ ) {
 		const dsurface_t &s = in[i];
@@ -642,7 +727,8 @@ static void gi_build_geometry( giScene &scene, const byte *fileBase, const dhead
 		gs.sky = ( sh.surfaceFlags & SURF_SKY ) != 0;
 		// water, fog, glass and other see-through surfaces let light pass
 		gs.occluder = !( sh.surfaceFlags & SURF_NODRAW )
-			&& !( sh.contentFlags & ( CONTENTS_WATER | CONTENTS_FOG | CONTENTS_TRANSLUCENT | CONTENTS_LAVA | CONTENTS_SLIME ) );
+			&& !( sh.contentFlags & ( CONTENTS_WATER | CONTENTS_FOG | CONTENTS_TRANSLUCENT | CONTENTS_LAVA | CONTENTS_SLIME ) )
+			&& i >= worldFirst && i < worldFirst + worldCount;	// movers don't block light
 
 		const int type = LittleLong( s.surfaceType );
 		const int firstVert = LittleLong( s.firstVert );
@@ -707,6 +793,8 @@ static void gi_build_geometry( giScene &scene, const byte *fileBase, const dhead
 		}
 		// flares and broken surfaces have no geometry
 	}
+
+	gi_smooth_normals( scene, in, numSurfs );
 }
 
 /*

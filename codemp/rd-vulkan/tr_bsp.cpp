@@ -600,6 +600,9 @@ static	void R_LoadLightmaps( world_t &worldData, lump_t *l, lump_t *surfs ) {
 						R_ColorShiftLightingFloats(color, color, 1.0f / 255.0f);
 
 						ColorToRGBA16F(color, (unsigned short *)(&image[j * 8]));
+						// DevoGI live lighting: ColorToRGBA16F always writes alpha 1; keep the
+						// sun's baked shadow that R_DevoGI_LightmapAlpha put in color[3]
+						((unsigned short *)(&image[j * 8]))[3] = FloatToHalf(color[3]);
 					}
 					else if (buf_p)
 #else // HDR_DELUXE_LIGHTMAP
