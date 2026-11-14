@@ -139,6 +139,13 @@ static qboolean	R_CullSurface( surfaceType_t *surface, shader_t *shader, int ent
 		return qfalse;
 	}
 
+	// DevoGI sun shadow map: a face pointing away from the sun still blocks it. A ceiling
+	// faces down, away from the sun, and the roof above it is usually sky or invisible,
+	// so dropping back faces here let the sun shine straight into closed rooms.
+	if ( tr.viewParms.devoShadow ) {
+		return qfalse;
+	}
+
 	// face culling
 	if ( !r_facePlaneCull->integer ) {
 		return qfalse;

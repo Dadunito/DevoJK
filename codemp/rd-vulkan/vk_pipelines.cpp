@@ -1307,6 +1307,12 @@ VkPipeline vk_create_pipeline( const Vk_Pipeline_Def *def, renderPass_t renderPa
             break;
     }
 
+    // DevoGI sun shadow map: both sides of everything block the sun. Ceilings face away
+    // from it, and curved patches are one-sided: seen from behind they vanished from the
+    // shadow map, which let light through roofs and gave patches broken, curled shadows.
+    if ( renderPassIndex == RENDER_PASS_DEVO_SHADOW )
+        rasterization_state.cullMode = VK_CULL_MODE_NONE;
+
     // how fragments are generated for geometry.
     rasterization_state.frontFace = VK_FRONT_FACE_CLOCKWISE; // Q3 defaults to clockwise vertex order
     if ( def->line_width )
