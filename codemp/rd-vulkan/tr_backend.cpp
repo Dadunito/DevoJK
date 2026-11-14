@@ -1255,6 +1255,10 @@ void RB_DrawDevoShadowViews( void )
 		VBO_UnBind();
 #endif
 		RB_UpdateUniformConstants( &backEnd.refdef, &backEnd.viewParms );
+		// each cascade has its own half of the shadow map: make the next draw set this
+		// view's viewport and scissor (they are only re-sent when the depth range changes)
+		vk.cmd->depth_range = DEPTH_RANGE_COUNT;
+		Com_Memset( &vk.cmd->scissor_rect, 0, sizeof( vk.cmd->scissor_rect ) );
 		RB_BeginDrawingView();
 		RB_RenderDrawSurfList( cmd->drawSurfs, cmd->numDrawSurfs );
 		R_DevoGI_SunShadowDrawn( &backEnd.viewParms );

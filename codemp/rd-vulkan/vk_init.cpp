@@ -154,15 +154,22 @@ void get_scissor_rect( VkRect2D *r ) {
 	{
 		get_viewport_rect(r);
 
+		// DevoJK: the sun's shadow views draw into the shadow map (two cascades side by
+		// side, e.g. 4096x2048), not the screen. Clamped to the screen size, the second
+		// cascade (from x = 2048) lay entirely outside and was never drawn or cleared,
+		// and the first was cut off below row 1080: far sun shadows came out "lit".
+		const int maxWidth = backEnd.viewParms.devoShadow ? (int)vk.renderWidth : glConfig.vidWidth;
+		const int maxHeight = backEnd.viewParms.devoShadow ? (int)vk.renderHeight : glConfig.vidHeight;
+
 		if (r->offset.x < 0)
 			r->offset.x = 0;
 		if (r->offset.y < 0)
 			r->offset.y = 0;
 
-		if (r->offset.x + r->extent.width > glConfig.vidWidth)
-			r->extent.width = glConfig.vidWidth - r->offset.x;
-		if (r->offset.y + r->extent.height > glConfig.vidHeight)
-			r->extent.height = glConfig.vidHeight - r->offset.y;
+		if (r->offset.x + (int)r->extent.width > maxWidth)
+			r->extent.width = maxWidth - r->offset.x;
+		if (r->offset.y + (int)r->extent.height > maxHeight)
+			r->extent.height = maxHeight - r->offset.y;
 	}
 }
 
