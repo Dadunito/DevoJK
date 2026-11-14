@@ -1413,7 +1413,6 @@ void		vk_devo_shadow_destroy( void );
 void		vk_devo_shadow_write_descriptor( VkDescriptorSet set );
 void		vk_devo_shadow_begin_pass( void );
 qboolean	vk_find_screenmap_drawsurfs( void );
-qboolean	vk_next_is_devo_shadow( const void *cmd );
 void		vk_create_cubemap_prefilter( void );
 void		vk_destroy_cubemap_prefilter( void );
 #endif

@@ -98,6 +98,11 @@ void R_IssueRenderCommands( qboolean runPerformanceCounters ) {
 	// clear it out, in case this is a sync and not a buffer flip
 	cmdList->used = 0;
 
+	// DevoGI: the sun shadow views queued with these commands belong to them; if the
+	// backend is skipped below (minimized window), they must not be drawn later
+	const int devoShadowCmds = backEndData->numDevoShadowCmds;
+	backEndData->numDevoShadowCmds = 0;
+
 	if (backEnd.screenshotMask == 0) {
 		if (ri.VK_IsMinimized())
 			return; // skip backend when minimized
@@ -114,7 +119,9 @@ void R_IssueRenderCommands( qboolean runPerformanceCounters ) {
 	// actually start the commands going
 	if ( !r_skipBackEnd->integer ) {
 		// let it start on the new batch
+		backEndData->numDevoShadowCmds = devoShadowCmds;
 		RB_ExecuteRenderCommands( cmdList->cmds );
+		backEndData->numDevoShadowCmds = 0;
 	}
 
 	// at this point, the back end thread is idle, so it is ok

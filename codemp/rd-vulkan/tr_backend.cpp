@@ -1231,12 +1231,50 @@ RB_DrawSurfs
 
 =============
 */
+/*
+=============
+RB_DrawDevoShadowViews
+
+DevoGI: draws this frame's sun views into the shadow map, before anything else
+in the frame (vk_begin_frame calls this inside the shadow map's render pass).
+They were queued with the player's view; RB_DrawSurfs skips them later.
+=============
+*/
+void RB_DrawDevoShadowViews( void )
+{
+	for ( int i = 0; i < backEndData->numDevoShadowCmds; i++ ) {
+		const drawSurfsCommand_t *cmd = backEndData->devoShadowCmds[i];
+
+		backEnd.refdef = cmd->refdef;
+		backEnd.viewParms = cmd->viewParms;
+		backEnd.hasGlowSurfaces = qfalse;
+		backEnd.isGlowPass = qfalse;
+		backEnd.hasRefractionSurfaces = qfalse;
+
+#ifdef USE_VBO
+		VBO_UnBind();
+#endif
+		RB_UpdateUniformConstants( &backEnd.refdef, &backEnd.viewParms );
+		RB_BeginDrawingView();
+		RB_RenderDrawSurfList( cmd->drawSurfs, cmd->numDrawSurfs );
+		R_DevoGI_SunShadowDrawn( &backEnd.viewParms );
+	}
+#ifdef USE_VBO
+	VBO_UnBind();
+#endif
+	backEndData->numDevoShadowCmds = 0;
+}
+
 const void	*RB_DrawSurfs( const void *data ) {
 	const drawSurfsCommand_t	*cmd;
 
-	RB_EndSurface(); // finish any 2D drawing if needed
-
 	cmd = (const drawSurfsCommand_t *)data;
+
+	// DevoGI: the sun's views were already drawn at the start of the frame
+	if ( cmd->viewParms.devoShadow )
+		return (const void*)(cmd + 1);
+
+	RB_EndSurface(); // finish any 2D drawing if needed
 
 	backEnd.refdef = cmd->refdef;
 	backEnd.viewParms = cmd->viewParms;
@@ -1255,25 +1293,6 @@ const void	*RB_DrawSurfs( const void *data ) {
 	// clear the z buffer, set the modelview, etc
 	RB_BeginDrawingView();
 
-	// DevoGI: the sun's view, drawn into the shadow map (the frame began with its pass)
-	if ( backEnd.viewParms.devoShadow )
-	{
-		if ( vk.renderPassIndex == RENDER_PASS_DEVO_SHADOW )
-		{
-			RB_RenderDrawSurfList( cmd->drawSurfs, cmd->numDrawSurfs );
-			R_DevoGI_SunShadowDrawn( &backEnd.viewParms );
-
-			// both cascades share one image and one pass: close it after the last one
-			if ( !vk_next_is_devo_shadow( (const void*)(cmd + 1) ) ) {
-				vk_end_render_pass();
-				if ( vk_find_screenmap_drawsurfs() )
-					vk_begin_screenmap_render_pass();
-				else
-					vk_begin_main_render_pass();
-			}
-		}
-		return (const void*)(cmd + 1);
-	}
 
 #ifdef VK_CUBEMAP
 	if ( backEnd.viewParms.targetCube != nullptr ) 

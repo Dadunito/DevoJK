@@ -2796,6 +2796,11 @@ typedef struct backEndData_s {
 	srfPoly_t			*polys;//[MAX_POLYS];
 	polyVert_t			*polyVerts;//[MAX_POLYVERTS];
 	renderCommandList_t	commands;
+
+	// DevoGI: this frame's sun shadow views (queued with the player's view, drawn by
+	// the backend before anything else - see RB_DrawDevoShadowViews)
+	struct drawSurfsCommand_s	*devoShadowCmds[2];
+	int					numDevoShadowCmds;
 } backEndData_t;
 
 extern int max_polys;
@@ -2878,6 +2883,7 @@ qboolean	R_DevoGI_EntityLighting( const vec3_t point, vec3_t ambient, vec3_t dir
 void		R_DevoGI_FillLights( const trRefdef_t *refdef, vkUniformLight_t *uniform );
 qboolean	R_DevoGI_SunShadowView( const viewParms_t *mainView, viewParms_t *out, int cascade );
 void		R_DevoGI_SunShadowDrawn( const viewParms_t *view );
+void		RB_DrawDevoShadowViews( void );
 
 // Vulkan
 void		RB_AddDrawItem( Pass *pass, const DrawItem& drawItem );

@@ -614,11 +614,17 @@ void RE_RenderScene( const refdef_t *fd ) {
 
 	// DevoGI real-time lighting: before the first world view of the frame, draw the
 	// scene from the sun into the shadow map (the backend starts the frame with it)
-	if ( lastRenderCommand == RC_DRAW_BUFFER ) {
+	// (only for the player's own view: not for the sky-portal scene that some maps draw
+	// first, and only once per frame)
+	if ( !( fd->rdflags & RDF_SKYBOXPORTAL ) && backEndData->numDevoShadowCmds == 0 ) {
 		viewParms_t shadowParms;
 		for ( int cascade = 0; cascade < 2; cascade++ ) {	// near and far shadow maps
-			if ( R_DevoGI_SunShadowView( &parms, &shadowParms, cascade ) )
-				R_RenderView( &shadowParms );
+			if ( !R_DevoGI_SunShadowView( &parms, &shadowParms, cascade ) )
+				continue;
+			tr.drawSurfCmd = NULL;
+			R_RenderView( &shadowParms );
+			if ( tr.drawSurfCmd )	// remember it: the backend draws it before anything else
+				backEndData->devoShadowCmds[backEndData->numDevoShadowCmds++] = tr.drawSurfCmd;
 		}
 		tr.drawSurfCmd = NULL;		// keep them out of the screen-map copies below
 		tr.numDrawSurfCmds = 0;

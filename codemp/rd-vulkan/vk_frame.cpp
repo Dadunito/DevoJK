@@ -402,34 +402,6 @@ void vk_destroy_framebuffers( void )
 #endif
 }
 
-// DevoGI: is the next draw command another sun shadow cascade?
-qboolean vk_next_is_devo_shadow( const void *curCmd )
-{
-    curCmd = PADP(curCmd, sizeof(void*));
-    if ( *(const int*)curCmd != RC_DRAW_SURFS )
-        return qfalse;
-    return ((const drawSurfsCommand_t*)curCmd)->viewParms.devoShadow ? qtrue : qfalse;
-}
-
-// DevoGI: does the frame start with the sun's shadow view?
-static qboolean vk_find_devo_shadow_drawsurfs( void )
-{
-    const void* curCmd = &backEndData->commands.cmds;
-
-    for (;; ) {
-        curCmd = PADP(curCmd, sizeof(void*));
-        switch (*(const int*)curCmd) {
-        case RC_DRAW_BUFFER:
-            curCmd = (const void*)((const drawBufferCommand_t*)curCmd + 1);
-            break;
-        case RC_DRAW_SURFS:
-            return ((const drawSurfsCommand_t*)curCmd)->viewParms.devoShadow ? qtrue : qfalse;
-        default:
-            return qfalse;
-        }
-    }
-}
-
 qboolean vk_find_screenmap_drawsurfs( void )
 {
     const void* curCmd = &backEndData->commands.cmds;
@@ -603,9 +575,10 @@ _retry:
 
     backEnd.screenMapDone = qfalse;
 
-    if (vk_find_devo_shadow_drawsurfs()) {
-        // DevoGI: the sun's shadow map is drawn first; RB_DrawSurfs moves on to the
-        // screen-map or main pass when it is done
+    // DevoGI: when the frame has sun shadow views, their pass comes first; they are
+    // drawn at the end of this function, once the per-frame buffers are reset
+    const qboolean devoShadowFirst = ( backEndData->numDevoShadowCmds > 0 && vk_devoShadow.active ) ? qtrue : qfalse;
+    if ( devoShadowFirst ) {
         vk_devo_shadow_begin_pass();
     }
     else if (vk_find_screenmap_drawsurfs()) {
@@ -634,6 +607,16 @@ _retry:
     // other stats
     vk.stats.push_size = 0;
 #endif
+
+    // DevoGI: draw the sun's views into the shadow map, then start the frame's real pass
+    if ( devoShadowFirst ) {
+        RB_DrawDevoShadowViews();
+        vk_end_render_pass();
+        if ( vk_find_screenmap_drawsurfs() )
+            vk_begin_screenmap_render_pass();
+        else
+            vk_begin_main_render_pass();
+    }
 }
 
 void vk_release_indirect_buffers( void )
