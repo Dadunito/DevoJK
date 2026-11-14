@@ -96,10 +96,10 @@ void R_DevoGI_Register( void )
 	r_devoGI_live			= ri.Cvar_Get( "r_devoGI_live",			"0",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI real-time lighting (work in progress): the map's lamps and the sun are drawn live, only bounce light comes from the bake\n 0: full bake (fastest)\n 1: live lamps and sun (no lamp shadows yet)" );
 	r_devoGI_sunShadow		= ri.Cvar_Get( "r_devoGI_sunShadow",	"1",	CVAR_ARCHIVE, "DevoGI live lighting: real-time sun shadows from everything, players and moving objects included (0 = only the baked sun shadows)" );
 	r_devoGI_sunShadowSize	= ri.Cvar_Get( "r_devoGI_sunShadowSize",	"2048",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI live lighting: sun shadow map resolution (1024, 2048 or 4096 - sharper but slower)" );
-	r_devoGI_sunShadowRange	= ri.Cvar_Get( "r_devoGI_sunShadowRange",	"1024",	CVAR_ARCHIVE, "DevoGI live lighting: how far around the player real-time sun shadows reach, in game units (further away the baked shadows take over)" );
-	r_devoGI_sunShadowRangeFar = ri.Cvar_Get( "r_devoGI_sunShadowRangeFar", "4096", CVAR_ARCHIVE, "DevoGI live lighting: reach of the second, coarser sun shadow map, in game units (beyond it the baked shadows take over)" );
+	r_devoGI_sunShadowRange	= ri.Cvar_Get( "r_devoGI_sunShadowRange",	"768",	CVAR_ARCHIVE, "DevoGI live lighting: reach of the sharp sun shadow map around the player, in game units (256-2048; the coarser one takes over further away)" );
+	r_devoGI_sunShadowRangeFar = ri.Cvar_Get( "r_devoGI_sunShadowRangeFar", "4096", CVAR_ARCHIVE, "DevoGI live lighting: reach of the second, coarser sun shadow map, in game units (up to 8192; beyond it the baked shadows take over)" );
 	r_devoGI_liveBounces	= ri.Cvar_Get( "r_devoGI_liveBounces",	"24",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI: light bounces of the bounce-only light that live lighting (r_devoGI_live 1) uses (1-32); the full bake keeps r_devoGI_bounces" );
-	r_devoGI_liveSky		= ri.Cvar_Get( "r_devoGI_liveSky",		"3",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI: sky light in the live layer (r_devoGI_live 1), times r_devoGI_sky: with no sun baked in, the sky all around lights the shade" );
+	r_devoGI_liveSky		= ri.Cvar_Get( "r_devoGI_liveSky",		"6",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI: sky light in the live layer (r_devoGI_live 1), times r_devoGI_sky: with no sun baked in, the sky all around lights the shade" );
 	r_devoGI_gpu			= ri.Cvar_Get( "r_devoGI_gpu",			"1",	CVAR_ARCHIVE, "DevoGI: trace the bake's rays on the graphics card (much faster, same result; falls back to the CPU when it can't)" );
 	r_devoGI_rebuild		= ri.Cvar_Get( "r_devoGI_rebuild",		"0",	CVAR_TEMP, "Set to 1 to force DevoGI to bake the next map that loads again" );
 	r_devoLights_glow		= ri.Cvar_Get( "r_devoLights_glow",		"4000",	CVAR_ARCHIVE | CVAR_LATCH, "DevoLights: starting strength of glowing lamp textures without q3map_surfacelight (the bake then matches each lamp type to the original map); 0 = they give no light" );
@@ -554,9 +554,13 @@ qboolean R_DevoGI_SunShadowView( const viewParms_t *mainView, viewParms_t *out, 
 		|| ( tr.refdef.rdflags & RDF_NOWORLDMODEL ) || cascade < 0 || cascade > 1 )
 		return qfalse;
 
-	const float nearRange = Com_Clamp( 256.0f, 8192.0f, r_devoGI_sunShadowRange->value );
+	// The shadow map has a fixed number of pixels, so the wider a cascade reaches, the
+	// bigger each pixel gets. Both are kept in a range where a shadow pixel stays small
+	// (a few game units at most at 2048): with a far cascade of 16000 one pixel was 16
+	// units, thin casters vanished and shadows jumped as the player moved.
+	const float nearRange = Com_Clamp( 256.0f, 2048.0f, r_devoGI_sunShadowRange->value );
 	const float range = cascade == 0 ? nearRange
-		: Com_Clamp( nearRange * 1.5f, 32768.0f, r_devoGI_sunShadowRangeFar->value );	// half the square's side
+		: Com_Clamp( nearRange * 2.0f, 8192.0f, r_devoGI_sunShadowRangeFar->value );	// half the square's side
 	const float distance = range + 4096.0f;		// the sun's camera sits this far away, above every caster
 	const int size = (int)vk_devoShadow.size;
 
@@ -569,10 +573,13 @@ qboolean R_DevoGI_SunShadowView( const viewParms_t *mainView, viewParms_t *out, 
 	VectorNormalize( left );
 	CrossProduct( forward, left, up );
 
-	// centre of the square: a little ahead of the player, snapped to whole shadow-map pixels
+	// centre of the square: a little ahead of the player (level, not up or down where the
+	// player looks), snapped to whole shadow-map pixels
 	const float texel = 2.0f * range / size;
-	vec3_t centre;
-	VectorMA( mainView->ori.origin, range * 0.4f, mainView->ori.axis[0], centre );
+	vec3_t centre, ahead = { mainView->ori.axis[0][0], mainView->ori.axis[0][1], 0.0f };
+	if ( VectorNormalize( ahead ) < 0.01f )
+		VectorClear( ahead );
+	VectorMA( mainView->ori.origin, range * 0.4f, ahead, centre );
 	const float cx = floorf( DotProduct( centre, left ) / texel ) * texel;
 	const float cy = floorf( DotProduct( centre, up ) / texel ) * texel;
 	const float cz = DotProduct( centre, forward );

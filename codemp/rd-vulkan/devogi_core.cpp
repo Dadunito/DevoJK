@@ -2087,10 +2087,10 @@ static void gi_fix_texel_positions( giBake &bake ) {
 	gi_parallel_for( (int)bake.texels.size(), [&]( int i ) {
 		giTexel &tx = bake.texels[i];
 		const int r = gi_fix_point( bake.scene, tx.pos, tx.faceNormal, tx.size, tx.surf );
-		// a texel well inside its polygon that still starts inside a wall lies where its
-		// surface runs on under that wall: whichever way it was pushed out, it may have
-		// come out on the far side, in another room
-		tx.buried = r == 1 && !tx.edge;
+		// a texel that starts inside a wall lies where its surface runs on under that wall
+		// (or, at a polygon's border, pokes into the next one): whichever way it was pushed
+		// out, it may have come out on the far side, in another room or under a ramp
+		tx.buried = r == 1;
 		if ( r == 1 )
 			moved.fetch_add( 1 );
 		else if ( r == 2 )

@@ -33,7 +33,7 @@ struct dgSettings {
 	int		rays		= 128;		// rays per bounce-light sample
 	int		bounces		= 8;		// light bounces
 	int		liveBounces	= 24;		// light bounces of the bounce-only light used by live lighting (1-32)
-	float	liveSky		= 3.0f;		// sky light in the live layer, times 'sky': with no sun baked in,
+	float	liveSky		= 6.0f;		// sky light in the live layer, times 'sky': with no sun baked in,
 									// the sky all around is what lights the shade (like a skylight)
 	float	aa			= 2.0f;		// shadow anti-aliasing width, in texels
 	float	sheen		= 0.12f;	// baked glossy sheen
