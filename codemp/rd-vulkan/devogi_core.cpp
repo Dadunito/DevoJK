@@ -320,7 +320,7 @@ static_assert( sizeof( dsurface_t ) == 148, "dsurface_t must match the BSP file"
 #include <vector>
 
 // Bump this whenever the bake changes in a way that should invalidate old .devogi files.
-#define DEVOGI_VERSION		17
+#define DEVOGI_VERSION		18
 
 #define DEVOGI_BSP_LM_SIZE	128			// lightmap page size stored in every Q3/JA BSP
 #define DEVOGI_LM_SIZE		gi_lmSize	// page size we are baking right now (128 * scale)
@@ -1603,17 +1603,25 @@ that wall into the open, just past its surface.
 
 static void gi_fix_texel_positions( giBake &bake ) {
 	const giScene &scene = bake.scene;
-	std::atomic<int> moved( 0 );
+	std::atomic<int> moved( 0 ), padded( 0 );
+	// how close a sample point may come to another surface: more than the 1.5 units that
+	// rays skip at their start (DEVOGI_RAY_TMIN), or rays would slip through that surface
+	const float margin = DEVOGI_RAY_TMIN + 1.0f;
 	gi_parallel_for( (int)bake.texels.size(), [&]( int i ) {
 		giTexel &tx = bake.texels[i];
 		gvec3 t, b;
 		gi_basis( tx.faceNormal, t, b );
+		const float s = 0.70710678f;
+		const gvec3 dirs[8] = { t, t * -1.0f, b, b * -1.0f,
+			( t + b ) * s, ( t - b ) * s, ( b - t ) * s, ( t + b ) * -s };
+
+		// 1. inside a wall: leave it through its nearest side (the closest back face)
 		// the corner of a texel is ~0.7 texels away; look a little further for safety
 		const float reach = tx.size * 1.0f + 2.0f;
 		for ( int pass = 0; pass < 2; pass++ ) {
 			const gvec3 o = tx.pos + tx.faceNormal * 0.1f;
-			const gvec3 dirs[4] = { t, t * -1.0f, b, b * -1.0f };
-			bool fixedOne = false;
+			float best = DEVOGI_INF;
+			gvec3 bestDir;
 			for ( const gvec3 &d : dirs ) {
 				giHit hit;
 				if ( !gi_trace( scene, o, d, reach, hit, false ) )
@@ -1621,18 +1629,54 @@ static void gi_fix_texel_positions( giBake &bake ) {
 				const giTri &ht = scene.tris[hit.tri];
 				if ( scene.surfs[ht.surf].sky || gdot( ht.n, d ) <= 0 )
 					continue;	// a wall's front face: we are outside it, all good
-				// we hit the back of a wall: step out through it, with a safety margin past
-				// its surface so no ray from here can slip under the wall's edge
-				tx.pos = o + d * ( hit.t + Q_max( 1.0f, tx.size * 0.5f ) ) - tx.faceNormal * 0.1f;
-				fixedOne = true;
-				break;
+				if ( hit.t < best ) {
+					best = hit.t;
+					bestDir = d;
+				}
 			}
-			if ( !fixedOne )
+			if ( best >= DEVOGI_INF )
 				break;
+			// step out through it, with a safety margin past its surface
+			tx.pos = o + bestDir * ( best + Q_max( margin, tx.size * 0.5f ) ) - tx.faceNormal * 0.1f;
 			moved.fetch_add( 1 );
 		}
+
+		/*
+		2. Padding: a point right where its ceiling meets a wall (a polygon's edge texels
+		sit exactly on that line) is too close to the wall: rays leaving it skip the
+		first 1.5 units, slip through the wall and bring back light from the other side
+		- a thin bright line along the corner. So the point slides along its own surface
+		until it is at least 'margin' away from every wall around it.
+		*/
+		for ( int pass = 0; pass < 2; pass++ ) {
+			const gvec3 o = tx.pos + tx.faceNormal * 0.5f;
+			gvec3 push;
+			bool close = false;
+			for ( const gvec3 &d : dirs ) {
+				giHit hit;
+				if ( !gi_trace( scene, o, d, margin, hit, false ) )
+					continue;
+				const giTri &ht = scene.tris[hit.tri];
+				if ( scene.surfs[ht.surf].sky || ht.surf == tx.surf )
+					continue;
+				if ( gdot( ht.n, tx.faceNormal ) > 0.95f )
+					continue;	// a surface lying flat in our own plane is not a wall
+				push += d * -( margin - hit.t );
+				close = true;
+			}
+			if ( !close )
+				break;
+			// stay on our own plane: only slide along it
+			push = push - tx.faceNormal * gdot( push, tx.faceNormal );
+			const float len = sqrtf( gdot( push, push ) );
+			if ( len < 1e-3f )
+				break;
+			const float step = Q_min( len, margin );
+			tx.pos += push * ( step / len );
+			padded.fetch_add( 1 );
+		}
 	} );
-	dg_print( "DevoGI: moved %d texel sample points out of walls\n", moved.load() );
+	dg_print( "DevoGI: moved %d texel sample points out of walls, %d away from corners\n", moved.load(), padded.load() );
 }
 
 /*
@@ -2707,7 +2751,7 @@ static uint64_t gi_bsp_hash( const byte *fileBase, const dheader_t *header ) {
 static uint64_t gi_settings_hash( int scale ) {
 	char buf[320];
 	Com_sprintf( buf, sizeof( buf ), "aa%g sh%g v%d ex%g r%d b%d i%g s%g e%d ao%g aod%g aor%g sat%g x%d rl%d gl%g lh%llx", g_set.aa, g_set.sheen, DEVOGI_VERSION, g_set.exposure,
-		Com_Clampi( 8, 1024, g_set.rays ), Com_Clampi( 1, 16, g_set.bounces ),
+		Com_Clampi( 8, 1024, g_set.rays ), Com_Clampi( 1, 16, g_set.bounces ) * 100 + Com_Clampi( 1, 32, g_set.liveBounces ),
 		g_set.intensity, g_set.sky, g_set.entityLights,
 		g_set.ao, g_set.aoDirect, g_set.aoDistance, g_set.saturation, scale,
 		g_set.relight, g_set.glow, (unsigned long long)( g_set.relight ? gi_lightsHash : 0 ) );
@@ -3422,17 +3466,37 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 	giSpatialHash gridHash;
 	gridHash.build( texelPos, gridPoints, bounceRadius );
 
+	/*
+	Two bounce counts. The full bake (r_devoGI_live 0) uses 'bounces'. Live lighting
+	(r_devoGI_live 1) takes only the bounce light from the bake, and since that is all
+	the baked light it shows, it gets more: the light keeps bouncing up to 'liveBounces'
+	(24 by default), filling deep rooms and corridors a little more each time. The
+	full bake's light is put aside after its last bounce, so it stays exactly as it was.
+	*/
+	const int totalBounces = relight ? Q_max( bounces, Com_Clampi( 1, 32, g_set.liveBounces ) ) : bounces;
+	std::vector<float> fullLight;	// the full bake's light, after its own last bounce
+
 	bake.light = bake.direct;
 	static char bounceStage[64];
 	const float bounceBase = 0.45f, bounceSpan = 0.47f;
-	for ( int b = 0; b < bounces; b++ ) {
-		Com_sprintf( bounceStage, sizeof( bounceStage ), "Bounce light %d of %d", b + 1, bounces );
-		gi_progress_stage( bounceStage, bounceBase + bounceSpan * b / bounces, bounceSpan / bounces );
+	for ( int b = 0; b < totalBounces; b++ ) {
+		Com_sprintf( bounceStage, sizeof( bounceStage ), b < bounces ? "Bounce light %d of %d" : "Bounce light %d of %d (live)",
+			b + 1, totalBounces );
+		gi_progress_stage( bounceStage, bounceBase + bounceSpan * b / totalBounces, bounceSpan / totalBounces );
 		// later bounces carry less and less energy, so fewer rays are enough for them
 		const int bounceRays = b == 0 ? rays : ( b < 3 ? rays / 2 : rays / 4 );
 		gi_gather( bake, gridHash, gridPoints, texelPos, bounceRadius, Q_max( 16, bounceRays ) );
 		gi_compose( bake, intensity );
-		dg_print( "DevoGI: bounce %d/%d done (%.1fs)\n", b + 1, bounces, ( dg_ms() - startTime ) / 1000.0f );
+		dg_print( "DevoGI: bounce %d/%d done (%.1fs)\n", b + 1, totalBounces, ( dg_ms() - startTime ) / 1000.0f );
+		if ( b + 1 == bounces && totalBounces > bounces )
+			fullLight = bake.light;
+	}
+	// the full bake goes on with its own light; the bounce-only light for live lighting
+	// (bake.indirect, see gi_build_bounce_maps) keeps all the extra bounces
+	if ( !fullLight.empty() ) {
+		bake.light.swap( fullLight );
+		fullLight.clear();
+		fullLight.shrink_to_fit();
 	}
 
 	// ---- exposure: one factor for the whole map ----

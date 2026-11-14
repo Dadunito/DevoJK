@@ -67,6 +67,7 @@ static cvar_t *r_devoLights_intensity;
 static cvar_t *r_devoLights_range;
 static cvar_t *r_devoGI_live;
 static cvar_t *r_devoGI_gpu;
+static cvar_t *r_devoGI_liveBounces;
 static cvar_t *r_devoGI_sunShadow;
 static cvar_t *r_devoGI_sunShadowSize;
 static cvar_t *r_devoGI_sunShadowRange;
@@ -96,6 +97,7 @@ void R_DevoGI_Register( void )
 	r_devoGI_sunShadowSize	= ri.Cvar_Get( "r_devoGI_sunShadowSize",	"2048",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI live lighting: sun shadow map resolution (1024, 2048 or 4096 - sharper but slower)" );
 	r_devoGI_sunShadowRange	= ri.Cvar_Get( "r_devoGI_sunShadowRange",	"1024",	CVAR_ARCHIVE, "DevoGI live lighting: how far around the player real-time sun shadows reach, in game units (further away the baked shadows take over)" );
 	r_devoGI_sunShadowRangeFar = ri.Cvar_Get( "r_devoGI_sunShadowRangeFar", "4096", CVAR_ARCHIVE, "DevoGI live lighting: reach of the second, coarser sun shadow map, in game units (beyond it the baked shadows take over)" );
+	r_devoGI_liveBounces	= ri.Cvar_Get( "r_devoGI_liveBounces",	"24",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI: light bounces of the bounce-only light that live lighting (r_devoGI_live 1) uses (1-32); the full bake keeps r_devoGI_bounces" );
 	r_devoGI_gpu			= ri.Cvar_Get( "r_devoGI_gpu",			"1",	CVAR_ARCHIVE, "DevoGI: trace the bake's rays on the graphics card (much faster, same result; falls back to the CPU when it can't)" );
 	r_devoGI_rebuild		= ri.Cvar_Get( "r_devoGI_rebuild",		"0",	CVAR_TEMP, "Set to 1 to force DevoGI to bake the next map that loads again" );
 	r_devoLights_glow		= ri.Cvar_Get( "r_devoLights_glow",		"4000",	CVAR_ARCHIVE | CVAR_LATCH, "DevoLights: starting strength of glowing lamp textures without q3map_surfacelight (the bake then matches each lamp type to the original map); 0 = they give no light" );
@@ -126,6 +128,7 @@ static dgSettings R_DevoGI_Settings( void )
 	s.entityLights	= r_devoGI_entityLights->integer;
 	s.threads		= r_devoGI_threads->integer;
 	s.gpu			= r_devoGI_gpu->integer;
+	s.liveBounces	= r_devoGI_liveBounces->integer;
 	return s;
 }
 
