@@ -416,6 +416,14 @@ static inline gvec3 gmax( const gvec3 &a, const gvec3 &b ) { return gvec3( Q_max
 // perceived brightness of a colour (Rec. 709 weights)
 static inline float gi_luma( const gvec3 &c ) { return 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z; }
 
+// a clearly coloured light (red, blue, green...), not a white or warm-white one: its
+// weakest colour channel is under half its strongest. High spec draws these live in
+// full instead of baking them (see DG_FixtureColored)
+static inline bool gi_is_colored( float r, float g, float b ) {
+	const float hi = Q_max( r, Q_max( g, b ) ), lo = Q_min( r, Q_min( g, b ) );
+	return hi > 0 && lo < hi * 0.5f;
+}
+
 // Stable random numbers: every texel seeds its own sequence from its index, so baking the
 // same map twice gives exactly the same picture (no shimmering between rebakes).
 static inline uint32_t gi_hash( uint32_t x ) {
@@ -3894,11 +3902,15 @@ static uint64_t gi_bsp_hash( const byte *fileBase, const dheader_t *header ) {
 	return h;
 }
 
+// Bump this when only the live bake (r_devoGI_live 1) changes: its files are baked
+// again, the full bake's stay valid. 2: coloured lamps are no longer baked in.
+#define DEVOGI_LIVE_REVISION	2
+
 static uint64_t gi_settings_hash( int scale ) {
 	char buf[320];
 	Com_sprintf( buf, sizeof( buf ), "aa%g sh%g v%d ex%g r%d b%d i%g s%g ls%g lo%d sb%g e%d ao%g aod%g aor%g sat%g x%d rl%d gl%g lh%llx", g_set.aa, g_set.sheen, DEVOGI_VERSION, g_set.exposure,
 		Com_Clampi( 8, 1024, g_set.rays ), Com_Clampi( 1, 16, g_set.bounces ) * 100 + Com_Clampi( 1, 32, g_set.liveBounces ),
-		g_set.intensity, g_set.sky, g_set.liveSky, g_set.liveOnly ? 1 : 0, g_set.sunBounceBlur, g_set.entityLights,
+		g_set.intensity, g_set.sky, g_set.liveSky, g_set.liveOnly ? DEVOGI_LIVE_REVISION : 0, g_set.sunBounceBlur, g_set.entityLights,
 		g_set.ao, g_set.aoDirect, g_set.aoDistance, g_set.saturation, scale,
 		g_set.relight, g_set.glow, (unsigned long long)( g_set.relight ? gi_lightsHash : 0 ) );
 	return gi_fnv( 1469598103934665603ULL, buf, strlen( buf ) );
@@ -4418,6 +4430,11 @@ static void gi_build_lamp_masks( const giBake &bake, dgLiveLighting &live ) {
 	for ( int i = 0; i < nf; i++ )
 		live.fixtures[i].maskChannel = -1;
 	std::vector<char> done( nf, 0 );
+	// coloured lamps choose first: high spec draws them live in full, and their mask is
+	// what keeps them from shining through walls
+	std::vector<char> colored( nf, 0 );
+	for ( int i = 0; i < nf; i++ )
+		colored[i] = DG_FixtureColored( live.fixtures[i] ) ? 1 : 0;
 	int withChannel = 0;
 	for ( int step = 0; step < nf; step++ ) {
 		// the uncoloured lamp whose neighbours use the most different channels
@@ -4433,6 +4450,13 @@ static void gi_build_lamp_masks( const giBake &bake, dgLiveLighting &live ) {
 					used[c] = true;
 					sat++;
 				}
+			}
+			if ( pick >= 0 && colored[pick] != colored[i] ) {
+				if ( colored[i] ) {
+					pick = i;
+					pickSat = sat;
+				}
+				continue;
 			}
 			if ( sat > pickSat || ( sat == pickSat && lamps[i].power > lamps[pick].power ) ) {
 				pick = i;
@@ -4785,6 +4809,7 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 	std::vector<float> origLuma;		// old lightmap brightness per texel
 	std::vector<float> groupScale;		// calibrated strength per light group
 	std::vector<gvec3> sunDirect;		// the sun's share of each texel's direct light (calibrated)
+	std::vector<gvec3> coloredDirect;	// the coloured lamps' share (high spec draws them live)
 	if ( relight ) {
 		gi_build_light_grid( lightGrid );
 		const size_t n = bake.texels.size();
@@ -4801,7 +4826,14 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 		gi_progress_stage( "Direct light and soft shadows", 0.12f, 0.33f );
 		std::vector<gvec3> directLight( n );
 		sunDirect.assign( n, gvec3() );
+		coloredDirect.assign( n, gvec3() );
 		bake.sunVis.assign( n, 0.0f );
+		// which calibration groups are coloured lamps (every lamp of a group shares a colour)
+		std::vector<char> groupColored( groupScale.size(), 0 );
+		for ( const devoLight_t &lt : gi_lights )
+			if ( lt.group >= 0 && lt.group < (int)groupColored.size() && lt.group != gi_sunGroup
+				&& gi_is_colored( lt.color.x, lt.color.y, lt.color.z ) )
+				groupColored[lt.group] = 1;
 		// the sun's visibility: what arrived, divided by what would arrive with nothing in
 		// the way (a real-time renderer draws the sun live and uses this as its shadow)
 		auto sunVisOf = [&]( int i, const gvec3 &sun ) {
@@ -4819,6 +4851,8 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 				directLight[i] += rgb * groupScale[group];
 				if ( group == gi_sunGroup )
 					sunRaw[i] += rgb;
+				else if ( groupColored[group] )
+					coloredDirect[i] += rgb * groupScale[group];
 			} );
 			for ( size_t i = 0; i < n; i++ ) {
 				sunDirect[i] = sunRaw[i] * groupScale[gi_sunGroup];
@@ -4829,14 +4863,17 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 				const giTexel &tx = bake.texels[i];
 				if ( tx.styleValue != 0 )
 					return;	// switchable lamps keep their original light
-				gvec3 total, sun;
+				gvec3 total, sun, colored;
 				gi_direct_point( bake, lightGrid, tx.pos, tx.normal, tx.faceNormal, (uint32_t)i * 2654435761u, tx.size,
 					[&]( int group, const gvec3 &rgb ) {
 						total += rgb * groupScale[group];
 						if ( group == gi_sunGroup )
 							sun += rgb;
+						else if ( groupColored[group] )
+							colored += rgb * groupScale[group];
 					} );
 				directLight[i] = total;
+				coloredDirect[i] = colored;
 				sunDirect[i] = sun * groupScale[gi_sunGroup];
 				bake.sunVis[i] = sunVisOf( i, sun );
 			}, true );
@@ -4850,6 +4887,7 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 		// gentle world-space smoothing: soft, anti-aliased shadow edges with no polygon seams
 		gi_world_smooth( bake, texelHash, directLight, directRadius );
 		gi_world_smooth( bake, texelHash, sunDirect, directRadius );
+		gi_world_smooth( bake, texelHash, coloredDirect, directRadius );
 
 		for ( size_t i = 0; i < n; i++ ) {
 			const giTexel &tx = bake.texels[i];
@@ -5022,19 +5060,23 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 		bake.indirect.swap( liveLayer );	// the live layer is what gi_build_bounce_maps stores
 
 		// the lamps' direct light (all direct light but the sun's) goes into the live layer
-		// too: lamps far away are drawn from it, with their soft baked shadows
+		// too: lamps far away are drawn from it, with their soft baked shadows. Coloured
+		// lamps stay out: high spec draws them live in full (their bounce light stays baked)
 		bake.liveDirect.assign( bake.texels.size(), gvec3() );
 		for ( size_t i = 0; i < bake.texels.size() && i < sunDirect.size(); i++ ) {
 			const giTexel &tx = bake.texels[i];
 			if ( tx.styleValue != 0 )
 				continue;
 			const float *px = &fullDirect[( ( (size_t)tx.page * DEVOGI_LM_SIZE + tx.y ) * DEVOGI_LM_SIZE + tx.x ) * 3];
-			bake.liveDirect[i] = gvec3( Q_max( 0.0f, px[0] - sunDirect[i].x ), Q_max( 0.0f, px[1] - sunDirect[i].y ),
-				Q_max( 0.0f, px[2] - sunDirect[i].z ) );
+			const gvec3 c = i < coloredDirect.size() ? coloredDirect[i] : gvec3();
+			bake.liveDirect[i] = gvec3( Q_max( 0.0f, px[0] - sunDirect[i].x - c.x ), Q_max( 0.0f, px[1] - sunDirect[i].y - c.y ),
+				Q_max( 0.0f, px[2] - sunDirect[i].z - c.z ) );
 		}
 	}
 	sunDirect.clear();
 	sunDirect.shrink_to_fit();
+	coloredDirect.clear();
+	coloredDirect.shrink_to_fit();
 
 	// buried texels (a floor running on under a wall) take the light of their nearest
 	// visible neighbour, in the full bake and in the live bounce light
@@ -5996,6 +6038,11 @@ static bool gi_read_sections( const byte *p, const byte *end, dgResult &result )
 }
 
 // only accepts a file made for exactly this BSP, these settings and this resolution
+bool DG_FixtureColored( const dgFixture &fx )
+{
+	return gi_is_colored( fx.rgb[0], fx.rgb[1], fx.rgb[2] );
+}
+
 size_t DG_CacheHeaderSize( void )
 {
 	return sizeof( devogiHeader_t );

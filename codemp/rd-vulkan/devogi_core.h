@@ -225,4 +225,9 @@ bool					DG_ReadCache( const uint8_t *data, size_t length, const uint8_t *bsp,
 // A quick look at just the start of a .devogi file: was it made by this version, for
 // this map and these settings? Lets a host check a file without reading all of it.
 size_t					DG_CacheHeaderSize( void );
+
+// A clearly coloured lamp (red, blue, green...), not a white or warm-white one. High
+// spec draws these live in full - the bake leaves their direct light out of the live
+// layer and gives them mask channels first - instead of baking them like white lamps.
+bool					DG_FixtureColored( const dgFixture &fx );
 bool					DG_CacheHeaderMatches( const uint8_t *head, size_t length, uint64_t bspHash, uint64_t settingsHash );

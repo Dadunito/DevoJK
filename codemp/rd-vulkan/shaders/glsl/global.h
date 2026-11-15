@@ -242,8 +242,9 @@ STRUCT (
 
     // origin.w is the light type: 0 = the game's dynamic lights (q3 falloff),
     // 1 = a DevoGI glowing lamp surface (faces normal.xyz), 2 = a DevoGI lamp that
-    // shines everywhere. For DevoGI lamps normal.w softens the light right at the
-    // lamp (its area), and the light fades out smoothly before radius.
+    // shines everywhere; 4 and 5 are the same for coloured lamps, which high spec draws
+    // live in full instead of baking them. For DevoGI lamps normal.w softens the light
+    // right at the lamp (its area), and the light fades out smoothly before radius.
     // origin.w carries more, packed as type + 10 * ( mask channel + 1 ) +
     // 100 * ( shadow slot + 1 ): the lamp's channel in the baked lamp shadow masks and
     // its near-lamp shadow slot (devo_lamp_shadow), each 0 when it has none.

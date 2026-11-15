@@ -98,7 +98,8 @@
 		{
 			float cosE = 1.0;
 			// origin.w = type + 10 * ( mask channel + 1 ): type 1 is a glowing surface
-			if ( mod( light.origin.w, 10.0 ) < 1.5 ) {
+			float type = mod( light.origin.w, 10.0 );
+			if ( type < 1.5 || ( type > 3.5 && type < 4.5 ) ) {
 				cosE = -dot( light.normal.xyz, L );
 				if ( cosE <= 0.0 )
 					return 0.0;		// behind the glowing surface
@@ -304,10 +305,14 @@
 				if ( devoLamp && devoMaskMode ) {
 					float channel = floor( mod( light.origin.w, 100.0 ) / 10.0 ) - 1.0;
 					float vis;
+					bool colored = mod( light.origin.w, 10.0 ) > 3.5;
 					if ( channel < 0.0 ) {
-						if ( !nearLamp )
+						if ( colored )
+							vis = 1.0;		// coloured: drawn live everywhere, even without a mask
+						else if ( !nearLamp )
 							continue;
-						vis = nearStrength;
+						else
+							vis = nearStrength;
 					} else {
 						// channels 0-3 are the mask's first layer, 4-7 its second
 						vec4 layer = channel < 3.5 ? devoMask : devoMask2;
@@ -317,6 +322,12 @@
 					if ( vis <= 0.0 )
 						continue;
 					vec3 lit = light.color * ( attenuation * NL * vis );
+					if ( colored ) {
+						// a coloured lamp isn't in the lightmap: all of its light is drawn here,
+						// inside its baked shadows (the mask) and the shadows of moving things
+						outColor += lit * ( diffuse + CalcSpecular(specular, NH, NL, NE, LH, VH, roughness) ) * moverVis;
+						continue;
+					}
 					outColor += lit * CalcSpecular(specular, NH, NL, NE, LH, VH, roughness) * moverVis;
 					// where a mover blocks the lamp, take its baked light back out
 					// (the same amount, see CalcDevoLampAttenuation): that's the shadow

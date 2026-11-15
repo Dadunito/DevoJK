@@ -1026,6 +1026,9 @@ void R_DevoGI_FillLights( const trRefdef_t *refdef, vkUniformLight_t *u )
 		VectorCopy( fx.origin, e.origin );
 		const bool area = fx.halfU > 0 || fx.halfV > 0;
 		e.origin[3] = area ? 1.0f : 2.0f;	// light type: 1 = glowing surface, 2 = shines everywhere
+		// a coloured lamp (types 4 and 5): high spec draws it live in full, it isn't baked
+		if ( gi_live.lampsBaked && DG_FixtureColored( fx ) )
+			e.origin[3] += 3.0f;
 		// lamp tiers: its channel in the baked lamp shadow masks, as type + 10 * ( channel + 1 )
 		if ( gi_live.lampsBaked && fx.maskChannel >= 0 && fx.maskChannel < dgLiveLighting::maskLayers * 4 )
 			e.origin[3] += 10.0f * ( fx.maskChannel + 1 );
