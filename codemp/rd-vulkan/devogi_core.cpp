@@ -3905,7 +3905,8 @@ static uint64_t gi_bsp_hash( const byte *fileBase, const dheader_t *header ) {
 // Bump this when only the live bake (r_devoGI_live 1) changes: its files are baked
 // again, the full bake's stay valid. 2: coloured lamps are no longer baked in.
 // 3: not even their bounce light; the strong live sky only in the shade; softer masks.
-#define DEVOGI_LIVE_REVISION	3
+// 4: the shade test blurred wide (no bright rings).
+#define DEVOGI_LIVE_REVISION	4
 
 static uint64_t gi_settings_hash( int scale ) {
 	char buf[512];
@@ -5109,11 +5110,18 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 		// exposure match, which then darkened all live light, the sun included)
 		const float skyBack = 1.0f / Q_max( 1.0f, g_set.liveSky );
 		std::vector<float> liveLayer = bake.indirect;
+		// how open each spot is to the sky (its ambient occlusion), blurred wide: per texel
+		// it is a little blotchy, and a sharp cut on it drew bright rings on shaded walls
+		std::vector<gvec3> openness( bake.texels.size() );
+		for ( size_t i = 0; i < bake.texels.size(); i++ )
+			openness[i].x = Com_Clamp( 0.0f, 1.0f, bake.indirect[i * 4 + 3] );
+		gi_wide_soften( bake, texelPos, openness, 48.0f, stride * 4 );
 		for ( size_t i = 0; i < bake.texels.size(); i++ ) {
 			// the strong live sky is there to light the shade: a surface open to the whole
 			// sky (a rooftop, the top of a tower) gets the normal sky instead, or it would
-			// come out flat and far too bright with the live sun on top
-			const float open = Com_Clamp( 0.0f, 1.0f, ( bake.indirect[i * 4 + 3] - 0.8f ) / 0.2f );
+			// come out flat and far too bright with the live sun on top - fading in gently
+			// from 60% open to fully open
+			const float open = Com_Clamp( 0.0f, 1.0f, ( openness[i].x - 0.6f ) / 0.4f );
 			const float skyScale = 1.0f + ( skyBack - 1.0f ) * open * open * ( 3.0f - 2.0f * open );
 			liveLayer[i * 4 + 0] = liveLayer[i * 4 + 0] * skyScale + sunBounce[i].x;
 			liveLayer[i * 4 + 1] = liveLayer[i * 4 + 1] * skyScale + sunBounce[i].y;
