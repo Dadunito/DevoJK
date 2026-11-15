@@ -3148,6 +3148,12 @@ go (a few million rays per batch); on the CPU every point is done on its own. Bo
 give the same result. Progress is reported for big runs.
 */
 static bool gi_gpuActive;	// the GPU tracer is running for this bake
+static bool gi_gpuDirect;	// direct light on the GPU too (DG_SetGpuDirect)
+
+void DG_SetGpuDirect( bool on )
+{
+	gi_gpuDirect = on;
+}
 static float gi_bounceBlurRadius;	// how wide the bounce light is blurred (gi_blur_grid), in game units
 
 static void gi_gather_many( const giBake &bake, const std::vector<giGatherJob> &jobs, bool report ) {
@@ -3209,6 +3215,392 @@ static void gi_trace_many( const giBake &bake, const dgGpuRay *rays, dgGpuHit *h
 		const int n = (int)Q_min( (size_t)chunk, count - first );
 		gi_trace_cpu( bake.scene, rays + first, hits + first, n, anyHit );
 	} );
+}
+
+/*
+===========================================================================
+Direct light on the GPU
+
+The same light as gi_direct_point - the same lights per texel, the same four probe
+rays, the same full set of samples in a penumbra, the same exact rectangle formula
+and sun disc - but with the rays traced in big batches on the graphics card instead
+of one at a time on the processor. That needs the work split into rounds, because a
+penumbra is only known once the probes are back:
+
+  1. start points: every texel gets a 3 x 3 grid of start points spread over its
+     area, each pulled back from any wall right next to it (gi_direct_point does
+     this test for every single sample);
+  2. probes: 4 rays per light (the full set right away very close to a lamp) and 4
+     towards the sun;
+  3. penumbras: where a light's probes disagree, its full set of samples.
+
+emit( texel, group, rgb ) is called once per texel and light, like gi_direct_point's.
+===========================================================================
+*/
+template<typename EMIT>
+static void gi_direct_gpu( const giBake &bake, const giLightGrid &grid, EMIT emit ) {
+	const giScene &scene = bake.scene;
+	const int numTexels = (int)bake.texels.size();
+	const float aa = Com_Clamp( 0.25f, 4.0f, g_set.aa );
+	const int G = 3;					// start points per texel side
+	const int blockTexels = 1024;		// one CPU thread builds the rays of one block
+	const int chunkBlocks = 128;		// blocks per GPU batch
+	const float pullBack = DEVOGI_RAY_TMIN + 0.5f;
+
+	// one light seen from one texel, while its rays are out
+	struct pair_t {
+		int		texel;		// in the block
+		int		light;
+		float	sum, all;	// light of the samples that got through / of all of them
+		int		vis, tested, taken;
+		bool	full;		// very close to the lamp: the full set from the start
+	};
+	struct sun_t {
+		int		texel;
+		float	cosS;
+		int		visible, samples;
+	};
+	// everything one block of texels has in flight
+	struct block_t {
+		int							first, count;
+		std::vector<gvec3>			starts;
+		std::vector<uint32_t>		rng;
+		std::vector<pair_t>			pairs;
+		std::vector<sun_t>			suns;
+		std::vector<dgGpuRay>		rays;		// this round's rays
+		std::vector<int>			owner;		// ray -> start point / pair / sun entry
+		std::vector<float>			contrib;	// lamp ray -> its share of light
+		size_t						rayBase;	// where its rays start in the batch
+	};
+
+	gvec3 st, sb;
+	gi_basis( gi_sunDir, st, sb );
+
+	std::vector<block_t> blocks;
+	std::vector<dgGpuRay> batch;
+	std::vector<dgGpuHit> hits;
+
+	// gathers every block's rays into one batch, traces it, and hands each block its hits
+	auto traceRound = [&]( bool anyHit, const std::function<void( block_t &, const dgGpuHit * )> &useHits ) {
+		size_t total = 0;
+		for ( block_t &b : blocks ) {
+			b.rayBase = total;
+			total += b.rays.size();
+		}
+		batch.resize( total );
+		for ( block_t &b : blocks )
+			if ( !b.rays.empty() )
+				memcpy( &batch[b.rayBase], b.rays.data(), b.rays.size() * sizeof( dgGpuRay ) );
+		hits.resize( total );
+		if ( total )
+			gi_trace_many( bake, batch.data(), hits.data(), total, anyHit );
+		gi_parallel_for( (int)blocks.size(), [&]( int bi ) {
+			block_t &b = blocks[bi];
+			useHits( b, &hits[b.rayBase] );
+			b.rays.clear();
+			b.owner.clear();
+			b.contrib.clear();
+		} );
+	};
+
+	for ( int chunkFirst = 0; chunkFirst < numTexels; chunkFirst += blockTexels * chunkBlocks ) {
+		const int chunkCount = Q_min( blockTexels * chunkBlocks, numTexels - chunkFirst );
+		blocks.assign( ( chunkCount + blockTexels - 1 ) / blockTexels, block_t() );
+		for ( int bi = 0; bi < (int)blocks.size(); bi++ ) {
+			blocks[bi].first = chunkFirst + bi * blockTexels;
+			blocks[bi].count = Q_min( blockTexels, chunkFirst + chunkCount - blocks[bi].first );
+		}
+
+		// ---- 1. start points, pulled back from any wall right next to the texel ----
+		gi_parallel_for( (int)blocks.size(), [&]( int bi ) {
+			block_t &b = blocks[bi];
+			b.starts.assign( (size_t)b.count * G * G, gvec3() );
+			for ( int t = 0; t < b.count; t++ ) {
+				const giTexel &tx = bake.texels[b.first + t];
+				const gvec3 o = tx.pos + tx.faceNormal * 1.0f;
+				gvec3 ft, fb;
+				gi_basis( tx.faceNormal, ft, fb );
+				const float fp = tx.size * aa;
+				for ( int g = 0; g < G * G; g++ ) {
+					b.starts[(size_t)t * G * G + g] = o;
+					const float ux = ( ( g % G ) + 0.5f ) / G - 0.5f, uy = ( ( g / G ) + 0.5f ) / G - 0.5f;
+					const gvec3 off = ft * ( ux * fp ) + fb * ( uy * fp );
+					const float len = sqrtf( gdot( off, off ) );
+					if ( fp <= 0 || len < 0.01f )
+						continue;
+					const gvec3 dir = off * ( 1.0f / len );
+					dgGpuRay r;
+					r.origin[0] = o.x; r.origin[1] = o.y; r.origin[2] = o.z;
+					r.dir[0] = dir.x; r.dir[1] = dir.y; r.dir[2] = dir.z;
+					r.tmin = 0.01f;
+					r.tmax = len + pullBack;
+					b.rays.push_back( r );
+					b.owner.push_back( t * G * G + g );
+				}
+			}
+		} );
+		traceRound( false, [&]( block_t &b, const dgGpuHit *h ) {
+			for ( size_t k = 0; k < b.rays.size(); k++ ) {
+				const dgGpuRay &r = b.rays[k];
+				const gvec3 o( r.origin[0], r.origin[1], r.origin[2] ), dir( r.dir[0], r.dir[1], r.dir[2] );
+				const float len = r.tmax - pullBack;
+				// the same rule as gi_direct_point: stay a full ray-start distance clear of a wall
+				const float keep = h[k].tri >= 0 ? Q_min( len, h[k].t - pullBack ) : len;
+				b.starts[b.owner[k]] = keep > 0.01f ? o + dir * keep : o;
+			}
+		} );
+
+		// one sample of pair 'pi' from spot (ux, uy) of the texel to spot (jx, jy) of the
+		// lamp; a ray is queued unless the sample is decided without one
+		auto startAt = []( const block_t &b, int t, float ux, float uy ) -> const gvec3 & {
+			const int gx = Com_Clampi( 0, 2, (int)( ( ux + 0.5f ) * 3 ) );
+			const int gy = Com_Clampi( 0, 2, (int)( ( uy + 0.5f ) * 3 ) );
+			return b.starts[(size_t)t * 9 + gy * 3 + gx];
+		};
+		auto lampSample = [&]( block_t &b, int pi, float ux, float uy, float jx, float jy ) {
+			pair_t &p = b.pairs[pi];
+			const devoLight_t &lt = gi_lights[p.light];
+			const giTexel &tx = bake.texels[b.first + p.texel];
+			const bool hasRect = lt.size > 0 && lt.halfU > 0;
+			gvec3 target = lt.origin;
+			if ( hasRect )
+				target = lt.rectCentre + lt.normal * 1.0f + lt.axisU * ( jx * 2.0f * lt.halfU ) + lt.axisV * ( jy * 2.0f * lt.halfV );
+			else if ( lt.size > 0 ) {
+				gvec3 et, eb;
+				gi_basis( lt.normal, et, eb );
+				target += et * ( jx * lt.size ) + eb * ( jy * lt.size );
+			}
+			const gvec3 &so = startAt( b, p.texel, ux, uy );
+			gvec3 Ls = target - so;
+			const float ds2 = gdot( Ls, Ls );
+			if ( ds2 < 1.0f )
+				return;
+			const float ds = sqrtf( ds2 );
+			Ls = Ls * ( 1.0f / ds );
+			const float cr = gdot( tx.normal, Ls );
+			const float ce = lt.size > 0 ? -gdot( lt.normal, Ls ) : 1.0f;
+			if ( cr <= 0 || ce <= 0 )
+				return;
+			p.tested++;
+			const float c = lt.photons * cr * ce / Q_max( ds2, 16.0f );
+			p.all += c;
+			const float clearance = hasRect ? 0.5f : 4.0f + lt.size * 0.25f;
+			if ( ds - clearance <= DEVOGI_RAY_TMIN ) {
+				p.sum += c;
+				p.vis++;
+				return;
+			}
+			dgGpuRay r;
+			r.origin[0] = so.x; r.origin[1] = so.y; r.origin[2] = so.z;
+			r.dir[0] = Ls.x; r.dir[1] = Ls.y; r.dir[2] = Ls.z;
+			r.tmin = DEVOGI_RAY_TMIN;
+			r.tmax = ds - clearance;
+			b.rays.push_back( r );
+			b.owner.push_back( pi );
+			b.contrib.push_back( c );
+		};
+		// the full set of samples, evenly spread over texel and lamp (as gi_direct_point)
+		auto fullSet = [&]( block_t &b, int pi ) {
+			pair_t &p = b.pairs[pi];
+			const devoLight_t &lt = gi_lights[p.light];
+			const giTexel &tx = bake.texels[b.first + p.texel];
+			int samples = 4;
+			if ( lt.size > 0 ) {
+				const gvec3 L = lt.origin - ( tx.pos + tx.faceNormal );
+				const float d = sqrtf( gdot( L, L ) );
+				if ( d < lt.size * 2.0f || d < 48.0f ) samples = 36;
+				else if ( d < lt.size * 4.0f ) samples = 16;
+				else if ( d < lt.size * 8.0f ) samples = 9;
+			}
+			const int strata = (int)ceilf( sqrtf( (float)samples ) );
+			const uint32_t shuffle = gi_hash( (uint32_t)( b.first + p.texel ) * 2654435761u ^ (uint32_t)p.light );
+			uint32_t &rng = b.rng[p.texel];
+			for ( int s = 0; s < samples; s++, b.pairs[pi].taken++ ) {
+				const int t = (int)( ( (uint32_t)s * 7u + shuffle ) % (uint32_t)samples );
+				const float ux = ( ( t % strata ) + gi_rand( rng ) ) / strata - 0.5f;
+				const float uy = ( ( ( t / strata ) % strata ) + gi_rand( rng ) ) / strata - 0.5f;
+				const float jx = lt.size > 0 ? ( ( s % strata ) + gi_rand( rng ) ) / strata - 0.5f : 0.0f;
+				const float jy = lt.size > 0 ? ( ( ( s / strata ) % strata ) + gi_rand( rng ) ) / strata - 0.5f : 0.0f;
+				lampSample( b, pi, ux, uy, jx, jy );
+			}
+		};
+		auto sunRay = [&]( block_t &b, int si, float ux, float uy, float jx, float jy ) {
+			float dx, dy;
+			gi_sun_disc( jx, jy, dx, dy );
+			const gvec3 dir = gnorm( gi_sunDir + st * dx + sb * dy );
+			const gvec3 &so = startAt( b, b.suns[si].texel, ux, uy );
+			dgGpuRay r;
+			r.origin[0] = so.x; r.origin[1] = so.y; r.origin[2] = so.z;
+			r.dir[0] = dir.x; r.dir[1] = dir.y; r.dir[2] = dir.z;
+			r.tmin = DEVOGI_RAY_TMIN;
+			r.tmax = 16384.0f;
+			b.rays.push_back( r );
+			b.owner.push_back( si );
+		};
+		// sunlight arrives if the ray leaves the map or reaches a sky surface
+		auto sunSeen = [&]( const dgGpuHit &h ) {
+			return h.tri < 0 || scene.surfs[scene.tris[h.tri].surf].sky;
+		};
+		auto lampHits = [&]( block_t &b, const dgGpuHit *h ) {
+			for ( size_t k = 0; k < b.rays.size(); k++ ) {
+				if ( h[k].tri < 0 ) {
+					b.pairs[b.owner[k]].sum += b.contrib[k];
+					b.pairs[b.owner[k]].vis++;
+				}
+			}
+		};
+		auto sunHits = [&]( block_t &b, const dgGpuHit *h ) {
+			for ( size_t k = 0; k < b.rays.size(); k++ )
+				if ( sunSeen( h[k] ) )
+					b.suns[b.owner[k]].visible++;
+		};
+
+		// ---- 2. probes: 4 per light (or the full set right by a lamp) ----
+		gi_parallel_for( (int)blocks.size(), [&]( int bi ) {
+			block_t &b = blocks[bi];
+			b.rng.assign( b.count, 0 );
+			for ( int t = 0; t < b.count; t++ ) {
+				const giTexel &tx = bake.texels[b.first + t];
+				if ( tx.styleValue != 0 || !grid.nx )
+					continue;	// switchable lamps keep their original light
+				b.rng[t] = gi_hash( (uint32_t)( b.first + t ) * 2654435761u ^ 0xA5A5A5A5u );
+				const gvec3 o = tx.pos + tx.faceNormal * 1.0f;
+				const int cx = (int)( ( tx.pos.x - grid.origin.x ) / grid.cell );
+				const int cy = (int)( ( tx.pos.y - grid.origin.y ) / grid.cell );
+				const int cz = (int)( ( tx.pos.z - grid.origin.z ) / grid.cell );
+				if ( cx < 0 || cy < 0 || cz < 0 || cx >= grid.nx || cy >= grid.ny || cz >= grid.nz )
+					continue;
+				for ( int li : grid.cells[( (size_t)cz * grid.ny + cy ) * grid.nx + cx] ) {
+					// the same tests as gi_direct_point: in reach, in front, strong enough
+					const devoLight_t &lt = gi_lights[li];
+					gvec3 L = lt.origin - o;
+					const float d2 = gdot( L, L );
+					if ( d2 > lt.radius * lt.radius || d2 < 1e-4f )
+						continue;
+					const float d = sqrtf( d2 );
+					L = L * ( 1.0f / d );
+					const bool nearPatch = lt.size > 0 && d < lt.size;
+					const float cosR = gdot( tx.normal, L );
+					if ( cosR <= 0 && !nearPatch )
+						continue;
+					float cosE = 1.0f;
+					if ( lt.size > 0 ) {
+						cosE = -gdot( lt.normal, L );
+						if ( cosE <= 0 && !nearPatch )
+							continue;
+					}
+					const float dd2 = Q_max( d2, lt.size * lt.size * 0.25f + 16.0f );
+					if ( !nearPatch && lt.photons * cosR * cosE / dd2 < 0.25f )
+						continue;
+					pair_t p = { t, li, 0, 0, 0, 0, 0, lt.size > 0 && ( d < lt.size * 2.0f || d < 48.0f ) };
+					b.pairs.push_back( p );
+					const int pi = (int)b.pairs.size() - 1;
+					if ( p.full ) {
+						fullSet( b, pi );
+						continue;
+					}
+					// from the texel's 4 quarters towards the lamp's 4 quarters
+					for ( int s = 0; s < 4; s++, b.pairs[pi].taken++ ) {
+						const float qx = ( ( s & 1 ) + gi_rand( b.rng[t] ) ) * 0.5f - 0.5f;
+						const float qy = ( ( s >> 1 ) + gi_rand( b.rng[t] ) ) * 0.5f - 0.5f;
+						const float jx = lt.size > 0 ? ( ( ( s >> 1 ) ^ 1 ) + gi_rand( b.rng[t] ) ) * 0.5f - 0.5f : 0.0f;
+						const float jy = lt.size > 0 ? ( ( s & 1 ) + gi_rand( b.rng[t] ) ) * 0.5f - 0.5f : 0.0f;
+						lampSample( b, pi, qx, qy, jx, jy );
+					}
+				}
+			}
+		} );
+		traceRound( true, lampHits );
+
+		// the sun's probes: from the texel's corners towards opposite edges of its disc
+		if ( gi_hasSun ) {
+			gi_parallel_for( (int)blocks.size(), [&]( int bi ) {
+				block_t &b = blocks[bi];
+				for ( int t = 0; t < b.count; t++ ) {
+					const giTexel &tx = bake.texels[b.first + t];
+					if ( tx.styleValue != 0 )
+						continue;
+					const float cosS = gdot( tx.normal, gi_sunDir );
+					if ( cosS <= 0 )
+						continue;
+					b.suns.push_back( { t, cosS, 0, 4 } );
+					const float px[4] = { -0.45f, 0.45f, -0.45f, 0.45f }, py[4] = { -0.45f, -0.45f, 0.45f, 0.45f };
+					for ( int s = 0; s < 4; s++ )
+						sunRay( b, (int)b.suns.size() - 1, px[s], py[s], -px[s], -py[s] );
+				}
+			} );
+			traceRound( false, sunHits );
+		}
+
+		// ---- 3. penumbras: where the probes disagree, the full set ----
+		gi_parallel_for( (int)blocks.size(), [&]( int bi ) {
+			block_t &b = blocks[bi];
+			const int n = (int)b.pairs.size();
+			for ( int pi = 0; pi < n; pi++ ) {
+				const pair_t &p = b.pairs[pi];
+				if ( !p.full && p.vis > 0 && p.vis < p.tested )
+					fullSet( b, pi );
+			}
+		} );
+		traceRound( true, lampHits );
+
+		if ( gi_hasSun ) {
+			gi_parallel_for( (int)blocks.size(), [&]( int bi ) {
+				block_t &b = blocks[bi];
+				const int g = 8;	// 8 x 8 samples over texel and disc
+				for ( int si = 0; si < (int)b.suns.size(); si++ ) {
+					sun_t &s = b.suns[si];
+					if ( s.visible == 0 || s.visible == 4 )
+						continue;
+					s.visible = 0;
+					s.samples = g * g;
+					uint32_t r = gi_hash( (uint32_t)( b.first + s.texel ) * 2654435761u ^ 0x51ED270Bu );
+					const uint32_t shuffle = gi_hash( r );
+					for ( int k = 0; k < g * g; k++ ) {
+						const int t = (int)( ( (uint32_t)k * 13u + shuffle ) % (uint32_t)( g * g ) );
+						const float ux = ( ( t % g ) + gi_rand( r ) ) / g - 0.5f;
+						const float uy = ( ( t / g ) + gi_rand( r ) ) / g - 0.5f;
+						const float jx = ( ( k % g ) + gi_rand( r ) ) / g - 0.5f;
+						const float jy = ( ( k / g ) + gi_rand( r ) ) / g - 0.5f;
+						sunRay( b, si, ux, uy, jx, jy );
+					}
+				}
+			} );
+			traceRound( false, sunHits );
+		}
+
+		// ---- the light itself (each block owns its texels, so this runs in parallel) ----
+		gi_parallel_for( (int)blocks.size(), [&]( int bi ) {
+			block_t &b = blocks[bi];
+			for ( const pair_t &p : b.pairs ) {
+				if ( p.sum <= 0 )
+					continue;
+				const devoLight_t &lt = gi_lights[p.light];
+				const giTexel &tx = bake.texels[b.first + p.texel];
+				const gvec3 o = tx.pos + tx.faceNormal * 1.0f;
+				if ( lt.size > 0 && lt.halfU > 0 ) {
+					// the exact light of the rectangle, times how much of it the samples saw
+					const gvec3 corner[4] = {
+						lt.rectCentre - lt.axisU * lt.halfU - lt.axisV * lt.halfV,
+						lt.rectCentre + lt.axisU * lt.halfU - lt.axisV * lt.halfV,
+						lt.rectCentre + lt.axisU * lt.halfU + lt.axisV * lt.halfV,
+						lt.rectCentre - lt.axisU * lt.halfU + lt.axisV * lt.halfV };
+					if ( gdot( o - lt.rectCentre, lt.normal ) <= 0 )
+						continue;	// behind the glowing surface
+					const float rectArea = 4.0f * lt.halfU * lt.halfV;
+					const float exact = lt.photons * 3.14159265f * gi_rect_form_factor( o, tx.normal, corner ) / rectArea;
+					emit( b.first + p.texel, lt.group, lt.color * ( exact * Q_min( 1.0f, p.sum / p.all ) ) );
+				} else {
+					emit( b.first + p.texel, lt.group, lt.color * ( p.sum / (float)Q_max( 1, p.taken ) ) );
+				}
+			}
+			for ( const sun_t &s : b.suns )
+				if ( s.visible )
+					emit( b.first + s.texel, gi_sunGroup, gi_sunColor * ( gi_sunIntensity * s.cosS * s.visible / (float)s.samples ) );
+		} );
+
+		gi_progress_draw( (float)( chunkFirst + chunkCount ) / numTexels, false );
+	}
 }
 
 /*
@@ -3915,10 +4307,11 @@ static void gi_build_fixtures( dgLiveLighting &live, float exposure, const std::
 Lamp shadow masks (live bake, see dgLiveLighting::lampsBaked). For every pixel of
 the live layer: which lamps light it most (up to four), and how much of each it
 sees - traced from the pixel to points spread over the lamp's glowing rectangle,
-so the masks are as soft as the baked shadows. Each lamp gets one of four channels;
-two lamps that light the same pixels never share one (the most powerful lamps
-choose first). A lamp left without a channel is simply never drawn live: its
-light stays the baked one.
+so the masks are as soft as the baked shadows. Each lamp gets one of eight channels
+(two RGBA layers); two lamps that light the same pixels never share one (the most
+powerful lamps choose first). Rows of strip lights overlap a lot, which is why four
+weren't enough. A lamp left without a channel is never drawn live: its light stays
+the baked one.
 */
 static void gi_build_lamp_masks( const giBake &bake, dgLiveLighting &live ) {
 	const int bs = live.bouncePageSize;
@@ -4012,13 +4405,14 @@ static void gi_build_lamp_masks( const giBake &bake, dgLiveLighting &live ) {
 		order[i] = i;
 	std::sort( order.begin(), order.end(), [&]( int a, int b ) { return lamps[a].power > lamps[b].power; } );
 	int withChannel = 0;
+	const int channels = dgLiveLighting::maskLayers * 4;
 	for ( int i : order ) {
-		bool used[4] = { false, false, false, false };
+		bool used[dgLiveLighting::maskLayers * 4] = {};
 		for ( int j = 0; j < nf; j++ )
 			if ( shares[(size_t)i * nf + j] && live.fixtures[j].maskChannel >= 0 )
 				used[live.fixtures[j].maskChannel] = true;
 		live.fixtures[i].maskChannel = -1;
-		for ( int c = 0; c < 4; c++ ) {
+		for ( int c = 0; c < channels; c++ ) {
 			if ( !used[c] ) {
 				live.fixtures[i].maskChannel = c;
 				withChannel++;
@@ -4028,7 +4422,7 @@ static void gi_build_lamp_masks( const giBake &bake, dgLiveLighting &live ) {
 	}
 
 	// 3. how much of each lamp a pixel sees: rays to points spread over the lamp
-	live.lampMask.assign( npix * 4, 0 );
+	live.lampMask.assign( npix * 4 * dgLiveLighting::maskLayers, 0 );
 	const int S = 8;		// 4 x 2 points over the rectangle (one for a point light)
 	const size_t chunkPix = 65536;
 	std::vector<dgGpuRay> rays;
@@ -4075,7 +4469,8 @@ static void gi_build_lamp_masks( const giBake &bake, dgLiveLighting &live ) {
 			for ( int s = 0; s < S; s++ )
 				if ( hits[g * S + s].tri < 0 )
 					seen++;
-			live.lampMask[owner[g].first * 4 + owner[g].second] = (uint8_t)( seen * 255 / S );
+			const int ch = owner[g].second;		// layer ch / 4, component ch % 4
+			live.lampMask[( (size_t)( ch / 4 ) * npix + owner[g].first ) * 4 + ch % 4] = (uint8_t)( seen * 255 / S );
 		}
 	}
 	dg_print( "DevoGI: lamp shadow masks: %d of %d lamps have a channel\n", withChannel, nf );
@@ -4369,26 +4764,47 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 		std::vector<gvec3> directLight( n );
 		sunDirect.assign( n, gvec3() );
 		bake.sunVis.assign( n, 0.0f );
-		gi_parallel_for( (int)n, [&]( int i ) {
-			const giTexel &tx = bake.texels[i];
-			if ( tx.styleValue != 0 )
-				return;	// switchable lamps keep their original light
-			gvec3 total, sun;
-			gi_direct_point( bake, lightGrid, tx.pos, tx.normal, tx.faceNormal, (uint32_t)i * 2654435761u, tx.size,
-				[&]( int group, const gvec3 &rgb ) {
-					total += rgb * groupScale[group];
-					if ( group == gi_sunGroup )
-						sun += rgb;
-				} );
-			directLight[i] = total;
-			sunDirect[i] = sun * groupScale[gi_sunGroup];
-			// the sun's visibility: what arrived, divided by what would arrive with nothing in
-			// the way (a real-time renderer draws the sun live and uses this as its shadow)
-			if ( gi_hasSun ) {
-				const float full = gi_luma( gi_sunColor ) * gi_sunIntensity * gdot( tx.normal, gi_sunDir );
-				bake.sunVis[i] = full > 1e-4f ? Com_Clamp( 0.0f, 1.0f, gi_luma( sun ) / full ) : 0.0f;
+		// the sun's visibility: what arrived, divided by what would arrive with nothing in
+		// the way (a real-time renderer draws the sun live and uses this as its shadow)
+		auto sunVisOf = [&]( int i, const gvec3 &sun ) {
+			if ( !gi_hasSun )
+				return 0.0f;
+			const float full = gi_luma( gi_sunColor ) * gi_sunIntensity * gdot( bake.texels[i].normal, gi_sunDir );
+			return full > 1e-4f ? Com_Clamp( 0.0f, 1.0f, gi_luma( sun ) / full ) : 0.0f;
+		};
+		const int directStart = dg_ms();
+		const bool directOnGpu = gi_gpuActive && gi_gpuDirect;
+		if ( directOnGpu ) {
+			// on the graphics card, in big batches of rays (see gi_direct_gpu)
+			std::vector<gvec3> sunRaw( n );
+			gi_direct_gpu( bake, lightGrid, [&]( int i, int group, const gvec3 &rgb ) {
+				directLight[i] += rgb * groupScale[group];
+				if ( group == gi_sunGroup )
+					sunRaw[i] += rgb;
+			} );
+			for ( size_t i = 0; i < n; i++ ) {
+				sunDirect[i] = sunRaw[i] * groupScale[gi_sunGroup];
+				bake.sunVis[i] = sunVisOf( (int)i, sunRaw[i] );
 			}
-		}, true );
+		} else {
+			gi_parallel_for( (int)n, [&]( int i ) {
+				const giTexel &tx = bake.texels[i];
+				if ( tx.styleValue != 0 )
+					return;	// switchable lamps keep their original light
+				gvec3 total, sun;
+				gi_direct_point( bake, lightGrid, tx.pos, tx.normal, tx.faceNormal, (uint32_t)i * 2654435761u, tx.size,
+					[&]( int group, const gvec3 &rgb ) {
+						total += rgb * groupScale[group];
+						if ( group == gi_sunGroup )
+							sun += rgb;
+					} );
+				directLight[i] = total;
+				sunDirect[i] = sun * groupScale[gi_sunGroup];
+				bake.sunVis[i] = sunVisOf( i, sun );
+			}, true );
+		}
+		dg_print( "DevoGI: direct light from %d lights done on the %s (%.1fs)\n", (int)gi_lights.size(),
+			directOnGpu ? "GPU" : "CPU", ( dg_ms() - directStart ) / 1000.0f );
 		debugSurf( "sun, before smoothing" );
 		gi_world_smooth( bake, texelHash, bake.sunVis, directRadius );
 		debugSurf( "sun, smoothed" );
@@ -4521,20 +4937,24 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 	if ( !liveOnly ) {
 		runChain( "Bounce light", bounces, done, bounces );
 	} else {
-		const int total = sunBounces + liveBounces;
+		// a map without a sun (indoors) has no sun bounce: that chain would bounce nothing
+		const int sunChain = gi_hasSun ? sunBounces : 0;
+		const int total = sunChain + liveBounces;
 		const std::vector<float> fullDirect = bake.direct;
 
 		// 2. the sun's bounce, alone
-		std::fill( bake.direct.begin(), bake.direct.end(), 0.0f );
-		addSun( 1.0f, true );
-		gi_gatherSky = gi_gatherGlow = gi_gatherModels = false;
-		runChain( "Sun bounce", sunBounces, done, total );
-		gi_gatherSky = gi_gatherGlow = gi_gatherModels = true;
 		std::vector<gvec3> sunBounce( bake.texels.size() );
-		for ( size_t i = 0; i < bake.texels.size(); i++ )
-			sunBounce[i] = gvec3( bake.indirect[i * 4], bake.indirect[i * 4 + 1], bake.indirect[i * 4 + 2] );
-		// pillow soft: spread it far along the surfaces
-		gi_wide_soften( bake, texelPos, sunBounce, Com_Clamp( 16.0f, 512.0f, g_set.sunBounceBlur ), stride * 4 );
+		if ( sunChain > 0 ) {
+			std::fill( bake.direct.begin(), bake.direct.end(), 0.0f );
+			addSun( 1.0f, true );
+			gi_gatherSky = gi_gatherGlow = gi_gatherModels = false;
+			runChain( "Sun bounce", sunChain, done, total );
+			gi_gatherSky = gi_gatherGlow = gi_gatherModels = true;
+			for ( size_t i = 0; i < bake.texels.size(); i++ )
+				sunBounce[i] = gvec3( bake.indirect[i * 4], bake.indirect[i * 4 + 1], bake.indirect[i * 4 + 2] );
+			// pillow soft: spread it far along the surfaces
+			gi_wide_soften( bake, texelPos, sunBounce, Com_Clamp( 16.0f, 512.0f, g_set.sunBounceBlur ), stride * 4 );
+		}
 
 		// 1. sky and lamps, without the sun
 		bake.direct = fullDirect;
@@ -5582,6 +6002,16 @@ bool DG_ReadCache( const byte *data, size_t length, const byte *bsp,
 	const byte *sections = p + outBytes + (size_t)h.numVertexColors * 4;
 	if ( !gi_read_sections( sections, data + length, result ) )
 		return false;
+	// files baked before the masks had two layers hold only the first (channels 0-3):
+	// the second stays empty, so they still load and work as they did
+	{
+		dgLiveLighting &live = result.live;
+		const size_t layer = live.bounce.size();	// one RGBA byte quad per bounce pixel
+		if ( layer > 0 && live.lampMask.size() == layer )
+			live.lampMask.resize( layer * dgLiveLighting::maskLayers, 0 );
+		else if ( !live.lampMask.empty() && live.lampMask.size() != layer * dgLiveLighting::maskLayers )
+			live.lampMask.clear();	// some other size: damaged, live lamps stay baked only
+	}
 	for ( const dgLightmapMove &m : result.lightmapMoves )
 		if ( m.surf < 0 || m.surf >= numSurfs || m.page < bspPages || m.page >= numPages || m.scale < 1 || m.scale > 8 )
 			return false;	// damaged

@@ -507,17 +507,22 @@ void main() {
 			
 		#ifdef VK_DLIGHT_GPU
 			// lamp tiers: on lightmapped surfaces the lamps' light is baked; live lamps add
-			// their highlights inside the baked lamp shadow masks (their own descriptor set)
-			vec4 devoMask = vec4( 1.0 );
+			// their highlights inside the baked lamp shadow masks (their own descriptor set).
+			// The mask image holds two layers of four channels, one above the other: each
+			// lookup stays half a pixel inside its own half, so the two never blend.
+			vec4 devoMask = vec4( 1.0 ), devoMask2 = vec4( 1.0 );
 			bool devoMaskMode = false;
 			#if defined(USE_LIGHTMAP) && defined(USE_TX1)
 				if ( devoLive && u_lights.devo_shadow_offset.w > 0.5 ) {
-					devoMask = texture( devo_mask_texture, frag_tex_coord1 );
+					float half_h = max( float( textureSize( devo_mask_texture, 0 ).y ) * 0.5, 1.0 );
+					float v = clamp( frag_tex_coord1.y, 0.5 / half_h, 1.0 - 0.5 / half_h ) * 0.5;
+					devoMask = texture( devo_mask_texture, vec2( frag_tex_coord1.x, v ) );
+					devoMask2 = texture( devo_mask_texture, vec2( frag_tex_coord1.x, v + 0.5 ) );
 					devoMaskMode = true;
 				}
 			#endif
 			out_color.rgb += CalcDynamicLightContribution(roughness, N, E, u_camera.viewOrigin.xyz, viewDir, NE, diffuse.rgb, specular.rgb, var_Normal.xyz,
-				devoSunVis, devoLive && devoAllowed, devoMask, devoMaskMode);
+				devoSunVis, devoLive && devoAllowed, devoMask, devoMask2, devoMaskMode);
 			// a mover's shadow subtracts baked lamp light, so stop at black
 			out_color.rgb = max( out_color.rgb, vec3( 0.0 ) );
 		#endif

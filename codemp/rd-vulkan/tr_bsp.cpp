@@ -466,15 +466,16 @@ static	void R_LoadLightmaps( world_t &worldData, lump_t *l, lump_t *surfs ) {
 					0, 0 );
 			}
 
-			// DevoGI live lighting: the lamps' shadow masks, an atlas laid out exactly like
-			// the lightmap atlas (filled page by page below)
-			if ( R_DevoGI_LampMask( 0, lightmapSize ) )
+			// DevoGI live lighting: the lamps' shadow masks, laid out exactly like the
+			// lightmap atlas - twice: channels 0-3 on top, channels 4-7 below (filled
+			// page by page below)
+			if ( R_DevoGI_LampMask( 0, lightmapSize, 0 ) )
 			{
 				tr.lightmaps[i]->devoMask = R_CreateImage(
 					va("_devomaskatlas%d", i),
 					NULL,
 					tr.lightmapAtlasSize[0],
-					tr.lightmapAtlasSize[1],
+					tr.lightmapAtlasSize[1] * 2,
 					DEVO_MASK_FLAGS,
 					0, 0 );
 			}
@@ -687,18 +688,28 @@ static	void R_LoadLightmaps( world_t &worldData, lump_t *l, lump_t *surfs ) {
 						lightmapFlags,
 						textureInternalFormat, 0 );
 
-				// DevoGI live lighting: this page's lamp shadow masks (RGBA, the same size and
-				// place as the lightmap), read by the shader where the deluxemap would be
-				const byte *devoMask = R_DevoGI_LampMask( i, lightmapWidth );
-				if ( devoMask && lightmapWidth * lightmapHeight * 4 <= imageSize ) {
-					Com_Memcpy( image, devoMask, lightmapWidth * lightmapHeight * 4 );
+				// DevoGI live lighting: this page's lamp shadow masks (the same size and place
+				// as the lightmap), two RGBA layers of four channels: layer 0 goes on top,
+				// layer 1 right below it (in the atlas: one atlas height lower)
+				const byte *devoMask0 = R_DevoGI_LampMask( i, lightmapWidth, 0 );
+				const byte *devoMask1 = R_DevoGI_LampMask( i, lightmapWidth, 1 );
+				if ( devoMask0 && devoMask1 ) {
+					const int layerBytes = lightmapWidth * lightmapHeight * 4;
 					if ( tr.worldInternalLightmapping ) {
-						if ( tr.lightmaps[lightmapnum]->devoMask )
-							vk_upload_image_data( tr.lightmaps[lightmapnum]->devoMask, xoff, yoff,
-								lightmapWidth, lightmapHeight, 1, image, lightmapWidth * lightmapHeight * 4, qtrue );
+						image_t *mask = tr.lightmaps[lightmapnum]->devoMask;
+						if ( mask && layerBytes <= imageSize ) {
+							Com_Memcpy( image, devoMask0, layerBytes );
+							vk_upload_image_data( mask, xoff, yoff, lightmapWidth, lightmapHeight, 1, image, layerBytes, qtrue );
+							Com_Memcpy( image, devoMask1, layerBytes );
+							vk_upload_image_data( mask, xoff, yoff + tr.lightmapAtlasSize[1], lightmapWidth, lightmapHeight, 1, image, layerBytes, qtrue );
+						}
 					} else {
-						tr.lightmaps[i]->devoMask = R_CreateImage( va( "*devomask%d", i ), image,
-							lightmapWidth, lightmapHeight, DEVO_MASK_FLAGS, 0, 0 );
+						byte *both = (byte *)Z_Malloc( layerBytes * 2, TAG_TEMP_WORKSPACE, qfalse );
+						Com_Memcpy( both, devoMask0, layerBytes );
+						Com_Memcpy( both + layerBytes, devoMask1, layerBytes );
+						tr.lightmaps[i]->devoMask = R_CreateImage( va( "*devomask%d", i ), both,
+							lightmapWidth, lightmapHeight * 2, DEVO_MASK_FLAGS, 0, 0 );
+						Z_Free( both );
 					}
 				}
 			}

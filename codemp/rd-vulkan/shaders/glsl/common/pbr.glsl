@@ -232,6 +232,7 @@
 			in float devoSunVis,
 			in bool devoAllowed,
 			in vec4 devoMask,
+			in vec4 devoMask2,
 			in bool devoMaskMode )
 		{
 			vec3 outColor = vec3(0.0);
@@ -298,7 +299,10 @@
 					float channel = floor( mod( light.origin.w, 100.0 ) / 10.0 ) - 1.0;
 					if ( channel < 0.0 )
 						continue;
-					float vis = channel < 0.5 ? devoMask.r : ( channel < 1.5 ? devoMask.g : ( channel < 2.5 ? devoMask.b : devoMask.a ) );
+					// channels 0-3 are the mask's first layer, 4-7 its second
+					vec4 layer = channel < 3.5 ? devoMask : devoMask2;
+					float c = mod( channel, 4.0 );
+					float vis = c < 0.5 ? layer.r : ( c < 1.5 ? layer.g : ( c < 2.5 ? layer.b : layer.a ) );
 					if ( vis <= 0.0 )
 						continue;
 					vec3 lit = light.color * ( attenuation * NL * vis );

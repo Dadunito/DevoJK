@@ -858,16 +858,20 @@ int R_DevoGI_LampShadowViews( viewParms_t *out, int maxViews )
 	return views;
 }
 
-// the lamp shadow masks of lightmap page 'page' (RGBA, size x size), while they
-// wait to be uploaded next to the lightmaps; NULL when there are none
-const byte *R_DevoGI_LampMask( int page, int size )
+// the lamp shadow masks of lightmap page 'page' (RGBA, size x size), one layer of
+// four channels at a time, while they wait to be uploaded next to the lightmaps;
+// NULL when there are none. The renderer stacks the layers in one image: layer 0 on
+// top, layer 1 below (see R_LoadLightmaps).
+const byte *R_DevoGI_LampMask( int page, int size, int layer )
 {
-	if ( !gi_liveActive || !gi_live.lampsBaked || size != gi_livePageSize || page < 0 || size <= 0 )
+	if ( !gi_liveActive || !gi_live.lampsBaked || size != gi_livePageSize || page < 0 || size <= 0
+		|| layer < 0 || layer >= dgLiveLighting::maskLayers )
 		return NULL;
 	const size_t pageBytes = (size_t)size * size * 4;
-	if ( (size_t)( page + 1 ) * pageBytes > gi_live.lampMask.size() )
+	const size_t layerBytes = gi_live.lampMask.size() / dgLiveLighting::maskLayers;
+	if ( (size_t)( page + 1 ) * pageBytes > layerBytes )
 		return NULL;
-	return &gi_live.lampMask[(size_t)page * pageBytes];
+	return &gi_live.lampMask[layer * layerBytes + (size_t)page * pageBytes];
 }
 
 void R_DevoGI_FreeLampMasks( void )
@@ -1006,7 +1010,7 @@ void R_DevoGI_FillLights( const trRefdef_t *refdef, vkUniformLight_t *u )
 		const bool area = fx.halfU > 0 || fx.halfV > 0;
 		e.origin[3] = area ? 1.0f : 2.0f;	// light type: 1 = glowing surface, 2 = shines everywhere
 		// lamp tiers: its channel in the baked lamp shadow masks, as type + 10 * ( channel + 1 )
-		if ( gi_live.lampsBaked && fx.maskChannel >= 0 && fx.maskChannel < 4 )
+		if ( gi_live.lampsBaked && fx.maskChannel >= 0 && fx.maskChannel < dgLiveLighting::maskLayers * 4 )
 			e.origin[3] += 10.0f * ( fx.maskChannel + 1 );
 		// near-lamp shadows: its slot, as + 100 * ( slot + 1 )
 		const int slot = lampSlot( fx.origin );

@@ -75,6 +75,11 @@ struct dgHost {
 // Must be called once before anything else.
 void		DG_SetHost( const dgHost *host );
 
+// Direct light on the graphics card too (off by default). The light is the same; it
+// is only faster on a strong dedicated GPU - on integrated graphics the processor's
+// threads keep up better with the many short shadow rays.
+void		DG_SetGpuDirect( bool on );
+
 /*
 Light sources. Call DG_ExtractLights once per map (the BSP file in memory, header
 first). It finds lamp shaders, glowing lamps, the sun and light entities.
@@ -118,7 +123,7 @@ struct dgFixture {
 	float	rgb[3];			// calibrated strength per colour channel
 	float	reach;			// distance where it stops mattering
 	int32_t	shader;			// BSP shader index it comes from, -1 for a light entity
-	int32_t	maskChannel;	// its channel (0-3) in the lamp shadow masks, -1: not in them
+	int32_t	maskChannel;	// its channel (0-7) in the lamp shadow masks, -1: not in them
 };
 
 /*
@@ -150,11 +155,13 @@ struct dgLiveLighting {
 	the live layer above (lampsBaked), so lamps never leak through walls or pop. A lamp
 	drawn live then adds only what the bake can't: its highlights, kept out of
 	shadow by lampMask - for every bounce-lightmap pixel (same layout as 'bounce'),
-	how much of each of up to four lamps it sees (RGBA = mask channels 0-3, 0..255;
-	each lamp's channel is dgFixture::maskChannel).
+	how much of each of up to four lamps it sees, 0..255. There are 8 channels in two
+	RGBA layers: all pages of layer 0 (channels 0-3) first, then all pages of layer 1
+	(channels 4-7). Each lamp's channel is dgFixture::maskChannel.
 	*/
 	bool					lampsBaked = false;
 	std::vector<uint8_t>	lampMask;
+	static const int		maskLayers = 2;	// RGBA layers in lampMask (4 channels each)
 	bool					hasSun = false;
 	float					sunDir[3] = { 0, 0, 1 };	// towards the sun
 	float					sunRgb[3] = { 0, 0, 0 };	// calibrated: light = sunRgb * cosR when lit
