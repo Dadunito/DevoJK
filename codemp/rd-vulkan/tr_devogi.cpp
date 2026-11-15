@@ -279,6 +279,7 @@ as it draws it (R_DevoGI_SunShadowDrawn) and the light list picks them up.
 struct giLampShadow {
 	vec3_t	origin;		// where the light is (matches its entry in the light list)
 	float	reach;
+	float	strength;	// 0..1: fades in from the edge of r_devoGI_lampShadowRange, no popping
 	int		tile[6];	// +X -X +Y -Y +Z -Z
 };
 static giLampShadow			gi_lampShadow[DEVO_LAMP_SHADOW_MAX];
@@ -782,11 +783,10 @@ int R_DevoGI_LampShadowViews( viewParms_t *out, int maxViews )
 		c.reach = reach;
 		cand.push_back( c );
 	};
-	for ( const dgFixture &fx : gi_live.fixtures ) {
-		if ( gi_live.lampsBaked && fx.maskChannel < 0 )
-			continue;	// a lamp kept baked only: it has no live light to shade
+	// every lamp may be one of the near ones - also those without a mask channel, which
+	// are otherwise kept baked only: up close they are drawn live too (see the shader)
+	for ( const dgFixture &fx : gi_live.fixtures )
 		consider( fx.origin, fx.reach );
-	}
 	for ( int i = 0; i < tr.refdef.num_dlights; i++ )
 		consider( tr.refdef.dlights[i].origin, tr.refdef.dlights[i].radius );
 	std::sort( cand.begin(), cand.end(), []( const candidate &a, const candidate &b ) { return a.dist < b.dist; } );
@@ -835,6 +835,9 @@ int R_DevoGI_LampShadowViews( viewParms_t *out, int maxViews )
 		giLampShadow &ls = gi_lampShadow[gi_numLampShadows++];
 		VectorCopy( c.origin, ls.origin );
 		ls.reach = c.reach;
+		// full strength within three quarters of the range, fading out towards its edge
+		// (measured to the nearest point of the light's reach, as the selection does)
+		ls.strength = Com_Clamp( 0.0f, 1.0f, ( range + c.reach - c.dist ) / ( range * 0.25f ) );
 		for ( int f = 0; f < 6; f++ ) {
 			ls.tile[f] = -1;
 			if ( !( sides & ( 1 << f ) ) )
@@ -950,7 +953,7 @@ void R_DevoGI_FillLights( const trRefdef_t *refdef, vkUniformLight_t *u )
 			// lookups pushed off the surface by one and a half shadow pixels, which grow
 			// with the distance from the light
 			more[2] = tileWorld * 1.5f;
-			more[3] = 0.0f;
+			more[3] = ls.strength;	// how strongly this light's live part shows (fade)
 		}
 		lampSlots = gi_numLampShadows;
 		u->devo_lamp_shadow_params[0] = (float)lampSlots;

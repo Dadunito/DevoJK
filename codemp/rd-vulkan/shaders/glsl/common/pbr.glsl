@@ -281,10 +281,14 @@
 				L /= sqrt(sqrLightDist);
 
 				// DevoGI near-lamp shadows: the shadows of moving things (see DevoLampShadow)
-				float moverVis = 1.0;
+				// (faded in by distance - strength 0..1 - so they never pop)
+				float moverVis = 1.0, nearStrength = 0.0;
 				float slot = floor( light.origin.w / 100.0 ) - 1.0;
-				if ( slot >= 0.0 && slot < u_lights.devo_lamp_shadow_params.x )
-					moverVis = DevoLampShadow( int( slot ), position, vertexNormal, light.origin.xyz );
+				bool nearLamp = slot >= 0.0 && slot < u_lights.devo_lamp_shadow_params.x;
+				if ( nearLamp ) {
+					nearStrength = u_lights.devo_lamp_shadow[int( slot ) * 2 + 1].w;
+					moverVis = mix( 1.0, DevoLampShadow( int( slot ), position, vertexNormal, light.origin.xyz ), nearStrength );
+				}
 
 				vec3  H  = normalize(L + E);
 				float NL = clamp(dot(N, L), 0.0, 1.0);
@@ -294,15 +298,22 @@
 
 				// On a lightmapped surface the lamp's light and soft shadows are already
 				// baked, so live it only adds its highlight, as far as the baked mask says
-				// this spot sees the lamp. Lamps without a mask channel stay baked only.
+				// this spot sees the lamp. A lamp without a mask channel stays baked only -
+				// unless it is one of the near lamps: up close it is drawn live too, taken as
+				// seen from everywhere it reaches, fading in with its strength.
 				if ( devoLamp && devoMaskMode ) {
 					float channel = floor( mod( light.origin.w, 100.0 ) / 10.0 ) - 1.0;
-					if ( channel < 0.0 )
-						continue;
-					// channels 0-3 are the mask's first layer, 4-7 its second
-					vec4 layer = channel < 3.5 ? devoMask : devoMask2;
-					float c = mod( channel, 4.0 );
-					float vis = c < 0.5 ? layer.r : ( c < 1.5 ? layer.g : ( c < 2.5 ? layer.b : layer.a ) );
+					float vis;
+					if ( channel < 0.0 ) {
+						if ( !nearLamp )
+							continue;
+						vis = nearStrength;
+					} else {
+						// channels 0-3 are the mask's first layer, 4-7 its second
+						vec4 layer = channel < 3.5 ? devoMask : devoMask2;
+						float c = mod( channel, 4.0 );
+						vis = c < 0.5 ? layer.r : ( c < 1.5 ? layer.g : ( c < 2.5 ? layer.b : layer.a ) );
+					}
 					if ( vis <= 0.0 )
 						continue;
 					vec3 lit = light.color * ( attenuation * NL * vis );
