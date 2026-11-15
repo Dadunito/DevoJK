@@ -6,7 +6,9 @@ A short guide to what DevoJK adds and how to set it up. Everything here can be c
 
 DevoGI gives every map new lighting. It works out how light bounces around the map (global illumination), with soft shadows, darker corners and colour picked up from the walls. All of it is worked out once per map, "baked", and saved next to the map as a `.devogi` file. After that, the map loads at normal speed with its new lighting.
 
-Maps made for rend2, which bring their own modern lighting, are left alone.
+### Rend2 maps are left alone
+
+Some maps are made for rend2 and bring their own modern lighting: HDR lightmaps (`maps/<map>/*.hdr`), a light grid and vertex light (`*.raw`), and reflection probes (`cubemaps/<map>/`). DevoGI switches itself off on those maps automatically, in both performance modes, and they keep the lighting their author made.
 
 ## Performance mode
 
@@ -55,6 +57,8 @@ Settings marked **(rebake)** in the menu change the baked file. A map bakes agai
 4. Press **Prebake**. The maps bake one after another, and **Stop** ends the bake that's running.
 
 It reads your settings from `EternalJK/eternaljk.cfg`, so the files it makes are exactly what the game expects. Change bake settings in the game first, then prebake.
+
+Rend2 maps show up in the list as **Rend2 map, \*.HDR and \*.RAW detected, not recommended to bake**, and **All** skips them. The game keeps their own lighting either way.
 
 ## Recommended settings
 
