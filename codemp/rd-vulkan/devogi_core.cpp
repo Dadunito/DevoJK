@@ -1227,6 +1227,36 @@ static void gi_sky_setup( const char *shaderName, const gvec3 &tint ) {
 				gi_sky.uniform = c;
 		}
 	}
+
+	/*
+	The colour of the sky light. A sky picture is blue where the light is not: the blue
+	of the sky is only part of the light outdoors, and lighting everything with it made
+	the whole level blue. So the sky keeps its brightness, direction by direction (a
+	bright horizon, clouds), but all of it takes one colour: the sun's, when the sky has a
+	sun, or else the sky's own average colour.
+	*/
+	gvec3 colour;
+	if ( gi_hasSun ) {
+		colour = gi_sunColor;
+	} else if ( gi_sky.images ) {
+		for ( int f = 0; f < 6; f++ )
+			for ( int y = 0; y < 16; y++ )
+				for ( int x = 0; x < 16; x++ )
+					colour += gi_sky.face[f][y][x];
+	} else {
+		colour = gi_sky.uniform;
+	}
+	const float cl = gi_luma( colour );
+	if ( cl > 1e-4f ) {
+		colour = colour * ( 1.0f / cl );	// brightness 1: the sky picture brings the brightness
+		if ( gi_sky.images ) {
+			for ( int f = 0; f < 6; f++ )
+				for ( int y = 0; y < 16; y++ )
+					for ( int x = 0; x < 16; x++ )
+						gi_sky.face[f][y][x] = colour * gi_luma( gi_sky.face[f][y][x] );
+		}
+		gi_sky.uniform = colour * gi_luma( gi_sky.uniform );
+	}
 }
 
 // the light the sky sends from direction d (pointing away from the scene, into the sky)
@@ -2031,14 +2061,17 @@ static void gi_wide_soften( const giBake &bake, const std::vector<gvec3> &texelP
 		cv.swap( next );
 	}
 
-	// back onto every texel: the blend of the grid points around it
+	// back onto every texel: the blend of the grid points around it (looked up in cubes
+	// of that small reach - looking through the wide cubes was the slowest step of a bake)
 	const float near = Q_min( spread, 3.0f * step * bake.texelSize + 8.0f );
 	const float n2 = near * near;
+	giSpatialHash nearHash;
+	nearHash.build( texelPos, coarse, near );
 	gi_parallel_for( (int)bake.texels.size(), [&]( int i ) {
 		const giTexel &tx = bake.texels[i];
 		gvec3 sum;
 		float wsum = 0;
-		hash.query( tx.pos, [&]( int o ) {
+		nearHash.query( tx.pos, [&]( int o ) {
 			const giTexel &ot = bake.texels[o];
 			const gvec3 d = ot.pos - tx.pos;
 			const float d2 = gdot( d, d );
@@ -4097,7 +4130,9 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 	const float bounceRadius = bake.texelSize * stride * 2.5f;
 	// the wide blur of the bounce light: three passes of 32 units at 8x (about 55 units
 	// in all), never less than 24 units per pass at low resolutions
-	gi_bounceBlurRadius = Com_Clamp( 24.0f, 48.0f, bake.texelSize * stride * 4.0f );
+	// (half what it was: at about 55 units in all, contact detail - the darkening under a
+	// ledge, around a window frame - turned into soft blobs)
+	gi_bounceBlurRadius = Com_Clamp( 12.0f, 24.0f, bake.texelSize * stride * 2.0f );
 	giSpatialHash gridHash;
 	gridHash.build( texelPos, gridPoints, bounceRadius );
 
