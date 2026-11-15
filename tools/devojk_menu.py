@@ -141,10 +141,15 @@ def item(page, idx, rows_per_col, entry, visible):
     row = idx % rows_per_col
     x = COL_X[col]
     y = TOP + row * ROW
+    # "type" has to come first: the game sets up an item's storage as soon as it reads
+    # "font" (or a cvar), sized for the type the item has at that moment. A list that
+    # got its type later would write its options past the end of that storage.
+    item_type = "ITEM_TYPE_SLIDER" if kind == "slider" else "ITEM_TYPE_MULTI"
     lines = [
         "\t\titemDef",
         "\t\t{",
         f"\t\t\tname\t\t\t\tdvj_{cvar}",
+        f"\t\t\ttype\t\t\t\t{item_type}",
         f"\t\t\tgroup\t\t\t\t{page}",
         f"\t\t\ttext\t\t\t\t{q(label)}",
         f"\t\t\trect\t\t\t\t{x} {y} {COL_W} {ROW - 1}",
@@ -160,11 +165,10 @@ def item(page, idx, rows_per_col, entry, visible):
     if kind == "slider":
         default, lo, hi = values
         lines += [
-            "\t\t\ttype\t\t\t\tITEM_TYPE_SLIDER",
             f"\t\t\tcvarfloat\t\t\t{q(cvar)} {default} {lo} {hi}",
         ]
     else:
-        lines += ["\t\t\ttype\t\t\t\tITEM_TYPE_MULTI", f"\t\t\tcvar\t\t\t\t{q(cvar)}"]
+        lines += [f"\t\t\tcvar\t\t\t\t{q(cvar)}"]
         if kind == "strlist":
             lines.append("\t\t\tcvarStrList { " + " ".join(f"{q(l)} {q(v)}" for l, v in values) + " }")
         else:
@@ -182,9 +186,9 @@ def button(name, text, x, y, w, actions, help_text, group="none", visible=True, 
         "\t\titemDef",
         "\t\t{",
         f"\t\t\tname\t\t\t\t{name}",
+        "\t\t\ttype\t\t\t\tITEM_TYPE_BUTTON",
         f"\t\t\tgroup\t\t\t\t{group}",
         f"\t\t\ttext\t\t\t\t{q(text)}",
-        "\t\t\ttype\t\t\t\tITEM_TYPE_BUTTON",
         "\t\t\tstyle\t\t\t\tWINDOW_STYLE_EMPTY",
         f"\t\t\trect\t\t\t\t{x} {y} {w} 20",
         "\t\t\ttextalign\t\t\tITEM_ALIGN_CENTER",

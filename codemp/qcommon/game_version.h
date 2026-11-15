@@ -32,16 +32,13 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 #define VERSION_STRING STR(VERSION_MAJOR_RELEASE) ", " STR(VERSION_MINOR_RELEASE) ", " STR(VERSION_EXTERNAL_BUILD) ", " STR(VERSION_INTERNAL_BUILD) // "a, b, c, d"
 #define VERSION_STRING_DOTTED STR(VERSION_MAJOR_RELEASE) "." STR(VERSION_MINOR_RELEASE) "." STR(VERSION_EXTERNAL_BUILD) "." STR(VERSION_INTERNAL_BUILD) // "a.b.c.d"
 
-// DevoJK's own version: shown in the menu corner and the console
-#define DEVOJK_VERSION		"beta 0.0.1"
-
 #if defined(_DEBUG)
-	#define	JK_VERSION		"(debug)DevoJK " DEVOJK_VERSION ": " SOURCE_DATE
+	#define	JK_VERSION		"(debug)EternalJK: " SOURCE_DATE
 	#define JK_VERSION_OLD	"(debug)JAmp: v" VERSION_STRING_DOTTED
 #elif defined (TOURNAMENT_CLIENT)
-	#define JK_VERSION		"DevoJK " DEVOJK_VERSION ": Tournament Client"
+	#define JK_VERSION		"EternalJK: Tournament Client"
 	#define JK_VERSION_OLD	"JAmp: v" VERSION_STRING_DOTTED
 #else
-	#define	JK_VERSION		"DevoJK " DEVOJK_VERSION
+	#define	JK_VERSION		"EternalJK: " SOURCE_DATE
 	#define JK_VERSION_OLD	"JAmp: v" VERSION_STRING_DOTTED
 #endif

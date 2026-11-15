@@ -594,12 +594,12 @@ void Con_Init (void) {
 			else if (month[0] == 'D')
 				mm = 12;
 
-			Com_sprintf(version, sizeof(version), "DevoJK " DEVOJK_VERSION " [%02i/%02i/%04i]", mm, day, year);
+			Com_sprintf(version, sizeof(version), "EternalJK: [%02i/%02i/%04i]", mm, day, year);
 		}
 	}
 
 	if (!version[0])
-		Q_strncpyz(version, "DevoJK " DEVOJK_VERSION, sizeof(version));
+		Q_strncpyz(version, "EternalJK", sizeof(version));
 }
 
 /*
