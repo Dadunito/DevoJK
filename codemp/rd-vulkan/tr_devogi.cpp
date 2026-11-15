@@ -132,6 +132,7 @@ static dgSettings R_DevoGI_Settings( void )
 	s.gpu			= r_devoGI_gpu->integer;
 	s.liveBounces	= r_devoGI_liveBounces->integer;
 	s.liveSky		= r_devoGI_liveSky->value;
+	s.liveOnly		= r_devoGI_live->integer ? 1 : 0;	// live lighting needs only the live layer
 	return s;
 }
 
@@ -314,7 +315,9 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 
 	char base[MAX_QPATH], cacheName[MAX_QPATH];
 	COM_StripExtension( mapName, base, sizeof( base ) );
-	Com_sprintf( cacheName, sizeof( cacheName ), "%s.devogi", base );
+	// the full bake and the live bake are different files, so switching r_devoGI_live
+	// back and forth never has to bake again
+	Com_sprintf( cacheName, sizeof( cacheName ), r_devoGI_live->integer ? "%s.live.devogi" : "%s.devogi", base );
 	const uint64_t bspHash = DG_BspHash( fileBase );
 	const uint64_t settingsHash = DG_SettingsHash( settings, scale );
 
@@ -673,7 +676,16 @@ void R_DevoGI_FillLights( const trRefdef_t *refdef, vkUniformLight_t *u )
 		vec3_t d;
 		VectorSubtract( fx.origin, refdef->vieworg, d );
 		const float d2 = DotProduct( d, d );
-		if ( d2 > fx.reach * fx.reach )
+		// a lamp matters when its light reaches something in view - not only when the
+		// camera itself stands within its reach (that made lamps pop on as the player
+		// walked up to them): its sphere of light must touch the view frustum
+		bool outside = false;
+		for ( int p = 0; p < 4 && !outside; p++ ) {
+			const cplane_t &pl = backEnd.viewParms.frustum[p];
+			if ( DotProduct( fx.origin, pl.normal ) - pl.dist < -fx.reach )
+				outside = true;
+		}
+		if ( outside )
 			continue;
 		if ( !R_inPVS( refdef->vieworg, fx.origin, NULL ) )
 			continue;	// in a part of the map the camera can't see

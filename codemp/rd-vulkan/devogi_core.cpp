@@ -1983,6 +1983,77 @@ static void gi_world_smooth( const giBake &bake, const giSpatialHash &hash, std:
 }
 
 /*
+A very wide, soft blur (used to make the live layer's sun bounce pillow soft).
+Blurring every texel over a radius of a hundred units or more would take ages,
+so it works on a coarse grid: one texel in every 'step' of the lightmap each way
+(a few dozen units apart) is blurred over 'spread' in three passes, and every
+texel then takes the blend of the grid points near it. Light only spreads along
+surfaces facing about the same way (never round a corner onto another wall).
+*/
+static void gi_wide_soften( const giBake &bake, const std::vector<gvec3> &texelPos, std::vector<gvec3> &values,
+	float spread, int step ) {
+	step = Q_max( 1, step );
+	std::vector<int> coarse;
+	for ( size_t i = 0; i < bake.texels.size(); i++ ) {
+		const giTexel &tx = bake.texels[i];
+		if ( tx.x % step == 0 && tx.y % step == 0 && !tx.buried )
+			coarse.push_back( (int)i );
+	}
+	if ( coarse.empty() )
+		return;
+	std::vector<int> slot( bake.texels.size(), -1 );
+	for ( size_t k = 0; k < coarse.size(); k++ )
+		slot[coarse[k]] = (int)k;
+	giSpatialHash hash;
+	hash.build( texelPos, coarse, spread );
+
+	std::vector<gvec3> cv( coarse.size() ), next( coarse.size() );
+	for ( size_t k = 0; k < coarse.size(); k++ )
+		cv[k] = values[coarse[k]];
+	const float r2 = spread * spread;
+	for ( int pass = 0; pass < 3; pass++ ) {
+		gi_parallel_for( (int)coarse.size(), [&]( int k ) {
+			const giTexel &tx = bake.texels[coarse[k]];
+			gvec3 sum;
+			float wsum = 0;
+			hash.query( tx.pos, [&]( int o ) {
+				const giTexel &ot = bake.texels[o];
+				const gvec3 d = ot.pos - tx.pos;
+				const float d2 = gdot( d, d );
+				if ( d2 > r2 || !gi_texels_compatible( tx, ot, spread * 0.5f ) )
+					return;
+				const float w = 1.0f - d2 / r2;
+				sum += cv[slot[o]] * w;
+				wsum += w;
+			} );
+			next[k] = wsum > 0 ? sum * ( 1.0f / wsum ) : cv[k];
+		} );
+		cv.swap( next );
+	}
+
+	// back onto every texel: the blend of the grid points around it
+	const float near = Q_min( spread, 3.0f * step * bake.texelSize + 8.0f );
+	const float n2 = near * near;
+	gi_parallel_for( (int)bake.texels.size(), [&]( int i ) {
+		const giTexel &tx = bake.texels[i];
+		gvec3 sum;
+		float wsum = 0;
+		hash.query( tx.pos, [&]( int o ) {
+			const giTexel &ot = bake.texels[o];
+			const gvec3 d = ot.pos - tx.pos;
+			const float d2 = gdot( d, d );
+			if ( d2 > n2 || !gi_texels_compatible( tx, ot, near ) )
+				return;
+			const float w = 1.0f - d2 / n2 + 1e-3f;
+			sum += cv[slot[o]] * w;
+			wsum += w;
+		} );
+		if ( wsum > 0 )
+			values[i] = sum * ( 1.0f / wsum );
+	} );
+}
+
+/*
 ===========================================================================
 Keeping sample points out of walls
 
@@ -2697,12 +2768,17 @@ the nearest gathered points in world space - fast, smooth and seam-free.
 */
 
 // light leaving the point where a bounce ray landed (for one light style)
+// what a gather sees besides the light computed so far: the sky, glowing surfaces and the
+// old vertex light of models. The live layer's sun-bounce chain switches them off, as
+// they are already in the layer's other chain (see the bounce stage in DG_Bake).
+static bool gi_gatherSky = true, gi_gatherGlow = true, gi_gatherModels = true;
+
 static gvec3 gi_hit_radiance( const giBake &bake, const giHit &hit, int styleValue, const gvec3 &dir ) {
 	const giScene &scene = bake.scene;
 	const giTri &t = scene.tris[hit.tri];
 	const giSurf &s = scene.surfs[t.surf];
 	if ( s.sky )
-		return styleValue == 0 ? gi_sky_radiance( dir ) : gvec3();	// the open sky
+		return styleValue == 0 && gi_gatherSky ? gi_sky_radiance( dir ) : gvec3();	// the open sky
 
 	const giVert &a = scene.verts[t.vert[0]];
 	const giVert &b = scene.verts[t.vert[1]];
@@ -2731,7 +2807,7 @@ static gvec3 gi_hit_radiance( const giBake &bake, const giHit &hit, int styleVal
 		const float *px = &bake.light[( ( (size_t)page * DEVOGI_LM_SIZE + y ) * DEVOGI_LM_SIZE + x ) * 3];
 		L = gvec3( px[0], px[1], px[2] );
 	}
-	else if ( page == LIGHTMAP_BY_VERTEX ) {
+	else if ( page == LIGHTMAP_BY_VERTEX && gi_gatherModels ) {
 		// a vertex-lit model: use its vertex colours
 		L = gvec3( a.color[slot][0] * w0 + b.color[slot][0] * w1 + c.color[slot][0] * w2,
 				   a.color[slot][1] * w0 + b.color[slot][1] * w1 + c.color[slot][1] * w2,
@@ -2740,7 +2816,7 @@ static gvec3 gi_hit_radiance( const giBake &bake, const giHit &hit, int styleVal
 	const giShader &sh = scene.shaders[s.shader];
 	L = L * sh.albedo;
 	// a glowing surface adds its own light, from the texture pixel that was hit
-	if ( sh.emitW && styleValue == 0 ) {
+	if ( sh.emitW && styleValue == 0 && gi_gatherGlow ) {
 		const float es = a.st[0] * w0 + b.st[0] * w1 + c.st[0] * w2;
 		const float et = a.st[1] * w0 + b.st[1] * w1 + c.st[1] * w2;
 		L += gi_emit_radiance( sh, es, et );
@@ -3263,9 +3339,9 @@ static uint64_t gi_bsp_hash( const byte *fileBase, const dheader_t *header ) {
 
 static uint64_t gi_settings_hash( int scale ) {
 	char buf[320];
-	Com_sprintf( buf, sizeof( buf ), "aa%g sh%g v%d ex%g r%d b%d i%g s%g ls%g e%d ao%g aod%g aor%g sat%g x%d rl%d gl%g lh%llx", g_set.aa, g_set.sheen, DEVOGI_VERSION, g_set.exposure,
+	Com_sprintf( buf, sizeof( buf ), "aa%g sh%g v%d ex%g r%d b%d i%g s%g ls%g lo%d sb%g e%d ao%g aod%g aor%g sat%g x%d rl%d gl%g lh%llx", g_set.aa, g_set.sheen, DEVOGI_VERSION, g_set.exposure,
 		Com_Clampi( 8, 1024, g_set.rays ), Com_Clampi( 1, 16, g_set.bounces ) * 100 + Com_Clampi( 1, 32, g_set.liveBounces ),
-		g_set.intensity, g_set.sky, g_set.liveSky, g_set.entityLights,
+		g_set.intensity, g_set.sky, g_set.liveSky, g_set.liveOnly ? 1 : 0, g_set.sunBounceBlur, g_set.entityLights,
 		g_set.ao, g_set.aoDirect, g_set.aoDistance, g_set.saturation, scale,
 		g_set.relight, g_set.glow, (unsigned long long)( g_set.relight ? gi_lightsHash : 0 ) );
 	return gi_fnv( 1469598103934665603ULL, buf, strlen( buf ) );
@@ -4026,60 +4102,103 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 	gridHash.build( texelPos, gridPoints, bounceRadius );
 
 	/*
-	Two bounce chains.
-	  - The full bake (r_devoGI_live 0): direct light from the lamps and the sun,
-	    bounced 'bounces' times.
-	  - Live lighting (r_devoGI_live 1) draws the sun and the lamps itself and takes
-	    only bounce light from the bake. There the sun must not be baked in at all,
-	    not even its bounce: the live layer is light from the sky all around (with its
-	    ambient occlusion) and the lamps' bounce, like a skylight. So a second chain
-	    starts again from the direct light without the sun and bounces 'liveBounces'
-	    times (24 by default), filling deep rooms and corridors a little more each time.
-	The full bake's light is put aside after its own chain, so it stays exactly as it was.
+	The bounce light, in one of two ways - each bake is made for one kind of lighting
+	(the cache file names them apart: <map>.devogi and <map>.live.devogi):
+	  - Full bake (r_devoGI_live 0): direct light from the lamps and the sun, bounced
+	    'bounces' times. Everything is baked; the GPU only reads the lightmaps.
+	  - Live bake (r_devoGI_live 1, g_set.liveOnly): the renderer draws the sun and the
+	    lamps itself and takes only the bounce light from the bake (the live layer):
+	      1. sky and lamps: starts from the direct light without the sun, the sky
+	         all around 'liveSky' times stronger (it lights the shade, like a skylight),
+	         bounced 'liveBounces' times;
+	      2. the sun's bounce: starts from the sun's direct light alone (no sky, glow
+	         or old model light - those are in chain 1), a few bounces, then spread
+	         very wide (sunBounceBlur): a pillow-soft warm fill that brings back the
+	         sun's yellow and white without any visible shape;
+	    the live layer is the sum of the two. The full bake's own chain is skipped.
 	*/
-	const int liveBounces = relight ? Com_Clampi( 1, 32, g_set.liveBounces ) : 0;
-	const int totalBounces = bounces + liveBounces;
-	std::vector<float> fullLight;	// the full bake's light, after its own last bounce
+	const bool liveOnly = relight && g_set.liveOnly;
+	const int liveBounces = Com_Clampi( 1, 32, g_set.liveBounces );
+	const int sunBounces = 4;
 	const float fullSkyScale = gi_sky.scale;
-
-	bake.light = bake.direct;
 	static char bounceStage[64];
 	const float bounceBase = 0.45f, bounceSpan = 0.47f;
-	for ( int b = 0; b < totalBounces; b++ ) {
-		if ( b == bounces ) {
-			// the full bake is done: keep its light, then start the live chain without the sun
-			fullLight = bake.light;
-			for ( size_t i = 0; i < bake.texels.size() && i < sunDirect.size(); i++ ) {
-				const giTexel &tx = bake.texels[i];
-				if ( tx.styleValue != 0 )
-					continue;
-				float *px = &bake.direct[( ( (size_t)tx.page * DEVOGI_LM_SIZE + tx.y ) * DEVOGI_LM_SIZE + tx.x ) * 3];
-				px[0] = Q_max( 0.0f, px[0] - sunDirect[i].x );
-				px[1] = Q_max( 0.0f, px[1] - sunDirect[i].y );
-				px[2] = Q_max( 0.0f, px[2] - sunDirect[i].z );
-			}
-			bake.light = bake.direct;
-			// ...and with more sky: it is what lights the shade there
-			gi_sky.scale *= Q_max( 0.0f, g_set.liveSky );
+
+	// runs one chain of bounces from what is in bake.direct
+	auto runChain = [&]( const char *name, int count, int &done, int total ) {
+		bake.light = bake.direct;
+		for ( int b = 0; b < count; b++, done++ ) {
+			Com_sprintf( bounceStage, sizeof( bounceStage ), "%s %d of %d", name, b + 1, count );
+			gi_progress_stage( bounceStage, bounceBase + bounceSpan * done / total, bounceSpan / total );
+			// later bounces carry less and less energy, so fewer rays are enough for them
+			const int bounceRays = b == 0 ? rays : ( b < 3 ? rays / 2 : rays / 4 );
+			gi_gather( bake, gridHash, gridPoints, texelPos, bounceRadius, Q_max( 16, bounceRays ) );
+			gi_compose( bake, intensity );
+			dg_print( "DevoGI: %s %d/%d done (%.1fs)\n", name, b + 1, count, ( dg_ms() - startTime ) / 1000.0f );
 		}
-		const int chainBounce = b < bounces ? b : b - bounces;
-		Com_sprintf( bounceStage, sizeof( bounceStage ), b < bounces ? "Bounce light %d of %d" : "Live bounce light %d of %d",
-			chainBounce + 1, b < bounces ? bounces : liveBounces );
-		gi_progress_stage( bounceStage, bounceBase + bounceSpan * b / totalBounces, bounceSpan / totalBounces );
-		// later bounces carry less and less energy, so fewer rays are enough for them
-		const int bounceRays = chainBounce == 0 ? rays : ( chainBounce < 3 ? rays / 2 : rays / 4 );
-		gi_gather( bake, gridHash, gridPoints, texelPos, bounceRadius, Q_max( 16, bounceRays ) );
+	};
+	// the sun's part of the direct light, added to (sign 1) or taken out of (-1) bake.direct
+	auto addSun = [&]( float sign, bool sunOnly ) {
+		for ( size_t i = 0; i < bake.texels.size() && i < sunDirect.size(); i++ ) {
+			const giTexel &tx = bake.texels[i];
+			if ( tx.styleValue != 0 )
+				continue;
+			float *px = &bake.direct[( ( (size_t)tx.page * DEVOGI_LM_SIZE + tx.y ) * DEVOGI_LM_SIZE + tx.x ) * 3];
+			if ( sunOnly ) {
+				px[0] = sunDirect[i].x; px[1] = sunDirect[i].y; px[2] = sunDirect[i].z;
+			} else {
+				px[0] = Q_max( 0.0f, px[0] + sign * sunDirect[i].x );
+				px[1] = Q_max( 0.0f, px[1] + sign * sunDirect[i].y );
+				px[2] = Q_max( 0.0f, px[2] + sign * sunDirect[i].z );
+			}
+		}
+	};
+
+	int done = 0;
+	if ( !liveOnly ) {
+		runChain( "Bounce light", bounces, done, bounces );
+	} else {
+		const int total = sunBounces + liveBounces;
+		const std::vector<float> fullDirect = bake.direct;
+
+		// 2. the sun's bounce, alone
+		std::fill( bake.direct.begin(), bake.direct.end(), 0.0f );
+		addSun( 1.0f, true );
+		gi_gatherSky = gi_gatherGlow = gi_gatherModels = false;
+		runChain( "Sun bounce", sunBounces, done, total );
+		gi_gatherSky = gi_gatherGlow = gi_gatherModels = true;
+		std::vector<gvec3> sunBounce( bake.texels.size() );
+		for ( size_t i = 0; i < bake.texels.size(); i++ )
+			sunBounce[i] = gvec3( bake.indirect[i * 4], bake.indirect[i * 4 + 1], bake.indirect[i * 4 + 2] );
+		// pillow soft: spread it far along the surfaces
+		gi_wide_soften( bake, texelPos, sunBounce, Com_Clamp( 16.0f, 512.0f, g_set.sunBounceBlur ), stride * 4 );
+
+		// 1. sky and lamps, without the sun
+		bake.direct = fullDirect;
+		addSun( -1.0f, false );
+		gi_sky.scale = fullSkyScale * Q_max( 0.0f, g_set.liveSky );
+		runChain( "Live bounce light", liveBounces, done, total );
+		gi_sky.scale = fullSkyScale;
+
+		// the live layer = both chains. The light the rest of the bake works with
+		// (the exposure match against the original level, the vertex colours of map
+		// models, the lightmaps in the file) is an estimate of the full bake instead: all
+		// direct light, the sun's bounce, and the live chain at the normal sky strength
+		// (its 'liveSky' times stronger sky would make everything look too bright to the
+		// exposure match, which then darkened all live light, the sun included)
+		const float skyBack = 1.0f / Q_max( 1.0f, g_set.liveSky );
+		std::vector<float> liveLayer = bake.indirect;
+		for ( size_t i = 0; i < bake.texels.size(); i++ ) {
+			liveLayer[i * 4 + 0] += sunBounce[i].x;
+			liveLayer[i * 4 + 1] += sunBounce[i].y;
+			liveLayer[i * 4 + 2] += sunBounce[i].z;
+			bake.indirect[i * 4 + 0] = bake.indirect[i * 4 + 0] * skyBack + sunBounce[i].x;
+			bake.indirect[i * 4 + 1] = bake.indirect[i * 4 + 1] * skyBack + sunBounce[i].y;
+			bake.indirect[i * 4 + 2] = bake.indirect[i * 4 + 2] * skyBack + sunBounce[i].z;
+		}
+		bake.direct = fullDirect;
 		gi_compose( bake, intensity );
-		dg_print( "DevoGI: %s bounce %d/%d done (%.1fs)\n", b < bounces ? "full" : "live",
-			chainBounce + 1, b < bounces ? bounces : liveBounces, ( dg_ms() - startTime ) / 1000.0f );
-	}
-	// the full bake goes on with its own light; the bounce-only light for live lighting
-	// (bake.indirect, see gi_build_bounce_maps) is the live chain's, without the sun
-	if ( !fullLight.empty() ) {
-		bake.light.swap( fullLight );
-		fullLight.clear();
-		fullLight.shrink_to_fit();
-		gi_sky.scale = fullSkyScale;	// back to the full bake's sky (models, probes)
+		bake.indirect.swap( liveLayer );	// the live layer is what gi_build_bounce_maps stores
 	}
 	sunDirect.clear();
 	sunDirect.shrink_to_fit();

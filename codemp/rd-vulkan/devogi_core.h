@@ -35,6 +35,9 @@ struct dgSettings {
 	int		liveBounces	= 24;		// light bounces of the bounce-only light used by live lighting (1-32)
 	float	liveSky		= 6.0f;		// sky light in the live layer, times 'sky': with no sun baked in,
 									// the sky all around is what lights the shade (like a skylight)
+	int		liveOnly	= 0;		// 1: bake only what live lighting (r_devoGI_live 1) uses - the live
+									// layer, lamps, probes - and skip the full bake's own bounce light
+	float	sunBounceBlur = 160.0f;	// live layer: how wide the sun's bounce light is spread (pillow soft)
 	float	aa			= 2.0f;		// shadow anti-aliasing width, in texels
 	float	sheen		= 0.12f;	// baked glossy sheen
 	float	intensity	= 1.0f;		// bounce light strength
