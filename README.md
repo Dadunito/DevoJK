@@ -6,7 +6,7 @@ Its heart is **DevoGI**, a new ray-traced lighting system that relights every ma
 > **Status:** first beta. Things may still change; feedback is very welcome under [issues](https://github.com/Dadunito/DevoJK/issues).
 
 ## Gallery
-Same places, same map (ffa3), both performance modes. **Low spec** is fully baked, **high spec** adds the live sun and lamps with real-time shadows.
+Ffa3, both performance modes in a visual comparison. **Low spec** GI is fully baked, and heavily optimized for lower spec machines, **high spec** adds the live sun and dynamic lighting with real-time shadows, prebaked Global Illumination style.
 
 ![Low spec and high spec, the hangar](docs/gallery/compare_1.jpg)
 ![Low spec and high spec, a corridor](docs/gallery/compare_2.jpg)
@@ -23,14 +23,14 @@ Same places, same map (ffa3), both performance modes. **Low spec** is fully bake
 | ![Complex shadows smoothly projecting onto the character](docs/gallery/feature_1.jpg) | ![Dynamic lights cast shadows](docs/gallery/feature_2.jpg) |
 | Complex shadows fall smoothly across the character | Lights near you cast the shadows of everything that moves |
 | ![More dynamic light shadows](docs/gallery/feature_3.jpg) | ![Smooth shadows, uniform regardless of what is above](docs/gallery/feature_4.jpg) |
-| Every nearby lamp, not just the sun | Smooth, even shadows, whatever hangs above |
+| Every nearby light source, not just the sun | Smooth, even shadows, whatever hangs above |
 
 ## Features
 * **Fully baked global illumination for every PC.** Low spec mode bakes everything: bounced light, soft shadows, darker corners, colour carried from wall to wall. In game it costs nothing more than the original lighting. Baking a map takes a while the first time, about 5 to 8 minutes for a map like ffa3 and longer for big indoor maps. Sorry about that! We're working on making it much faster. Once a map is baked, it's baked for good, and the wait is worth it.
-* **High spec mode: baked and live, in levels of detail.** The sun is drawn live with real-time shadows. Lamps switch smoothly with distance: far away they're baked, in view they shine live over their baked shadows, and right next to you they cast real-time shadows of players, weapons and anything else that moves. The handover is designed to be invisible to the naked eye, while the expensive work only happens where you can see it.
+* **High spec mode: baked and live, in levels of detail.** The sun is drawn live with real-time shadows. Light sources switch smoothly with distance: far away they're baked, in view they shine live over their baked shadows, and right next to you they cast real-time shadows of players, weapons and anything else that moves. The handover is designed to be invisible to the naked eye, while the expensive work only happens where you can see it.
 * **The original lighting is never touched.** DevoGI swaps out a map's whole lighting without destroying anything: the classic lightmaps stay in the map as they were. To go back, just turn DevoGI off.
 * **Drag-and-drop realism.** The ray tracer reads a map's lights however the mapper made them: light entities, shaders with surface lights, glowing textures, the sun and the sky. Nobody has to change their workflow, so every standard map is relit automatically, and that is the part we're proudest of.
-* **Precompile Shaders.** A little program in the game folder that bakes the lighting for as many maps as you like, outside the game. Let it run while you use your PC for something else, or while you build your own maps.
+* **Precompile Shaders.** A little tool in the game folder that bakes the lighting for as many maps as you like, outside the game. Let it run while you use your PC for something else, or while you build your own maps.
 * **Full integration into Q3Map2.** [DevoQ3Map2](https://github.com/Dadunito/DevoQ3Map2) has the same baker built in: `mapcompiler -devogi`. Mappers can ship the baked lighting inside their pk3, and players get it with no wait. Mappers are very welcome!
 * **SFX sabers, fixed and back.** The SFX saber system is reintegrated and fixed: the trail only shows while swinging, it has a length setting, black blades keep their colour, and the menus preview the SFX blade too.
 * **DevoJK settings menu.** Setup → DevoJK, with a Vulkan page and a DevoGI page. The main switch is **Performance mode**: Low spec or High spec.
@@ -66,7 +66,7 @@ The install folder gets the client, both renderers (`rd-vulkan` and `rd-eternalj
 
 ### Where things are
 * `codemp/rd-vulkan/devogi_core.cpp`: the baker. It's shared word for word with DevoQ3Map2, so the game and the compiler always bake the same lighting.
-* `codemp/rd-vulkan/tr_devogi.cpp`: how the renderer uses the bake: loading, live lights, sun and lamp shadows.
+* `codemp/rd-vulkan/tr_devogi.cpp`: how the renderer uses the bake: loading, live lights, sun and light-source shadows.
 * `codemp/rd-vulkan/vk_devo_shadow.cpp`: the shadow map image.
 * `tools/devojk_menu.py`: generates the DevoJK menu from two simple tables.
 

@@ -767,7 +767,7 @@
 			font				2
 			textscale			0.55
 			forecolor			1 .682 0 1
-			descText			"Glowing sabers, lamps and screens."
+			descText			"Glowing sabers, light sources and screens."
 			visible				1
 			type				ITEM_TYPE_MULTI
 			cvar				"r_DynamicGlow"
@@ -994,7 +994,7 @@
 			font				2
 			textscale			0.55
 			forecolor			1 .682 0 1
-			descText			"Low spec: everything baked, fastest. High spec: live sun and lamps with real-time shadows."
+			descText			"Low spec: everything baked, fastest. High spec: live sun and light sources with real-time shadows."
 			visible				0
 			type				ITEM_TYPE_MULTI
 			cvar				"r_devoGI_live"

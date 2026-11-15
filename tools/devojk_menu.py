@@ -66,7 +66,7 @@ VULKAN = [
     ("r_dynamiclight", "Dynamic lights", "list", ONOFF, "Light from sabers, blaster bolts and explosions."),
     ("r_dlightMethod", "Dynamic light method", "list", [("CPU", 0), ("GPU", 1)], "GPU is faster and needed for live DevoGI lighting."),
     ("r_dlightMode", "Dynamic light mode", "list", [("0", 0), ("1", 1), ("2", 2)], "2 lights models and the map alike."),
-    ("r_DynamicGlow", "Glow *", "list", ONOFF, "Glowing sabers, lamps and screens."),
+    ("r_DynamicGlow", "Glow *", "list", ONOFF, "Glowing sabers, light sources and screens."),
     ("r_DynamicGlowAllStages", "Glow on every layer *", "list", ONOFF, "Also glow the layers the original game skipped."),
     ("r_DynamicGlowIntensity", "Glow strength", "slider", (0.8, 0.0, 2.0), "How bright the glow is."),
     ("r_bloom", "Bloom *", "list", ONOFF, "Soft light bleeding around very bright spots."),
@@ -86,7 +86,7 @@ VULKAN = [
 # time it loads (or prebake it with the Precompile tool).
 # ---------------------------------------------------------------------------
 DEVOGI = [
-    ("r_devoGI_live", "PERFORMANCE MODE *", "list", [("Low spec", 0), ("High spec", 1)], "Low spec: everything baked, fastest. High spec: live sun and lamps with real-time shadows."),
+    ("r_devoGI_live", "PERFORMANCE MODE *", "list", [("Low spec", 0), ("High spec", 1)], "Low spec: everything baked, fastest. High spec: live sun and light sources with real-time shadows."),
     ("r_devoGI", "DevoGI lighting *", "list", ONOFF, "New baked global illumination for every map. Off = the maps' original lighting."),
     ("r_devoGI_prebake", "Bake in the game", "list", ONOFF, "Bake a map's lighting when it loads without a baked file. Off: use the Precompile tool."),
     ("r_devoGI_prebakeSet", "Prebake set", "list", [("Current mode", 0), ("High spec", 1), ("Low spec", 2), ("Both", 3)], "Which versions to bake when a map loads. Both: switching mode never waits."),

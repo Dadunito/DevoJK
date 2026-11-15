@@ -15,7 +15,7 @@ The most important setting, at the top of the DevoGI page.
 | | Low spec | High spec |
 |---|---|---|
 | Cvar | `r_devoGI_live 0` | `r_devoGI_live 1` |
-| Sun and lamps | baked | drawn live |
+| Sun and light sources | baked | drawn live |
 | Shadows from players | none | from the sun, and from lights close to you |
 | Bounce light | baked | baked, plus soft sky light |
 | Baked file | `maps/<map>.devogi` | `maps/<map>.live.devogi` |
@@ -23,13 +23,13 @@ The most important setting, at the top of the DevoGI page.
 
 High spec also needs **Normal maps**, **Specular maps** and the **GPU dynamic light method**, all on by default.
 
-### How high spec handles lamps
+### How high spec handles light sources
 
-The work is split by distance, so far-away lamps cost nothing:
+The work is split by distance, so far-away light sources cost nothing:
 
-* **Far away:** the lamp's light and its soft shadows are baked.
-* **In view:** the lamp is also drawn live for its shine, but it keeps its baked shadows.
-* **Right by you:** up to 4 nearby lights (lamps, sabers, blaster bolts) also throw the shadows of anything that moves: players including yourself, weapons and doors. The level itself never has to be drawn for these shadows, since its own are baked. That keeps them cheap.
+* **Far away:** the light source's light and its soft shadows are baked.
+* **In view:** the light source is also drawn live for its shine, but it keeps its baked shadows.
+* **Right by you:** up to 4 nearby light sources (the map's lights, sabers, blaster bolts) also throw the shadows of anything that moves: players including yourself, weapons and doors. The level itself never has to be drawn for these shadows, since its own are baked. That keeps them cheap.
 
 ## Baking
 
