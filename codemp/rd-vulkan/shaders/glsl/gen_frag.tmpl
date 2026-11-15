@@ -403,6 +403,10 @@ void main() {
 			// the surface colour is the plain texture and the vertex colour is the light.
 			#if !defined(USE_CL0_IDENT) && !defined(USE_TX1) && !defined(USE_TX2)
 				diffuse = vec4( texture( texture0, frag_tex_coord0 ).rgb, base.a );
+				// DevoGI high spec: the vertex colour is bounce light only (from the light
+				// probes, see R_DevoGI_PatchVertexColors), so the sun and the light sources
+				// are drawn live here, with their real-time shadows, as on players
+				devoAllowed = true;
 			#else
 				diffuse = base;
 			#endif
@@ -423,6 +427,12 @@ void main() {
 			if ( devoLive ) {
 				// bounce light comes from all around: no direction to split it into
 				ambientColor = lightmapColor * frag_color0.rgb;
+				lightColor = vec3(0.0);
+			}
+		#elif defined(USE_LIGHT_VERTEX) && !defined(USE_CL0_IDENT)
+			if ( devoLive && devoAllowed ) {
+				// the same for map models in high spec: their vertex colour is bounce light
+				ambientColor = frag_color0.rgb;
 				lightColor = vec3(0.0);
 			}
 		#endif

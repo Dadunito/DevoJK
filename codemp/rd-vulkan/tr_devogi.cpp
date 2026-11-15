@@ -527,11 +527,12 @@ directed part, and the direction it comes from.
 Values are in the 0..255 range the renderer uses for model lighting. Returns
 false when the map has no DevoGI light probes.
 */
-qboolean R_DevoGI_EntityLighting( const vec3_t point, vec3_t ambient, vec3_t directed, vec3_t lightDir, float *sunVis )
+// the 8 probes around 'point' blended into one ambient cube (light arriving from +X -X
+// +Y -Y +Z -Z, in lightmap units) and how much of the sun they see; false without probes
+static bool R_DevoGI_ProbeCube( const vec3_t point, bool withDirect, float cube[6][3], float *sunVis )
 {
 	if ( gi_live.probes.empty() || gi_live.probeValid.empty() )
-		return qfalse;
-	const bool withDirect = !gi_liveActive && gi_live.probesDirect.size() == gi_live.probes.size();
+		return false;
 	const int *dims = gi_live.probeDims;
 	float f[3];
 	int c0[3];
@@ -540,7 +541,8 @@ qboolean R_DevoGI_EntityLighting( const vec3_t point, vec3_t ambient, vec3_t dir
 		c0[k] = Com_Clampi( 0, Q_max( 0, dims[k] - 2 ), (int)floorf( g ) );
 		f[k] = Com_Clamp( 0.0f, 1.0f, g - c0[k] );
 	}
-	float cube[6][3] = {}, sun = 0, wsum = 0;
+	memset( cube, 0, sizeof( float ) * 18 );
+	float sun = 0, wsum = 0;
 	for ( int corner = 0; corner < 8; corner++ ) {
 		const int x = Q_min( dims[0] - 1, c0[0] + ( corner & 1 ) );
 		const int y = Q_min( dims[1] - 1, c0[1] + ( ( corner >> 1 ) & 1 ) );
@@ -561,12 +563,24 @@ qboolean R_DevoGI_EntityLighting( const vec3_t point, vec3_t ambient, vec3_t dir
 		wsum += w;
 	}
 	if ( wsum <= 0 )
+		return false;
+	for ( int a = 0; a < 6; a++ )
+		for ( int k = 0; k < 3; k++ )
+			cube[a][k] /= wsum;
+	*sunVis = sun / wsum;
+	return true;
+}
+
+qboolean R_DevoGI_EntityLighting( const vec3_t point, vec3_t ambient, vec3_t directed, vec3_t lightDir, float *sunVis )
+{
+	const bool withDirect = !gi_liveActive && gi_live.probesDirect.size() == gi_live.probes.size();
+	float cube[6][3];
+	if ( !R_DevoGI_ProbeCube( point, withDirect, cube, sunVis ) )
 		return qfalse;
-	const float shift = R_DevoGI_Shift() / wsum;
+	const float shift = R_DevoGI_Shift();
 	for ( int a = 0; a < 6; a++ )
 		for ( int k = 0; k < 3; k++ )
 			cube[a][k] *= shift;
-	*sunVis = sun / wsum;
 
 	if ( !withDirect ) {
 		// live lighting: only the soft bounce light, the same from all sides
@@ -1058,6 +1072,49 @@ void R_DevoGI_PatchVertexColors( byte *fileBase, const dheader_t *header )
 	}
 	gi_vertexColors.clear();
 	gi_vertexColors.shrink_to_fit();
+
+	/*
+	High spec: map models lit per vertex (ships, crates, pipes) get the same split as
+	players - their vertex colour becomes the bounce light from the light probes, seen
+	in the direction the vertex faces, and the sun and the light sources are drawn live
+	on top with their real-time shadows (see USE_LIGHT_VERTEX in gen_frag). Their baked
+	vertex colours hold the sun already, so drawing it live there would only double it,
+	and moving things could never shadow them.
+	*/
+	if ( gi_liveActive ) {
+		const lump_t &ls = header->lumps[LUMP_SURFACES];
+		const dsurface_t *ds = (const dsurface_t *)( fileBase + ls.fileofs );
+		const int numSurfs = ls.filelen / (int)sizeof( dsurface_t );
+		mapVert_t *dv = (mapVert_t *)( fileBase + lv.fileofs );
+		int relit = 0;
+		for ( int s = 0; s < numSurfs; s++ ) {
+			if ( LittleLong( ds[s].lightmapNum[0] ) != LIGHTMAP_BY_VERTEX )
+				continue;
+			const int first = LittleLong( ds[s].firstVert ), count = LittleLong( ds[s].numVerts );
+			for ( int v = first; v < first + count && v >= 0 && v < numVerts; v++ ) {
+				vec3_t n = { LittleFloat( dv[v].normal[0] ), LittleFloat( dv[v].normal[1] ), LittleFloat( dv[v].normal[2] ) };
+				if ( VectorNormalize( n ) < 0.5f )
+					VectorSet( n, 0, 0, 1 );
+				// a little in front of the vertex, so a model sunk into a wall still finds air
+				vec3_t p;
+				for ( int k = 0; k < 3; k++ )
+					p[k] = LittleFloat( dv[v].xyz[k] ) + n[k] * 4.0f;
+				float cube[6][3], sunVis;
+				if ( !R_DevoGI_ProbeCube( p, false, cube, &sunVis ) )
+					continue;
+				// the ambient cube seen from the vertex's normal
+				for ( int k = 0; k < 3; k++ ) {
+					const float c = n[0] * n[0] * cube[n[0] > 0 ? 0 : 1][k]
+								  + n[1] * n[1] * cube[n[1] > 0 ? 2 : 3][k]
+								  + n[2] * n[2] * cube[n[2] > 0 ? 4 : 5][k];
+					dv[v].color[0][k] = (byte)Com_Clampi( 0, 255, (int)( c + 0.5f ) );
+				}
+				relit++;
+			}
+		}
+		if ( relit )
+			ri.Printf( PRINT_DEVELOPER, "DevoGI: %d map model vertices take their bounce light from the probes\n", relit );
+	}
 }
 
 /*

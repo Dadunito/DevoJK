@@ -4353,8 +4353,9 @@ static void gi_build_lamp_masks( const giBake &bake, dgLiveLighting &live ) {
 		l.reach = fx.reach;
 	}
 
-	// 1. the four lamps that light each pixel most
+	// 1. the four lamps that light each pixel most, and how much
 	std::vector<int16_t> top( npix * 4, -1 );
+	std::vector<float> topE( npix * 4, 0.0f );
 	gi_parallel_for( (int)( npix / 4096 + 1 ), [&]( int chunk ) {
 		const size_t a = (size_t)chunk * 4096, b = Q_min( npix, a + 4096 );
 		for ( size_t q = a; q < b; q++ ) {
@@ -4387,34 +4388,65 @@ static void gi_build_lamp_masks( const giBake &bake, dgLiveLighting &live ) {
 					}
 				}
 			}
+			for ( int k = 0; k < 4; k++ )
+				topE[q * 4 + k] = best[k];
 		}
 	} );
 
-	// 2. channels: lamps that share a pixel must differ; the most powerful choose first
+	/*
+	2. channels: two lamps that both light a pixel must differ - when the weaker one
+	gives at least 15% of the stronger one's light there; a fainter overlap may share a
+	channel, and the stronger lamp keeps that pixel (step 3). The channels are handed
+	out "most constrained first" (DSATUR graph colouring): next is always the lamp
+	whose neighbours already use the most channels, the most powerful on a tie. Rows of
+	strip lights get channels this way where strongest-first ran out.
+	*/
+	const float shareFrac = 0.15f;
 	std::vector<char> shares( (size_t)nf * nf, 0 );
 	for ( size_t q = 0; q < npix; q++ ) {
 		const int16_t *t = &top[q * 4];
+		const float *e = &topE[q * 4];
 		for ( int a = 0; a < 4 && t[a] >= 0; a++ )
 			for ( int b = a + 1; b < 4 && t[b] >= 0; b++ ) {
+				if ( e[b] < e[a] * shareFrac )
+					continue;	// a faint overlap: they may share
 				shares[(size_t)t[a] * nf + t[b]] = 1;
 				shares[(size_t)t[b] * nf + t[a]] = 1;
 			}
 	}
-	std::vector<int> order( nf );
-	for ( int i = 0; i < nf; i++ )
-		order[i] = i;
-	std::sort( order.begin(), order.end(), [&]( int a, int b ) { return lamps[a].power > lamps[b].power; } );
-	int withChannel = 0;
 	const int channels = dgLiveLighting::maskLayers * 4;
-	for ( int i : order ) {
+	for ( int i = 0; i < nf; i++ )
+		live.fixtures[i].maskChannel = -1;
+	std::vector<char> done( nf, 0 );
+	int withChannel = 0;
+	for ( int step = 0; step < nf; step++ ) {
+		// the uncoloured lamp whose neighbours use the most different channels
+		int pick = -1, pickSat = -1;
+		for ( int i = 0; i < nf; i++ ) {
+			if ( done[i] )
+				continue;
+			bool used[dgLiveLighting::maskLayers * 4] = {};
+			int sat = 0;
+			for ( int j = 0; j < nf; j++ ) {
+				const int c = live.fixtures[j].maskChannel;
+				if ( c >= 0 && shares[(size_t)i * nf + j] && !used[c] ) {
+					used[c] = true;
+					sat++;
+				}
+			}
+			if ( sat > pickSat || ( sat == pickSat && lamps[i].power > lamps[pick].power ) ) {
+				pick = i;
+				pickSat = sat;
+			}
+		}
+		done[pick] = 1;
 		bool used[dgLiveLighting::maskLayers * 4] = {};
 		for ( int j = 0; j < nf; j++ )
-			if ( shares[(size_t)i * nf + j] && live.fixtures[j].maskChannel >= 0 )
+			if ( shares[(size_t)pick * nf + j] && live.fixtures[j].maskChannel >= 0 )
 				used[live.fixtures[j].maskChannel] = true;
-		live.fixtures[i].maskChannel = -1;
 		for ( int c = 0; c < channels; c++ ) {
 			if ( !used[c] ) {
-				live.fixtures[i].maskChannel = c;
+				live.fixtures[pick].maskChannel = c;
 				withChannel++;
 				break;
 			}
@@ -4437,10 +4469,16 @@ static void gi_build_lamp_masks( const giBake &bake, dgLiveLighting &live ) {
 				continue;
 			const giTexel &tx = bake.texels[rep[q]];
 			const gvec3 o = tx.pos + tx.faceNormal * 1.0f;
+			bool written[dgLiveLighting::maskLayers * 4] = {};
 			for ( int k = 0; k < 4; k++ ) {
 				const int li = top[q * 4 + k];
 				if ( li < 0 || live.fixtures[li].maskChannel < 0 )
 					continue;
+				// two lamps on one channel here (a faint overlap): the stronger one, first
+				// in 'top', keeps the pixel
+				if ( written[live.fixtures[li].maskChannel] )
+					continue;
+				written[live.fixtures[li].maskChannel] = true;
 				const lamp_t &l = lamps[li];
 				owner.push_back( std::make_pair( q, live.fixtures[li].maskChannel ) );
 				for ( int s = 0; s < S; s++ ) {
