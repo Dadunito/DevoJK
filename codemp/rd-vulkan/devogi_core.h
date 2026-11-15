@@ -118,6 +118,7 @@ struct dgFixture {
 	float	rgb[3];			// calibrated strength per colour channel
 	float	reach;			// distance where it stops mattering
 	int32_t	shader;			// BSP shader index it comes from, -1 for a light entity
+	int32_t	maskChannel;	// its channel (0-3) in the lamp shadow masks, -1: not in them
 };
 
 /*
@@ -144,6 +145,16 @@ struct dgLiveLighting {
 	std::vector<uint16_t>	probesDirect;		// the direct light (lamps, sun) the same way: 18 half floats
 												// per probe; bounce + direct = all the light, for models
 	std::vector<dgFixture>	fixtures;
+	/*
+	Lamp tiers (live bake): every lamp's diffuse light and soft shadows are baked into
+	the live layer above (lampsBaked), so lamps never leak through walls or pop. A lamp
+	drawn live then adds only what the bake can't: its highlights, kept out of
+	shadow by lampMask - for every bounce-lightmap pixel (same layout as 'bounce'),
+	how much of each of up to four lamps it sees (RGBA = mask channels 0-3, 0..255;
+	each lamp's channel is dgFixture::maskChannel).
+	*/
+	bool					lampsBaked = false;
+	std::vector<uint8_t>	lampMask;
 	bool					hasSun = false;
 	float					sunDir[3] = { 0, 0, 1 };	// towards the sun
 	float					sunRgb[3] = { 0, 0, 0 };	// calibrated: light = sunRgb * cosR when lit

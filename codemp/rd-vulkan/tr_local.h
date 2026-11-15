@@ -306,6 +306,7 @@ typedef struct image_s {
 	qboolean				isLightmap;
 	uint32_t				mipLevels;		// gl texture binding
 	VkSamplerAddressMode	wrapClampMode;	
+	struct image_s			*devoMask;		// DevoJK: a lightmap's DevoGI lamp shadow masks (live lighting), or NULL
 } image_t;
 
 typedef struct cubemap_s {
@@ -2878,6 +2879,8 @@ void		R_DevoLights_Extract( const char *mapName, const byte *fileBase, const dhe
 void		R_DevoLights_AddToScene( const vec3_t viewOrg, int freeSlots );
 void		R_DevoLights_List_f( void );
 float		R_DevoGI_LightmapAlpha( int page, int pixel );
+const byte	*R_DevoGI_LampMask( int page, int size );	// RGBA lamp masks of a lightmap page, or NULL
+void		R_DevoGI_FreeLampMasks( void );
 qboolean	R_DevoGI_LiveActive( void );
 qboolean	R_DevoGI_EntityLighting( const vec3_t point, vec3_t ambient, vec3_t directed, vec3_t lightDir, float *sunVis );
 void		R_DevoGI_FillLights( const trRefdef_t *refdef, vkUniformLight_t *uniform );

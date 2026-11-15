@@ -627,6 +627,24 @@ void R_DevoGI_SunShadowDrawn( const viewParms_t *view )
 	gi_shadowValid[cascade] = true;
 }
 
+// the lamp shadow masks of lightmap page 'page' (RGBA, size x size), while they
+// wait to be uploaded next to the lightmaps; NULL when there are none
+const byte *R_DevoGI_LampMask( int page, int size )
+{
+	if ( !gi_liveActive || !gi_live.lampsBaked || size != gi_livePageSize || page < 0 || size <= 0 )
+		return NULL;
+	const size_t pageBytes = (size_t)size * size * 4;
+	if ( (size_t)( page + 1 ) * pageBytes > gi_live.lampMask.size() )
+		return NULL;
+	return &gi_live.lampMask[(size_t)page * pageBytes];
+}
+
+void R_DevoGI_FreeLampMasks( void )
+{
+	gi_live.lampMask.clear();
+	gi_live.lampMask.shrink_to_fit();
+}
+
 void R_DevoGI_FillLights( const trRefdef_t *refdef, vkUniformLight_t *u )
 {
 	u->devo_sun_dir[3] = 0.0f;
@@ -650,6 +668,9 @@ void R_DevoGI_FillLights( const trRefdef_t *refdef, vkUniformLight_t *u )
 	// one lightmap step in GPU light: the shader rolls bright light off above 170 steps,
 	// like the bake does (gi_shoulder), so live sun on top of bounce light doesn't clip
 	u->devo_sun_color[3] = shift;
+	// lamp tiers: the lamps' light and soft shadows are baked into the live layer, so on
+	// lightmapped surfaces a live lamp only adds its highlights, inside its baked mask
+	u->devo_shadow_offset[3] = gi_live.lampsBaked ? 1.0f : 0.0f;
 
 	// the sun's real-time shadow maps, when both cascades have been drawn
 	if ( gi_shadowValid[0] && gi_shadowValid[1] && r_devoGI_sunShadow->integer && gi_live.hasSun ) {
@@ -704,6 +725,9 @@ void R_DevoGI_FillLights( const trRefdef_t *refdef, vkUniformLight_t *u )
 		VectorCopy( fx.origin, e.origin );
 		const bool area = fx.halfU > 0 || fx.halfV > 0;
 		e.origin[3] = area ? 1.0f : 2.0f;	// light type: 1 = glowing surface, 2 = shines everywhere
+		// lamp tiers: its channel in the baked lamp shadow masks, as type + 10 * ( channel + 1 )
+		if ( gi_live.lampsBaked && fx.maskChannel >= 0 && fx.maskChannel < 4 )
+			e.origin[3] += 10.0f * ( fx.maskChannel + 1 );
 		VectorScale( fx.rgb, shift, e.color );
 		e.radius = fx.reach;
 		VectorCopy( fx.normal, e.normal );

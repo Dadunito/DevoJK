@@ -2962,6 +2962,11 @@ void RB_StageIteratorGeneric( void )
 		
 			if ( def.vk_light_flags & LIGHTDEF_USE_LIGHTMAP && def.vk_pbr_flags & PBR_HAS_DELUXEMAP )
 				vk_update_descriptor(  VK_DESC_PBR_DELUXE, pStage->bundle[1].deluxeMap->descriptor_set );
+			// DevoJK: maps lit by DevoGI have no deluxemaps; with live lighting this slot
+			// carries the lightmap's lamp shadow masks instead (see R_DevoGI_LampMask)
+			else if ( def.vk_light_flags & LIGHTDEF_USE_LIGHTMAP && pStage->bundle[1].image[0]
+				&& pStage->bundle[1].image[0]->devoMask )
+				vk_update_descriptor(  VK_DESC_PBR_DELUXE, pStage->bundle[1].image[0]->devoMask->descriptor_set );
 			else
 				vk_update_descriptor(  VK_DESC_PBR_DELUXE, tr.whiteImage->descriptor_set );
 		}

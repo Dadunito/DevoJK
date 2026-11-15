@@ -505,8 +505,18 @@ void main() {
 
 			
 		#ifdef VK_DLIGHT_GPU
+			// lamp tiers: on lightmapped surfaces the lamps' light is baked; live lamps add
+			// their highlights inside the baked lamp shadow masks (in the deluxemap slot)
+			vec4 devoMask = vec4( 1.0 );
+			bool devoMaskMode = false;
+			#if defined(USE_LIGHTMAP) && defined(USE_TX1)
+				if ( devoLive && u_lights.devo_shadow_offset.w > 0.5 ) {
+					devoMask = texture( deluxe_texture, frag_tex_coord1 );
+					devoMaskMode = true;
+				}
+			#endif
 			out_color.rgb += CalcDynamicLightContribution(roughness, N, E, u_camera.viewOrigin.xyz, viewDir, NE, diffuse.rgb, specular.rgb, var_Normal.xyz,
-				devoSunVis, devoLive && devoAllowed);
+				devoSunVis, devoLive && devoAllowed, devoMask, devoMaskMode);
 		#endif
 
 		// DevoGI live lighting: live sun and lamps come on top of the baked bounce light, so

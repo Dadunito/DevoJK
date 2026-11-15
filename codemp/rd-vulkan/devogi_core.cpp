@@ -328,7 +328,7 @@ static_assert( sizeof( dsurface_t ) == 148, "dsurface_t must match the BSP file"
 #include <vector>
 
 // Bump this whenever the bake changes in a way that should invalidate old .devogi files.
-#define DEVOGI_VERSION		21
+#define DEVOGI_VERSION		22
 
 #define DEVOGI_BSP_LM_SIZE	128			// lightmap page size stored in every Q3/JA BSP
 #define DEVOGI_LM_SIZE		gi_lmSize	// page size we are baking right now (128 * scale)
@@ -1408,6 +1408,8 @@ struct giBake {
 	std::vector<float>			light;		// direct + bounce light so far, per page pixel rgb
 	std::vector<float>			indirect;	// bounce light per texel: rgb + ambient occlusion
 	std::vector<float>			sunVis;		// how much of the sun each texel sees, 0..1 (for live light)
+	std::vector<gvec3>			liveDirect;	// live bake: each texel's direct light from the lamps (no sun),
+											// baked into the live layer (see dgLiveLighting::lampsBaked)
 	int							numPages;
 	gvec3						skyColor;
 	float						texelSize;	// typical texel size (median), for filter radii
@@ -3443,7 +3445,14 @@ static void gi_build_bounce_maps( giBake &bake, dgLiveLighting &live, bool relig
 		px[0] = bake.indirect[i * 4 + 0] * k;
 		px[1] = bake.indirect[i * 4 + 1] * k;
 		px[2] = bake.indirect[i * 4 + 2] * k;
+		// live bake: the lamps' own light with its soft shadows (see lampsBaked)
+		if ( i < bake.liveDirect.size() && tx.styleValue == 0 ) {
+			px[0] += bake.liveDirect[i].x * exposure;
+			px[1] += bake.liveDirect[i].y * exposure;
+			px[2] += bake.liveDirect[i].z * exposure;
+		}
 	}
+	live.lampsBaked = relight && !bake.liveDirect.empty();
 	std::vector<char> filled;
 	gi_dilate( bake, img, &filled );
 
@@ -3481,8 +3490,10 @@ static void gi_build_bounce_maps( giBake &bake, dgLiveLighting &live, bool relig
 				if ( !n )
 					continue;
 				uint8_t *o = &live.bounce[( ( (size_t)p * bs + y ) * bs + x ) * 4];
+				float c[3] = { sum[0] / n, sum[1] / n, sum[2] / n };
+				gi_shoulder( c );	// lamp light right by a lamp rolls off instead of clipping
 				for ( int k = 0; k < 3; k++ )
-					o[k] = (uint8_t)Com_Clampi( 0, 255, (int)( sum[k] / n + 0.5f ) );
+					o[k] = (uint8_t)Com_Clampi( 0, 255, (int)( c[k] + 0.5f ) );
 				o[3] = (uint8_t)Com_Clampi( 0, 255, (int)( sum[3] / n * 255.0f + 0.5f ) );
 			}
 		}
@@ -3729,6 +3740,7 @@ static void gi_build_fixtures( dgLiveLighting &live, float exposure, const std::
 		centre = centre * ( 1.0f / photons );
 
 		dgFixture fx = {};
+		fx.maskChannel = -1;
 		fx.origin[0] = centre.x; fx.origin[1] = centre.y; fx.origin[2] = centre.z;
 		fx.shader = first.shader;
 		const gvec3 rgb = first.color * ( photons * strength );
@@ -3769,13 +3781,185 @@ static void gi_build_fixtures( dgLiveLighting &live, float exposure, const std::
 		n, (int)live.fixtures.size(), gi_hasSun ? ", plus the sun" : "" );
 }
 
+/*
+Lamp shadow masks (live bake, see dgLiveLighting::lampsBaked). For every pixel of
+the live layer: which lamps light it most (up to four), and how much of each it
+sees - traced from the pixel to points spread over the lamp's glowing rectangle,
+so the masks are as soft as the baked shadows. Each lamp gets one of four channels;
+two lamps that light the same pixels never share one (the most powerful lamps
+choose first). A lamp left without a channel is simply never drawn live: its
+light stays the baked one.
+*/
+static void gi_build_lamp_masks( const giBake &bake, dgLiveLighting &live ) {
+	const int bs = live.bouncePageSize;
+	const int nf = (int)live.fixtures.size();
+	if ( bs <= 0 || nf <= 0 || !live.lampsBaked )
+		return;
+	const int f = Q_max( 1, DEVOGI_LM_SIZE / bs );
+	const size_t npix = (size_t)bake.numPages * bs * bs;
+
+	// one texel stands for each mask pixel
+	std::vector<int> rep( npix, -1 );
+	gi_parallel_for( bake.numPages * bs, [&]( int row ) {
+		const int p = row / bs, y = row % bs;
+		for ( int x = 0; x < bs; x++ ) {
+			for ( int dy = 0; dy < f && rep[(size_t)row * bs + x] < 0; dy++ ) {
+				for ( int dx = 0; dx < f; dx++ ) {
+					const int o = bake.owner[( (size_t)p * DEVOGI_LM_SIZE + y * f + dy ) * DEVOGI_LM_SIZE + x * f + dx];
+					if ( o >= 0 && !bake.texels[o].buried && bake.texels[o].styleValue == 0 ) {
+						rep[(size_t)row * bs + x] = o;
+						break;
+					}
+				}
+			}
+		}
+	} );
+
+	struct lamp_t { gvec3 c, n, u, v; float hu, hv, power, reach; bool rect; };
+	std::vector<lamp_t> lamps( nf );
+	for ( int i = 0; i < nf; i++ ) {
+		const dgFixture &fx = live.fixtures[i];
+		lamp_t &l = lamps[i];
+		l.c = gvec3( fx.origin[0], fx.origin[1], fx.origin[2] );
+		l.n = gvec3( fx.normal[0], fx.normal[1], fx.normal[2] );
+		l.rect = gdot( l.n, l.n ) > 0.5f;
+		l.u = gvec3( fx.axisU[0], fx.axisU[1], fx.axisU[2] );
+		l.v = l.rect ? gnorm( gcross( l.n, l.u ) ) : gvec3();
+		l.hu = fx.halfU; l.hv = fx.halfV;
+		l.power = Q_max( fx.rgb[0], Q_max( fx.rgb[1], fx.rgb[2] ) );
+		l.reach = fx.reach;
+	}
+
+	// 1. the four lamps that light each pixel most
+	std::vector<int16_t> top( npix * 4, -1 );
+	gi_parallel_for( (int)( npix / 4096 + 1 ), [&]( int chunk ) {
+		const size_t a = (size_t)chunk * 4096, b = Q_min( npix, a + 4096 );
+		for ( size_t q = a; q < b; q++ ) {
+			if ( rep[q] < 0 )
+				continue;
+			const giTexel &tx = bake.texels[rep[q]];
+			const gvec3 o = tx.pos + tx.faceNormal * 1.0f;
+			float best[4] = { 0, 0, 0, 0 };
+			int16_t *t = &top[q * 4];
+			for ( int i = 0; i < nf; i++ ) {
+				const lamp_t &l = lamps[i];
+				gvec3 L = l.c - o;
+				const float d2 = gdot( L, L );
+				if ( d2 > l.reach * l.reach || d2 < 1e-4f )
+					continue;
+				L = L * ( 1.0f / sqrtf( d2 ) );
+				const float cr = gdot( tx.normal, L );
+				const float ce = l.rect ? -gdot( l.n, L ) : 1.0f;
+				if ( cr <= 0 || ce <= 0 )
+					continue;
+				const float e = l.power * cr * ce / Q_max( d2, 16.0f );
+				if ( e < 0.5f )
+					continue;	// too faint here to matter
+				for ( int k = 0; k < 4; k++ ) {
+					if ( e > best[k] ) {
+						for ( int m = 3; m > k; m-- ) { best[m] = best[m - 1]; t[m] = t[m - 1]; }
+						best[k] = e;
+						t[k] = (int16_t)i;
+						break;
+					}
+				}
+			}
+		}
+	} );
+
+	// 2. channels: lamps that share a pixel must differ; the most powerful choose first
+	std::vector<char> shares( (size_t)nf * nf, 0 );
+	for ( size_t q = 0; q < npix; q++ ) {
+		const int16_t *t = &top[q * 4];
+		for ( int a = 0; a < 4 && t[a] >= 0; a++ )
+			for ( int b = a + 1; b < 4 && t[b] >= 0; b++ ) {
+				shares[(size_t)t[a] * nf + t[b]] = 1;
+				shares[(size_t)t[b] * nf + t[a]] = 1;
+			}
+	}
+	std::vector<int> order( nf );
+	for ( int i = 0; i < nf; i++ )
+		order[i] = i;
+	std::sort( order.begin(), order.end(), [&]( int a, int b ) { return lamps[a].power > lamps[b].power; } );
+	int withChannel = 0;
+	for ( int i : order ) {
+		bool used[4] = { false, false, false, false };
+		for ( int j = 0; j < nf; j++ )
+			if ( shares[(size_t)i * nf + j] && live.fixtures[j].maskChannel >= 0 )
+				used[live.fixtures[j].maskChannel] = true;
+		live.fixtures[i].maskChannel = -1;
+		for ( int c = 0; c < 4; c++ ) {
+			if ( !used[c] ) {
+				live.fixtures[i].maskChannel = c;
+				withChannel++;
+				break;
+			}
+		}
+	}
+
+	// 3. how much of each lamp a pixel sees: rays to points spread over the lamp
+	live.lampMask.assign( npix * 4, 0 );
+	const int S = 8;		// 4 x 2 points over the rectangle (one for a point light)
+	const size_t chunkPix = 65536;
+	std::vector<dgGpuRay> rays;
+	std::vector<dgGpuHit> hits;
+	std::vector<std::pair<size_t, int>> owner;	// ray group -> (mask pixel, channel)
+	for ( size_t a = 0; a < npix; a += chunkPix ) {
+		const size_t b = Q_min( npix, a + chunkPix );
+		rays.clear();
+		owner.clear();
+		for ( size_t q = a; q < b; q++ ) {
+			if ( rep[q] < 0 )
+				continue;
+			const giTexel &tx = bake.texels[rep[q]];
+			const gvec3 o = tx.pos + tx.faceNormal * 1.0f;
+			for ( int k = 0; k < 4; k++ ) {
+				const int li = top[q * 4 + k];
+				if ( li < 0 || live.fixtures[li].maskChannel < 0 )
+					continue;
+				const lamp_t &l = lamps[li];
+				owner.push_back( std::make_pair( q, live.fixtures[li].maskChannel ) );
+				for ( int s = 0; s < S; s++ ) {
+					gvec3 target = l.c;
+					if ( l.rect )
+						target += l.u * ( ( ( s % 4 ) + 0.5f ) / 4.0f * 2.0f - 1.0f ) * l.hu * 0.9f
+								+ l.v * ( ( ( s / 4 ) + 0.5f ) / 2.0f * 2.0f - 1.0f ) * l.hv * 0.9f;
+					gvec3 d = target - o;
+					const float len = sqrtf( gdot( d, d ) );
+					dgGpuRay r;
+					r.origin[0] = o.x; r.origin[1] = o.y; r.origin[2] = o.z;
+					r.tmin = DEVOGI_RAY_TMIN;
+					d = d * ( 1.0f / Q_max( len, 1e-3f ) );
+					r.dir[0] = d.x; r.dir[1] = d.y; r.dir[2] = d.z;
+					r.tmax = Q_max( DEVOGI_RAY_TMIN + 0.01f, len - 0.5f );
+					rays.push_back( r );
+				}
+			}
+		}
+		if ( rays.empty() )
+			continue;
+		hits.resize( rays.size() );
+		gi_trace_many( bake, rays.data(), hits.data(), rays.size(), true );
+		for ( size_t g = 0; g < owner.size(); g++ ) {
+			int seen = 0;
+			for ( int s = 0; s < S; s++ )
+				if ( hits[g * S + s].tri < 0 )
+					seen++;
+			live.lampMask[owner[g].first * 4 + owner[g].second] = (uint8_t)( seen * 255 / S );
+		}
+	}
+	dg_print( "DevoGI: lamp shadow masks: %d of %d lamps have a channel\n", withChannel, nf );
+}
+
 static void gi_build_live( giBake &bake, dgLiveLighting &live, const giLightGrid *lightGrid, bool relight, float exposure, float intensity,
 	int rays, const std::vector<float> &groupScale ) {
 	live = dgLiveLighting();
 	live.relit = relight;
 	gi_build_bounce_maps( bake, live, relight, exposure, intensity );
-	if ( relight )
+	if ( relight ) {
 		gi_build_fixtures( live, exposure, groupScale );
+		gi_build_lamp_masks( bake, live );
+	}
 	gi_build_probes( bake, live, intensity, rays, relight ? lightGrid : NULL, groupScale, exposure );
 }
 
@@ -4234,6 +4418,18 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 		bake.direct = fullDirect;
 		gi_compose( bake, intensity );
 		bake.indirect.swap( liveLayer );	// the live layer is what gi_build_bounce_maps stores
+
+		// the lamps' direct light (all direct light but the sun's) goes into the live layer
+		// too: lamps far away are drawn from it, with their soft baked shadows
+		bake.liveDirect.assign( bake.texels.size(), gvec3() );
+		for ( size_t i = 0; i < bake.texels.size() && i < sunDirect.size(); i++ ) {
+			const giTexel &tx = bake.texels[i];
+			if ( tx.styleValue != 0 )
+				continue;
+			const float *px = &fullDirect[( ( (size_t)tx.page * DEVOGI_LM_SIZE + tx.y ) * DEVOGI_LM_SIZE + tx.x ) * 3];
+			bake.liveDirect[i] = gvec3( Q_max( 0.0f, px[0] - sunDirect[i].x ), Q_max( 0.0f, px[1] - sunDirect[i].y ),
+				Q_max( 0.0f, px[2] - sunDirect[i].z ) );
+		}
 	}
 	sunDirect.clear();
 	sunDirect.shrink_to_fit();
@@ -4256,6 +4452,8 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 				bake.indirect[i * 4 + k] = bake.indirect[(size_t)o * 4 + k];
 			if ( !bake.sunVis.empty() )
 				bake.sunVis[i] = bake.sunVis[o];
+			if ( !bake.liveDirect.empty() )
+				bake.liveDirect[i] = bake.liveDirect[o];
 			copied++;
 		}
 		dg_print( "DevoGI: %d texels under walls take their light from the visible side\n", copied );
@@ -5108,6 +5306,12 @@ std::vector<byte> DG_WriteCache( uint64_t bspHash, uint64_t settingsHash, const 
 	gi_put( file, live.sunRgb, sizeof( live.sunRgb ) );
 	gi_section_end( file, s );
 
+	// lamp tiers: lamps baked into the live layer, and their shadow masks
+	s = gi_section_begin( file, "MASK" );
+	gi_put_i32( file, live.lampsBaked ? 1 : 0 );
+	gi_put( file, live.lampMask.data(), live.lampMask.size() );
+	gi_section_end( file, s );
+
 	// surfaces that got their own lightmap spot (see dgLightmapMove)
 	s = gi_section_begin( file, "MOVE" );
 	gi_put_i32( file, (int32_t)result.lightmapMoves.size() );
@@ -5168,6 +5372,13 @@ static bool gi_read_sections( const byte *p, const byte *end, dgResult &result )
 			if ( !get( &sun, 4 ) || !get( live.sunDir, 12 ) || !get( live.sunRgb, 12 ) )
 				return false;
 			live.hasSun = sun != 0;
+		}
+		else if ( !memcmp( tag, "MASK", 4 ) ) {
+			int32_t baked = 0;
+			if ( !get( &baked, 4 ) )
+				return false;
+			live.lampsBaked = baked != 0;
+			live.lampMask.assign( q, qend );
 		}
 		else if ( !memcmp( tag, "MOVE", 4 ) ) {
 			int32_t n = 0;

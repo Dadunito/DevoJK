@@ -97,7 +97,8 @@
 		float CalcDevoLampAttenuation( in vkUniformLightEntry_t light, in vec3 L, in float sqrLightDist, in float radiusSqr )
 		{
 			float cosE = 1.0;
-			if ( light.origin.w < 1.5 ) {
+			// origin.w = type + 10 * ( mask channel + 1 ): type 1 is a glowing surface
+			if ( mod( light.origin.w, 10.0 ) < 1.5 ) {
 				cosE = -dot( light.normal.xyz, L );
 				if ( cosE <= 0.0 )
 					return 0.0;		// behind the glowing surface
@@ -171,7 +172,9 @@
 			in vec3 specular,
 			in vec3 vertexNormal,
 			in float devoSunVis,
-			in bool devoAllowed )
+			in bool devoAllowed,
+			in vec4 devoMask,
+			in bool devoMaskMode )
 		{
 			vec3 outColor = vec3(0.0);
 			vec3 position = viewOrigin - viewDir;
@@ -222,6 +225,23 @@
 				float LH = clamp(dot(L, H), 0.0, 1.0);
 				float NH = clamp(dot(N, H), 0.0, 1.0);
 				float VH = clamp(dot(E, H), 0.0, 1.0);
+
+				/*
+				DevoGI lamp tiers, on a lightmapped surface: the lamp's diffuse light and its
+				soft shadows are already in the lightmap (baked), so drawn live it adds only
+				what a bake can't hold - its highlight - and only as far as the baked mask
+				says this spot sees the lamp. A lamp without a mask channel stays baked only.
+				*/
+				if ( devoLamp && devoMaskMode ) {
+					float channel = floor( light.origin.w / 10.0 ) - 1.0;
+					if ( channel < 0.0 )
+						continue;
+					float vis = channel < 0.5 ? devoMask.r : ( channel < 1.5 ? devoMask.g : ( channel < 2.5 ? devoMask.b : devoMask.a ) );
+					if ( vis <= 0.0 )
+						continue;
+					outColor += light.color * CalcSpecular(specular, NH, NL, NE, LH, VH, roughness) * ( attenuation * NL * vis );
+					continue;
+				}
 
 				vec3 reflectance = diffuse + CalcSpecular(specular, NH, NL, NE, LH, VH, roughness);
 

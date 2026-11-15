@@ -30,6 +30,8 @@ along with this program; if not, see <http://www.gnu.org/licenses/>.
 #undef JSON_IMPLEMENTATION
 
 static const imgFlags_t lightmapFlags = IMGFLAG_NOLIGHTSCALE | IMGFLAG_NO_COMPRESSION | IMGFLAG_LIGHTMAP | IMGFLAG_NOSCALE | IMGFLAG_CLAMPTOEDGE;
+// DevoGI lamp shadow masks: plain data next to the lightmaps, not light (no light scaling)
+#define DEVO_MASK_FLAGS ( IMGFLAG_NOLIGHTSCALE | IMGFLAG_NO_COMPRESSION | IMGFLAG_NOSCALE | IMGFLAG_CLAMPTOEDGE )
 
 /*
 
@@ -463,6 +465,19 @@ static	void R_LoadLightmaps( world_t &worldData, lump_t *l, lump_t *surfs ) {
 					lightmapFlags,
 					0, 0 );
 			}
+
+			// DevoGI live lighting: the lamps' shadow masks, an atlas laid out exactly like
+			// the lightmap atlas (filled page by page below)
+			if ( R_DevoGI_LampMask( 0, lightmapSize ) )
+			{
+				tr.lightmaps[i]->devoMask = R_CreateImage(
+					va("_devomaskatlas%d", i),
+					NULL,
+					tr.lightmapAtlasSize[0],
+					tr.lightmapAtlasSize[1],
+					DEVO_MASK_FLAGS,
+					0, 0 );
+			}
 		}
 	}
 
@@ -671,6 +686,21 @@ static	void R_LoadLightmaps( world_t &worldData, lump_t *l, lump_t *surfs ) {
 						lightmapHeight,
 						lightmapFlags,
 						textureInternalFormat, 0 );
+
+				// DevoGI live lighting: this page's lamp shadow masks (RGBA, the same size and
+				// place as the lightmap), read by the shader where the deluxemap would be
+				const byte *devoMask = R_DevoGI_LampMask( i, lightmapWidth );
+				if ( devoMask && lightmapWidth * lightmapHeight * 4 <= imageSize ) {
+					Com_Memcpy( image, devoMask, lightmapWidth * lightmapHeight * 4 );
+					if ( tr.worldInternalLightmapping ) {
+						if ( tr.lightmaps[lightmapnum]->devoMask )
+							vk_upload_image_data( tr.lightmaps[lightmapnum]->devoMask, xoff, yoff,
+								lightmapWidth, lightmapHeight, 1, image, lightmapWidth * lightmapHeight * 4, qtrue );
+					} else {
+						tr.lightmaps[i]->devoMask = R_CreateImage( va( "*devomask%d", i ), image,
+							lightmapWidth, lightmapHeight, DEVO_MASK_FLAGS, 0, 0 );
+					}
+				}
 			}
 
 			if ( externalLightmap )
@@ -825,6 +855,7 @@ static	void R_LoadLightmaps( world_t &worldData, lump_t *l, lump_t *surfs ) {
 
 	if ( devoGILightmaps )
 		Z_Free( devoGILightmaps );
+	R_DevoGI_FreeLampMasks();	// they are on the GPU now
 
 	if ( tr.deluxemaps )
 		tr.worldDeluxeMapping = qtrue;
