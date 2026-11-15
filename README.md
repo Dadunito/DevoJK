@@ -9,6 +9,10 @@ DevoJK is a Jedi Knight: Jedi Academy multiplayer client by **Devoted**. It's bu
 > **Status:** early, work in progress. Changes so far are listed under [What's new](#whats-new).
 
 ## What's new
+* **DevoGI lighting:** every map gets new baked lighting with bounced light, soft shadows and darker corners. Pick **Low spec** (everything baked, as fast as the original game) or **High spec** (live sun and lamps, with real-time shadows from players and anything that moves). How it works and how to set it up is in the **[manual](MANUAL.md)**.
+* **DevoJK settings menu:** Setup → DevoJK, with a Vulkan page and a DevoGI page.
+* **Precompile Shaders:** a small program in the game folder that bakes the lighting for many maps at once, outside the game.
+* **Saber trail settings:** SFX trails only show while swinging, plus a trail length setting (`cg_saberTrailLength`) and a glow strength setting (`cg_shaderSaberGlowAlpha`).
 * **SFX sabers in the menus:** with Saber Trail set to **SFX** (`cg_saberTrail 3`), the saber preview in the profile and saber menus now uses the SFX blade, matching what you see in game. The blade glow and core size follow `cg_shaderSaberGlow` and `cg_shaderSaberCore`. Ported from [JKEnhanced](https://github.com/JKEnhanced/OpenJK) by redsaurus.
 * **Black SFX blades fixed:** black sabers no longer get a random colour with SFX sabers on.
 
@@ -27,6 +31,7 @@ DevoJK only exists thanks to the people who brought Vulkan and incredible graphi
 1. Build DevoJK (see below), or use a release once one is available.
 2. Copy the files into your Jedi Academy `GameData` folder. For Steam, that's `<Steam Folder>/steamapps/common/Jedi Academy/GameData/`.
 3. Run `eternaljk.x86_64.exe`. The Vulkan renderer is selected with `cl_renderer rd-vulkan`.
+4. Read the [manual](MANUAL.md) for the lighting settings. In short: Setup → DevoJK → Performance mode.
 
 ## For developers
 ### Building

@@ -6127,8 +6127,8 @@ void CG_DoSFXSaber( vec3_t blade_muz, vec3_t blade_tip, vec3_t trail_tip, vec3_t
 
 	VectorMA( blade_muz, blade_len * 0.5f, blade_dir, mid );
 
-	// DevoJK fix: rgb also colours the blade further down, so it must be set even when the
-	// saber casts no light (black blades never do) - before, they got random colours.
+	// DevoJK: rgb also colours the blade below, so set it even for sabers that cast no
+	// light (black ones), or they get a random colour.
 	CG_RGBForSaberColor(color, rgb, cnum, bnum);
 	VectorScale(rgb, 0.66f, rgb);
 	if ( doLight ) {
@@ -7620,14 +7620,10 @@ CheckTrail:
 			dirlen1 = VectorLength(dir1);
 			dirlen2 = VectorLength(dir2);
 
-			/*
-			DevoJK: like the stock trail, the SFX trail shows only while the saber swings
-			(an attack move, a super-break, force speed or a thrown saber) - just walking
-			around with the blade out leaves no trail. While swinging, the old edge of the
-			trail follows the blade, keeping a share of its distance each frame ('lagscale'
-			times the base/tip share); cg_saberTrailLength raises that share to the power
-			1/length, so 2 makes the trail fade twice as slowly, 0.5 twice as fast.
-			*/
+			// DevoJK: like the classic trail, the SFX one only shows while swinging (attack,
+			// super-break, force speed or a thrown saber). Each frame the trail's old edge
+			// keeps a share of its distance to the blade; cg_saberTrailLength raises that
+			// share to the power 1/length, so 2 fades twice as slowly.
 			sfxTrailOn = (qboolean)( cent->currentState.saberMove >= 0 && cent->currentState.saberMove < LS_MOVE_MAX
 				&& ( BG_SuperBreakWinAnim( cent->currentState.torsoAnim )
 					|| saberMoveData[cent->currentState.saberMove].trailLength > 0

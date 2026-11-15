@@ -16,6 +16,7 @@
 	loadMenu { "ui/jamp/rules_moves.menu" }
 	loadMenu { "ui/jamp/controls.menu" }
 	loadMenu { "ui/jamp/setup.menu" }
+	loadMenu { "ui/jamp/devojk.menu" }
 	loadMenu { "ui/jamp/demo.menu" }
 	loadMenu { "ui/jamp/demo_delete.menu" }
 	loadMenu { "ui/jamp/password.menu" }

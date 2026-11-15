@@ -160,11 +160,10 @@
 			// near cascade on top, fading into the far one at its border
 			if ( nearVis >= 0.0 )
 				vis = mix( nearVis, vis, clamp( ( edgeNear - params.w ) / ( 0.98 - params.w ), 0.0, 1.0 ) );
-			// The baked sun shadow is exact for the level itself. The shadow maps have to look
-			// a little off the surface (or a surface would shadow itself), and right at the
-			// foot of a wall that let a thin strip of sun through. So the level keeps its baked
-			// shadow, and the live maps only add the shadows of moving things.
-			// (only on lightmapped surfaces: a model's baked value comes from the coarse probes)
+			// On the level itself the baked sun shadow is exact, while the shadow maps look a
+			// little off the surface and can let a strip of sun in at a wall's foot. So the
+			// level keeps its baked shadow and the maps only add what moves. (Models get their
+			// baked value from the coarse probes, so they use the maps as they are.)
 			return bakedExact ? min( vis, bakedVis ) : vis;
 		}
 
@@ -292,12 +291,9 @@
 				float NH = clamp(dot(N, H), 0.0, 1.0);
 				float VH = clamp(dot(E, H), 0.0, 1.0);
 
-				/*
-				DevoGI lamp tiers, on a lightmapped surface: the lamp's diffuse light and its
-				soft shadows are already in the lightmap (baked), so drawn live it adds only
-				what a bake can't hold - its highlight - and only as far as the baked mask
-				says this spot sees the lamp. A lamp without a mask channel stays baked only.
-				*/
+				// On a lightmapped surface the lamp's light and soft shadows are already
+				// baked, so live it only adds its highlight, as far as the baked mask says
+				// this spot sees the lamp. Lamps without a mask channel stay baked only.
 				if ( devoLamp && devoMaskMode ) {
 					float channel = floor( mod( light.origin.w, 100.0 ) / 10.0 ) - 1.0;
 					if ( channel < 0.0 )
@@ -307,9 +303,8 @@
 						continue;
 					vec3 lit = light.color * ( attenuation * NL * vis );
 					outColor += lit * CalcSpecular(specular, NH, NL, NE, LH, VH, roughness) * moverVis;
-					// where something moving blocks the lamp, take back the lamp's diffuse
-					// light that the bake put into the lightmap (the same amount, see
-					// CalcDevoLampAttenuation): the mover's shadow on the floor and walls
+					// where a mover blocks the lamp, take its baked light back out
+					// (the same amount, see CalcDevoLampAttenuation): that's the shadow
 					outColor -= lit * diffuse * ( 1.0 - moverVis );
 					continue;
 				}

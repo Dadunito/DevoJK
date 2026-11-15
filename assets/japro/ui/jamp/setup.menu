@@ -807,6 +807,53 @@
 			}
 		}
 
+		// DevoJK settings button: opens devojk.menu (Vulkan and DevoGI pages)
+		itemDef
+		{
+			name				devojkbutton_glow
+			group				highlights
+			style				WINDOW_STYLE_SHADER
+			rect				80 329 180 24
+			background			"gfx/menus/menu_blendbox2"
+			forecolor			1 1 1 1
+			visible			0
+			decoration
+		}
+
+		itemDef
+		{
+			name				devojkmenubutton
+			group				setup_submenu
+			text				"DevoJK"
+			type				ITEM_TYPE_BUTTON
+			style				WINDOW_STYLE_EMPTY
+			rect				80 329 170 24
+			font				3
+			textscale			0.9
+			textalignx			160
+			textaligny			2
+			textalign			ITEM_ALIGN_RIGHT
+			textstyle			0
+			forecolor			1 .682 0 1
+			visible			1
+			descText			"Vulkan and DevoGI lighting settings."
+
+			mouseEnter
+			{
+				show			devojkbutton_glow
+			}
+			mouseExit
+			{
+				hide			devojkbutton_glow
+			}
+			action
+			{
+				play			"sound/interface/button1.wav" ;
+				close			setup_menu ;
+				open			devojk_menu ;
+			}
+		}
+
 		itemDef 
 		{
 			name				setup_background

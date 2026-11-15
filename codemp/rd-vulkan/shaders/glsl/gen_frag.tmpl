@@ -518,7 +518,7 @@ void main() {
 			#endif
 			out_color.rgb += CalcDynamicLightContribution(roughness, N, E, u_camera.viewOrigin.xyz, viewDir, NE, diffuse.rgb, specular.rgb, var_Normal.xyz,
 				devoSunVis, devoLive && devoAllowed, devoMask, devoMaskMode);
-			// a moving thing's shadow takes baked lamp light back out: never below black
+			// a mover's shadow subtracts baked lamp light, so stop at black
 			out_color.rgb = max( out_color.rgb, vec3( 0.0 ) );
 		#endif
 
@@ -533,11 +533,9 @@ void main() {
 			if ( incident > knee )
 				out_color.rgb *= ( knee + room * ( 1.0 - exp( -( incident - knee ) / room ) ) ) / incident;
 
-			// ...and the screen itself: the final picture is this colour times the overbright
-			// scale (devo_shadow_offset.z), and anything past 1.0 there clips per channel - a
-			// pale wall in full sun under the bright live sky went flat pale green. So the
-			// colour as it will show is rolled off from 80% of white, all channels together:
-			// the brightest walls keep their texture and hue instead of clipping.
+			// The screen clips too: the final picture is this colour times the overbright
+			// scale (devo_shadow_offset.z). Rolling off from 80% of white, all channels
+			// together, keeps sunlit pale walls textured instead of flat.
 			float screen = max( out_color.r, max( out_color.g, out_color.b ) ) * u_lights.devo_shadow_offset.z;
 			const float white = 0.8;
 			if ( screen > white )

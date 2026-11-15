@@ -214,3 +214,8 @@ DG_ReadCache only accepts a file made for exactly this BSP, settings and size.
 std::vector<uint8_t>	DG_WriteCache( uint64_t bspHash, uint64_t settingsHash, const dgResult &result );
 bool					DG_ReadCache( const uint8_t *data, size_t length, const uint8_t *bsp,
 							uint64_t bspHash, uint64_t settingsHash, int scale, dgResult &result );
+
+// A quick look at just the start of a .devogi file: was it made by this version, for
+// this map and these settings? Lets a host check a file without reading all of it.
+size_t					DG_CacheHeaderSize( void );
+bool					DG_CacheHeaderMatches( const uint8_t *head, size_t length, uint64_t bspHash, uint64_t settingsHash );

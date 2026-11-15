@@ -74,15 +74,17 @@ static cvar_t *r_devoGI_sunShadowSize;
 static cvar_t *r_devoGI_sunShadowRange;
 static cvar_t *r_devoGI_sunShadowRangeFar;
 static cvar_t *r_devoGI_lampShadows;
+static cvar_t *r_devoGI_prebake;
+static cvar_t *r_devoGI_prebakeSet;
 static cvar_t *r_devoGI_lampShadowSize;
 static cvar_t *r_devoGI_lampShadowRange;
 
 void R_DevoGI_Register( void )
 {
 	r_devoGI				= ri.Cvar_Get( "r_devoGI",				"1",	CVAR_ARCHIVE | CVAR_LATCH, "Baked global illumination: maps get new lighting on their first load, cached in maps/<name>.devogi\n 0: off\n 1: on" );
-	r_devoGI_scale			= ri.Cvar_Get( "r_devoGI_scale",		"4",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI lightmap resolution multiplier (1 to 16, the same for every surface). Higher gives sharper shadows and corners but bakes slower and uses more memory" );
+	r_devoGI_scale			= ri.Cvar_Get( "r_devoGI_scale",		"12",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI lightmap resolution multiplier (1 to 16, the same for every surface). Higher gives sharper shadows and corners but bakes slower and uses more memory" );
 	r_devoGI_rays			= ri.Cvar_Get( "r_devoGI_rays",			"128",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI rays per bounce-light sample (8-1024). More is smoother but bakes slower" );
-	r_devoGI_bounces		= ri.Cvar_Get( "r_devoGI_bounces",		"8",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI light bounces (1-16)" );
+	r_devoGI_bounces		= ri.Cvar_Get( "r_devoGI_bounces",		"16",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI light bounces (1-16)" );
 	r_devoGI_aa				= ri.Cvar_Get( "r_devoGI_aa",			"2.0",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI shadow anti-aliasing: width of the area each texel's shadow samples come from, in texels (0.5 = sharp, 2 = smooth, up to 4)" );
 	r_devoGI_sheen			= ri.Cvar_Get( "r_devoGI_sheen",		"0.12",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI baked sheen: every surface faintly picks up the faces right in front of it, like a slightly glossy finish (0 = off, up to 0.5)" );
 	r_devoGI_intensity		= ri.Cvar_Get( "r_devoGI_intensity",	"1.0",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI bounce light strength" );
@@ -96,7 +98,9 @@ void R_DevoGI_Register( void )
 	r_devoGI_entityLights	= ri.Cvar_Get( "r_devoGI_entityLights",	"1",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI uses light entities kept in the BSP as light sources" );
 	r_devoGI_threads		= ri.Cvar_Get( "r_devoGI_threads",		"0",	CVAR_ARCHIVE, "DevoGI bake threads (0 = all CPU cores)" );
 	r_devoGI_progress		= ri.Cvar_Get( "r_devoGI_progress",		"1",	CVAR_ARCHIVE, "DevoGI: show a progress screen with a percentage while a map bakes" );
-	r_devoGI_live			= ri.Cvar_Get( "r_devoGI_live",			"0",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI real-time lighting (work in progress): the map's lamps and the sun are drawn live, only bounce light comes from the bake\n 0: full bake (fastest)\n 1: live lamps and sun (no lamp shadows yet)" );
+	r_devoGI_live			= ri.Cvar_Get( "r_devoGI_live",			"0",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI performance mode\n 0: low spec - everything baked, fastest\n 1: high spec - live sun and lamps with real-time shadows, only bounce light is baked" );
+	r_devoGI_prebake		= ri.Cvar_Get( "r_devoGI_prebake",		"1",	CVAR_ARCHIVE, "DevoGI: bake a map's lighting in the game when it has none yet (0 = never bake in the game, use the Precompile tool; maps without a baked file keep their original lighting)" );
+	r_devoGI_prebakeSet		= ri.Cvar_Get( "r_devoGI_prebakeSet",	"0",	CVAR_ARCHIVE, "DevoGI: which versions to bake when a map loads\n 0: only the one the current performance mode needs\n 1: high spec too\n 2: low spec too\n 3: both, so switching mode never waits" );
 	r_devoGI_sunShadow		= ri.Cvar_Get( "r_devoGI_sunShadow",	"1",	CVAR_ARCHIVE, "DevoGI live lighting: real-time sun shadows from everything, players and moving objects included (0 = only the baked sun shadows)" );
 	r_devoGI_sunShadowSize	= ri.Cvar_Get( "r_devoGI_sunShadowSize",	"2048",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI live lighting: sun shadow map resolution (1024, 2048 or 4096 - sharper but slower)" );
 	r_devoGI_sunShadowRange	= ri.Cvar_Get( "r_devoGI_sunShadowRange",	"768",	CVAR_ARCHIVE, "DevoGI live lighting: reach of the sharp sun shadow map around the player, in game units (256-2048; the coarser one takes over further away)" );
@@ -346,6 +350,39 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 	const uint64_t bspHash = DG_BspHash( fileBase );
 	const uint64_t settingsHash = DG_SettingsHash( settings, scale );
 
+	// ---- 0. prebake: also prepare the other performance mode's file, if asked to ----
+	// (first, so the two bakes never sit in memory at the same time)
+	const int prebakeSet = r_devoGI_prebakeSet->integer;
+	const bool live = r_devoGI_live->integer != 0;
+	const bool wantOther = r_devoGI_prebake->integer
+		&& ( prebakeSet == 3 || ( prebakeSet == 1 && !live ) || ( prebakeSet == 2 && live ) );
+	if ( wantOther ) {
+		dgSettings other = settings;
+		other.liveOnly = live ? 0 : 1;
+		const int otherScale = DG_ChooseScale( other, maxScale );
+		const uint64_t otherHash = DG_SettingsHash( other, otherScale );
+		char otherName[MAX_QPATH];
+		Com_sprintf( otherName, sizeof( otherName ), live ? "%s.devogi" : "%s.live.devogi", base );
+		// read only the file's header to see whether it is still good
+		bool upToDate = false;
+		fileHandle_t f;
+		if ( ri.FS_FOpenFileRead( otherName, &f, qfalse ) > 0 && f ) {
+			std::vector<byte> head( DG_CacheHeaderSize() );
+			const int got = ri.FS_Read( head.data(), (int)head.size(), f );
+			ri.FS_FCloseFile( f );
+			upToDate = got == (int)head.size() && DG_CacheHeaderMatches( head.data(), head.size(), DG_BspHash( fileBase ), otherHash );
+		}
+		if ( !upToDate ) {
+			ri.Printf( PRINT_ALL, "DevoGI: prebaking %s for the other performance mode\n", otherName );
+			dgResult otherResult;
+			if ( DG_Bake( mapName, fileBase, other, otherScale, otherResult ) ) {
+				const std::vector<byte> file = DG_WriteCache( DG_BspHash( fileBase ), otherHash, otherResult );
+				ri.FS_WriteFile( otherName, file.data(), (int)file.size() );
+				ri.Printf( PRINT_ALL, "DevoGI: saved %s\n", otherName );
+			}
+		}
+	}
+
 	dgResult result;
 	bool haveResult = false;
 
@@ -366,6 +403,10 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 
 	// ---- 2. no: bake it, and save the result for next time ----
 	if ( !haveResult ) {
+		if ( !r_devoGI_prebake->integer ) {
+			ri.Printf( PRINT_ALL, "DevoGI: no baked lighting for %s and in-game baking is off (r_devoGI_prebake 0): original lighting\n", base );
+			return NULL;
+		}
 		if ( !DG_Bake( mapName, fileBase, settings, scale, result ) )
 			return NULL;
 		const std::vector<byte> file = DG_WriteCache( bspHash, settingsHash, result );

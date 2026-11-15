@@ -1464,14 +1464,10 @@ static void gi_rasterize_tri( giBake &bake, const giTri &t, int style, int page 
 			giTexel tx;
 			tx.pos = v[0]->xyz * w0 + v[1]->xyz * w1 + v[2]->xyz * w2;
 			if ( !inside ) {
-				/*
-				A border texel was just clamped onto the triangle's edge - and where a floor
-				meets a wall, that edge lies exactly in the wall's plane. Rays starting right
-				on a wall don't see it, so gi_fix_point never slid the texel away from it and
-				its sun rays went straight through: half the sun from the far side, smoothed
-				into a thin sunlit line along the foot of the wall. A quarter unit inside the
-				triangle the wall is seen like any other.
-				*/
+				// A border texel gets clamped onto the triangle's edge. Where a floor meets a
+				// wall, that edge sits exactly in the wall's plane, and a ray starting on a
+				// wall can't see it - so the texel would catch sun through the wall and leave
+				// a bright line along its foot. Nudging it a quarter unit inwards fixes that.
 				const gvec3 centre = ( v[0]->xyz + v[1]->xyz + v[2]->xyz ) * ( 1.0f / 3.0f );
 				const gvec3 in = centre - tx.pos;
 				const float len = sqrtf( gdot( in, in ) );
@@ -2506,13 +2502,9 @@ static void gi_direct_point( const giBake &bake, const giLightGrid &grid, const 
 		const float len = sqrtf( gdot( off, off ) );
 		if ( len < 0.01f )
 			return o;
-		// a spread-out start must not end up inside a wall next to the texel (that would
-		// leak light, or darken the corner). Nor may it end up just in front of one:
-		// rays ignore whatever they hit within their first DEVOGI_RAY_TMIN units, so a start
-		// half a unit from a wall shot straight through it - the edge texels at the foot of
-		// a wall saw a third of the sun from the far side, a thin sunlit line along the
-		// crease. So the start stays a full ray-start distance (plus a little) clear of any
-		// wall in the way, moving only as far towards it as that allows.
+		// Keep the spread-out start out of the walls next to the texel, and not too close
+		// to them either: rays ignore anything in their first DEVOGI_RAY_TMIN units, so a
+		// start right in front of a wall would see straight through it.
 		const gvec3 dir = off * ( 1.0f / len );
 		const float clear = DEVOGI_RAY_TMIN + 0.5f;
 		giHit h;
@@ -5546,6 +5538,21 @@ static bool gi_read_sections( const byte *p, const byte *end, dgResult &result )
 }
 
 // only accepts a file made for exactly this BSP, these settings and this resolution
+size_t DG_CacheHeaderSize( void )
+{
+	return sizeof( devogiHeader_t );
+}
+
+bool DG_CacheHeaderMatches( const byte *head, size_t length, uint64_t bspHash, uint64_t settingsHash )
+{
+	if ( !head || length < sizeof( devogiHeader_t ) )
+		return false;
+	devogiHeader_t h;
+	memcpy( &h, head, sizeof( h ) );
+	return !memcmp( h.magic, "DVGI", 4 ) && h.version == DEVOGI_VERSION
+		&& h.bspHash == bspHash && h.settingsHash == settingsHash;
+}
+
 bool DG_ReadCache( const byte *data, size_t length, const byte *bsp,
 	uint64_t bspHash, uint64_t settingsHash, int scale, dgResult &result )
 {
