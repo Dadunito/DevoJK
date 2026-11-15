@@ -328,7 +328,7 @@ static_assert( sizeof( dsurface_t ) == 148, "dsurface_t must match the BSP file"
 #include <vector>
 
 // Bump this whenever the bake changes in a way that should invalidate old .devogi files.
-#define DEVOGI_VERSION		22
+#define DEVOGI_VERSION		23
 
 #define DEVOGI_BSP_LM_SIZE	128			// lightmap page size stored in every Q3/JA BSP
 #define DEVOGI_LM_SIZE		gi_lmSize	// page size we are baking right now (128 * scale)
@@ -2691,6 +2691,45 @@ brightness - no more blown-out lamps next to dark ones.
 ===========================================================================
 */
 
+/*
+The lamps: neighbouring glowing patches of one shader facing the same way belong
+to one lamp (the same rule gi_build_fixtures uses for the live lights). Returns
+each light's lamp number, -1 for light entities; 'count' gets the number of lamps.
+*/
+static std::vector<int> gi_lamp_clusters( int &count ) {
+	const int n = (int)gi_lights.size();
+	std::vector<int> parent( n );
+	for ( int i = 0; i < n; i++ )
+		parent[i] = i;
+	std::function<int( int )> root = [&]( int i ) { return parent[i] == i ? i : ( parent[i] = root( parent[i] ) ); };
+	for ( int i = 0; i < n; i++ ) {
+		const devoLight_t &a = gi_lights[i];
+		if ( a.shader < 0 )
+			continue;
+		for ( int j = i + 1; j < n; j++ ) {
+			const devoLight_t &b = gi_lights[j];
+			if ( b.shader != a.shader || gdot( a.normal, b.normal ) < 0.9f )
+				continue;
+			const gvec3 d = a.origin - b.origin;
+			const float link = Q_max( a.size, b.size ) * 1.5f + 8.0f;
+			if ( gdot( d, d ) > link * link )
+				continue;
+			parent[root( i )] = root( j );
+		}
+	}
+	std::vector<int> id( n, -1 ), cluster( n, -1 );
+	count = 0;
+	for ( int i = 0; i < n; i++ ) {
+		if ( gi_lights[i].shader < 0 )
+			continue;
+		const int r = root( i );
+		if ( id[r] < 0 )
+			id[r] = count++;
+		cluster[i] = id[r];
+	}
+	return cluster;
+}
+
 struct giCalibSample {
 	float					target;		// old lightmap brightness at this texel
 	std::vector<std::pair<int, float>>	parts;	// (group, brightness at strength 1)
@@ -2698,6 +2737,31 @@ struct giCalibSample {
 
 static void gi_calibrate( const giBake &bake, const giLightGrid &grid, const std::vector<float> &origLuma,
 	std::vector<float> &groupScale ) {
+	/*
+	Each lamp gets a group of its own (after the shader groups, the light entities and
+	the sun): one lamp type can be used in a brightly lit corridor in one place and as a
+	dim accent elsewhere - in the original map, light entities placed by hand made the
+	difference, and they are gone from the BSP. The fit runs twice: first per lamp type
+	(as one group, as before), then per lamp, pulled towards its type's strength and kept
+	within 0.3x to 3x of it.
+	*/
+	const int baseGroups = gi_sunGroup + 1;
+	int numLamps = 0;
+	const std::vector<int> lampOf = gi_lamp_clusters( numLamps );
+	std::vector<int> typeOf( baseGroups + numLamps );	// group -> the group of its lamp type
+	for ( int g = 0; g < baseGroups; g++ )
+		typeOf[g] = g;
+	gi_groupNames.resize( baseGroups + numLamps );
+	for ( size_t i = 0; i < gi_lights.size(); i++ ) {
+		if ( lampOf[i] < 0 )
+			continue;
+		const int g = baseGroups + lampOf[i];
+		typeOf[g] = gi_lights[i].shader;
+		gi_groupNames[g] = gi_groupNames[gi_lights[i].shader];
+		gi_lights[i].group = g;
+	}
+	gi_numGroups = baseGroups + numLamps;
+
 	const int G = gi_numGroups;
 	groupScale.assign( G, 1.0f );
 
@@ -2723,17 +2787,58 @@ static void gi_calibrate( const giBake &bake, const giLightGrid &grid, const std
 			} );
 	}, true );
 
-	// 2. normal equations of the least-squares problem: (A^T A) x = A^T b
-	std::vector<double> AtA( (size_t)G * G, 0.0 ), Atb( G, 0.0 );
-	double sumSS = 0, sumBS = 0;		// for one shared strength (the "prior")
+	// 2. normal equations of the least-squares problem: (A^T A) x = A^T b, for 'map'ped
+	// groups (map = typeOf: all lamps of a type as one group; identity: every lamp alone)
+	auto normals = [&]( const std::vector<int> &map, int n, std::vector<double> &AtA, std::vector<double> &Atb ) {
+		AtA.assign( (size_t)n * n, 0.0 );
+		Atb.assign( n, 0.0 );
+		std::vector<std::pair<int, float>> parts;
+		for ( const giCalibSample &cs : samples ) {
+			parts.clear();
+			for ( const auto &p : cs.parts ) {
+				const int g = map[p.first];
+				bool merged = false;
+				for ( auto &q : parts )
+					if ( q.first == g ) { q.second += p.second; merged = true; break; }
+				if ( !merged )
+					parts.push_back( std::make_pair( g, p.second ) );
+			}
+			for ( const auto &p : parts ) {
+				Atb[p.first] += cs.target * p.second;
+				for ( const auto &q : parts )
+					AtA[(size_t)p.first * n + q.first] += (double)p.second * q.second;
+			}
+		}
+	};
+	// projected Gauss-Seidel with a gentle pull (ridge) towards 'pull', within [lo, hi]
+	auto solve = [&]( const std::vector<double> &AtA, const std::vector<double> &Atb, int n, double ridgeShare,
+		const std::vector<double> &pull, const std::vector<double> &lo, const std::vector<double> &hi, std::vector<double> &x, int &used ) {
+		double trace = 0;
+		used = 0;
+		for ( int g = 0; g < n; g++ )
+			if ( AtA[(size_t)g * n + g] > 0 ) { trace += AtA[(size_t)g * n + g]; used++; }
+		const double ridge = used ? ridgeShare * trace / used : 0.0;
+		x = pull;
+		for ( int iter = 0; iter < 400; iter++ ) {
+			for ( int g = 0; g < n; g++ ) {
+				const double diag = AtA[(size_t)g * n + g] + ridge;
+				if ( diag <= 0 )
+					continue;
+				double r = Atb[g] + ridge * pull[g];
+				for ( int h = 0; h < n; h++ )
+					if ( h != g )
+						r -= AtA[(size_t)g * n + h] * x[h];
+				x[g] = Com_Clamp( (float)lo[g], (float)hi[g], (float)( r / diag ) );
+			}
+		}
+	};
+
+	// the shared strength (the "prior"): one factor for all light at once
+	double sumSS = 0, sumBS = 0;
 	for ( const giCalibSample &cs : samples ) {
 		double total = 0;
-		for ( const auto &p : cs.parts ) {
-			Atb[p.first] += cs.target * p.second;
+		for ( const auto &p : cs.parts )
 			total += p.second;
-			for ( const auto &q : cs.parts )
-				AtA[(size_t)p.first * G + q.first] += (double)p.second * q.second;
-		}
 		sumSS += total * total;
 		sumBS += cs.target * total;
 	}
@@ -2741,46 +2846,55 @@ static void gi_calibrate( const giBake &bake, const giLightGrid &grid, const std
 		return;	// no light reaches the sampled texels: nothing to calibrate
 	const double prior = Q_max( 1e-4, sumBS / sumSS );
 
-	// 3. solve: projected Gauss-Seidel with a gentle pull (ridge) towards the shared strength
-	double trace = 0;
+	// 3a. per lamp type: never negative, at most 8x the shared strength; 0 is allowed, so
+	// something that looked like a lamp but never lit anything in the original is switched off
+	std::vector<double> AtA, Atb, typeScale;
 	int used = 0;
+	normals( typeOf, baseGroups, AtA, Atb );
+	solve( AtA, Atb, baseGroups, 0.02, std::vector<double>( baseGroups, prior ), std::vector<double>( baseGroups, 0.0 ),
+		std::vector<double>( baseGroups, prior * 8.0 ), typeScale, used );
+
+	// 3b. per lamp: pulled firmly towards its type's strength, within 0.3x to 3x of it
+	std::vector<int> identity( G );
 	for ( int g = 0; g < G; g++ )
-		if ( AtA[(size_t)g * G + g] > 0 ) { trace += AtA[(size_t)g * G + g]; used++; }
-	const double ridge = used ? 0.02 * trace / used : 0.0;
-	std::vector<double> x( G, prior );
-	for ( int iter = 0; iter < 400; iter++ ) {
-		for ( int g = 0; g < G; g++ ) {
-			const double diag = AtA[(size_t)g * G + g] + ridge;
-			if ( diag <= 0 )
-				continue;
-			double r = Atb[g] + ridge * prior;
-			for ( int h = 0; h < G; h++ )
-				if ( h != g )
-					r -= AtA[(size_t)g * G + h] * x[h];
-			// never negative, at most 8x the shared strength; 0 is allowed, so something that
-			// looked like a lamp but never lit anything in the original map is switched off
-			x[g] = Com_Clamp( 0.0f, (float)( prior * 8.0 ), (float)( r / diag ) );
+		identity[g] = g;
+	std::vector<double> pull( G ), lo( G ), hi( G ), x;
+	for ( int g = 0; g < G; g++ ) {
+		const double t = typeScale[typeOf[g]];
+		pull[g] = t;
+		lo[g] = g < baseGroups ? t : t * 0.3;
+		hi[g] = g < baseGroups ? t : t * 3.0;
+	}
+	int usedLamps = 0;
+	normals( identity, G, AtA, Atb );
+	solve( AtA, Atb, G, 0.1, pull, lo, hi, x, usedLamps );
+	int raised = 0, lowered = 0;
+	for ( int g = 0; g < G; g++ ) {
+		groupScale[g] = (float)x[g];
+		if ( g >= baseGroups && typeScale[typeOf[g]] > 0 ) {
+			const double r = x[g] / typeScale[typeOf[g]];
+			raised += r > 1.25 ? 1 : 0;
+			lowered += r < 0.8 ? 1 : 0;
 		}
 	}
-	for ( int g = 0; g < G; g++ )
-		groupScale[g] = (float)x[g];
+	for ( int g = 0; g < baseGroups; g++ )
+		groupScale[g] = (float)typeScale[g];	// (the type groups themselves have no lights now)
 
-	dg_print( "DevoGI: calibrated %d light groups from %d samples (shared strength x%.3f)\n",
-		used, (int)samples.size(), prior );
+	dg_print( "DevoGI: calibrated %d lamp types and %d lamps from %d samples (shared strength x%.3f): %d lamps brighter than their type, %d dimmer\n",
+		used, numLamps, (int)samples.size(), prior, raised, lowered );
 
 	// the bake log lists every lamp type and the brightness it got, relative to the
 	// shared strength (1.00 = average, 0.00 = switched off): handy to see which lamps work
-	std::vector<int> lightsPerGroup( G, 0 );
+	std::vector<int> lightsPerType( baseGroups, 0 );
 	for ( const devoLight_t &lt : gi_lights )
 		if ( lt.group >= 0 && lt.group < G )
-			lightsPerGroup[lt.group]++;
-	for ( int g = 0; g < G; g++ ) {
+			lightsPerType[typeOf[lt.group]]++;
+	for ( int g = 0; g < baseGroups; g++ ) {
 		const bool sun = g == gi_sunGroup;
-		if ( !lightsPerGroup[g] && !( sun && gi_hasSun ) )
+		if ( !lightsPerType[g] && !( sun && gi_hasSun ) )
 			continue;
 		const char *name = sun ? "the sun" : ( g < (int)gi_groupNames.size() ? gi_groupNames[g].c_str() : "?" );
-		dg_print( "DevoGI:   %-48s x%.2f  (%d patches%s)\n", name, groupScale[g] / prior,
-			lightsPerGroup[g], AtA[(size_t)g * G + g] > 0 ? "" : ", never seen - kept at average" );
+		dg_print( "DevoGI:   %-48s x%.2f  (%d patches)\n", name, typeScale[g] / prior, lightsPerType[g] );
 	}
 }
 
@@ -4314,9 +4428,10 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 	const float bounceRadius = bake.texelSize * stride * 2.5f;
 	// the wide blur of the bounce light: three passes of 32 units at 8x (about 55 units
 	// in all), never less than 24 units per pass at low resolutions
-	// (half what it was: at about 55 units in all, contact detail - the darkening under a
-	// ledge, around a window frame - turned into soft blobs)
-	gi_bounceBlurRadius = Com_Clamp( 12.0f, 24.0f, bake.texelSize * stride * 2.0f );
+	// wide and soft: three passes of 32-64 units (about 90 in all). The lamps' own light and
+	// the sun's are added after this blur, so their shadows stay crisp; only bounce light -
+	// the sky's and the lamps' - spreads this far.
+	gi_bounceBlurRadius = Com_Clamp( 32.0f, 64.0f, bake.texelSize * stride * 5.0f );
 	giSpatialHash gridHash;
 	gridHash.build( texelPos, gridPoints, bounceRadius );
 

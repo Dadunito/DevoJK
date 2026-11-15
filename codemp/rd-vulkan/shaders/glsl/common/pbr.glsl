@@ -138,7 +138,7 @@
 			return sum / 16.0;
 		}
 
-		float CalcDevoSunShadow( in vec3 position, in vec3 vertexNormal, in vec3 sunDir, in float bakedVis )
+		float CalcDevoSunShadow( in vec3 position, in vec3 vertexNormal, in vec3 sunDir, in float bakedVis, in bool bakedExact )
 		{
 			vec4 params = u_lights.devo_shadow_params;
 			if ( params.x < 0.5 )
@@ -158,7 +158,12 @@
 			// near cascade on top, fading into the far one at its border
 			if ( nearVis >= 0.0 )
 				vis = mix( nearVis, vis, clamp( ( edgeNear - params.w ) / ( 0.98 - params.w ), 0.0, 1.0 ) );
-			return vis;
+			// The baked sun shadow is exact for the level itself. The shadow maps have to look
+			// a little off the surface (or a surface would shadow itself), and right at the
+			// foot of a wall that let a thin strip of sun through. So the level keeps its baked
+			// shadow, and the live maps only add the shadows of moving things.
+			// (only on lightmapped surfaces: a model's baked value comes from the coarse probes)
+			return bakedExact ? min( vis, bakedVis ) : vis;
 		}
 
 		vec3 CalcDynamicLightContribution(
@@ -253,7 +258,7 @@
 			if ( devoAllowed && u_lights.devo_sun_dir.w > 0.5 && dot( vertexNormal, u_lights.devo_sun_dir.xyz ) > -0.2 )
 			{
 				vec3  L  = u_lights.devo_sun_dir.xyz;
-				devoSunVis = CalcDevoSunShadow( position, vertexNormal, L, devoSunVis );
+				devoSunVis = CalcDevoSunShadow( position, vertexNormal, L, devoSunVis, devoMaskMode );
 				vec3  H  = normalize(L + E);
 				float NL = clamp(dot(N, L), 0.0, 1.0);
 				float LH = clamp(dot(L, H), 0.0, 1.0);
