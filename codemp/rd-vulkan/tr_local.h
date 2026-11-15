@@ -928,9 +928,15 @@ typedef struct viewParms_s {
 	cubemap_t		*targetCube;
 	int				targetCubeLayer;
 
-	int				devoShadow;		// DevoGI: the sun's view for shadow cascade 1 or 2 (0 = a normal view)
-	float			devoShadowRange;// half the side of the square the sun's view covers (orthographic)
+	int				devoShadow;		// DevoGI: the sun's view for shadow cascade 1 or 2, or 3 + the tile
+									// of a near-lamp shadow view (0 = a normal view)
+	float			devoShadowRange;// sun: half the side of the square its view covers (orthographic);
+									// near lamp: how far its light reaches (the view's far plane)
 } viewParms_t;
+
+// DevoGI: which kind of shadow view a view is
+#define DEVO_SUN_VIEW( vp )		( (vp).devoShadow == 1 || (vp).devoShadow == 2 )
+#define DEVO_LAMP_VIEW( vp )	( (vp).devoShadow >= 3 )
 
 /*
 ==============================================================================
@@ -2756,7 +2762,7 @@ struct DrawItem
 
 	struct {
 		uint32_t		start, end;
-		VkDescriptorSet	current[VK_DESC_COUNT];			// 0:uniform, 1:color0, 2:color1, 3:color2, 4:fog, 5:brdf lut, 6:normal, 7:physical, 8:prefilterd envmap, !9:irradiance envmap
+		VkDescriptorSet	current[VK_DESC_COUNT];			// 0:uniform, 1:color0, 2:color1, 3:color2, 4:fog, 5:brdf lut, 6:normal, 7:physical, 8:prefilterd envmap, 9:deluxe, 10:DevoGI lamp masks, !11:irradiance envmap
 		uint32_t		offset[VK_DESC_UNIFORM_COUNT + 1];	// 0:uniform, 1: camera, 2: light, 3:ghoul2, 4: global, ( +1 surface_sprites ssbo :( )
 	} descriptor_set;
 
@@ -2798,9 +2804,10 @@ typedef struct backEndData_s {
 	polyVert_t			*polyVerts;//[MAX_POLYVERTS];
 	renderCommandList_t	commands;
 
-	// DevoGI: this frame's sun shadow views (queued with the player's view, drawn by
-	// the backend before anything else - see RB_DrawDevoShadowViews)
-	struct drawSurfsCommand_s	*devoShadowCmds[2];
+	// DevoGI: this frame's shadow views - the sun's two cascades and the near lamps'
+	// cube sides (queued with the player's view, drawn by the backend before anything
+	// else - see RB_DrawDevoShadowViews)
+	struct drawSurfsCommand_s	*devoShadowCmds[2 + DEVO_LAMP_SHADOW_MAX * 6];
 	int					numDevoShadowCmds;
 } backEndData_t;
 
@@ -2886,6 +2893,7 @@ qboolean	R_DevoGI_EntityLighting( const vec3_t point, vec3_t ambient, vec3_t dir
 void		R_DevoGI_FillLights( const trRefdef_t *refdef, vkUniformLight_t *uniform );
 qboolean	R_DevoGI_SunShadowView( const viewParms_t *mainView, viewParms_t *out, int cascade );
 void		R_DevoGI_SunShadowDrawn( const viewParms_t *view );
+int			R_DevoGI_LampShadowViews( viewParms_t *out, int maxViews );
 void		RB_DrawDevoShadowViews( void );
 
 // Vulkan

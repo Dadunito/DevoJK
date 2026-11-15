@@ -6179,6 +6179,11 @@ void CG_DoSFXSaber( vec3_t blade_muz, vec3_t blade_tip, vec3_t trail_tip, vec3_t
 		AngleScale = 0.2f;
 
 	effectalpha *= AngleScale;
+	// DevoJK: the glow is added on top of what is behind it, so over a sunlit wall it
+	// can turn as white as the core itself; cg_shaderSaberGlowAlpha tones it down
+	effectalpha *= Com_Clamp( 0.0f, 2.0f, cg_shaderSaberGlowAlpha.value );
+	if ( effectalpha > 1.0f )
+		effectalpha = 1.0f;
 
 	AngleScale += 0.3f;
 
@@ -7023,6 +7028,7 @@ void CG_AddSaberBlade( centity_t *cent, centity_t *scent, refEntity_t *saber, in
 	int scolor = 0;
 	int	useModelIndex = 0;
 	qboolean sfxSabers = (cg_saberTrail.integer == 3 || cg_saberTrail.integer == -3);
+	qboolean sfxTrailOn = qfalse;	// DevoJK: the SFX trail is drawn only while swinging
 
 	if (cent->currentState.eType == ET_NPC)
 	{
@@ -7311,6 +7317,8 @@ CheckTrail:
 				trailDur = SABER_TRAIL_TIME;
 			}
 		}
+		// DevoJK: cg_saberTrailLength stretches how long a trail segment lives
+		trailDur = (int)( trailDur * Com_Clamp( 0.1f, 4.0f, cg_saberTrailLength.value ) );
 
 		// if we happen to be timescaled or running in a high framerate situation, we don't want to flood
 		//	the system with very small trail slices...but perhaps doing it by distance would yield better results?
@@ -7612,20 +7620,35 @@ CheckTrail:
 			dirlen1 = VectorLength(dir1);
 			dirlen2 = VectorLength(dir2);
 
-			if (saberMoveData[cent->currentState.saberMove].trailLength == 0) {
-				dirlen0 *= 0.5f;
-				dirlen1 *= 0.3f;
-			}
-			else {
-				dirlen0 *= 1.0f;
-				dirlen1 *= 0.5f;
-			}
+			/*
+			DevoJK: like the stock trail, the SFX trail shows only while the saber swings
+			(an attack move, a super-break, force speed or a thrown saber) - just walking
+			around with the blade out leaves no trail. While swinging, the old edge of the
+			trail follows the blade, keeping a share of its distance each frame ('lagscale'
+			times the base/tip share); cg_saberTrailLength raises that share to the power
+			1/length, so 2 makes the trail fade twice as slowly, 0.5 twice as fast.
+			*/
+			sfxTrailOn = (qboolean)( cent->currentState.saberMove >= 0 && cent->currentState.saberMove < LS_MOVE_MAX
+				&& ( BG_SuperBreakWinAnim( cent->currentState.torsoAnim )
+					|| saberMoveData[cent->currentState.saberMove].trailLength > 0
+					|| ( ( cent->currentState.powerups & ( 1 << PW_SPEED ) ) && cg_speedTrail.integer )
+					|| ( cent->currentState.saberInFlight && saberNum == 0 ) ) );
 
 			lagscale = (cg.time - saberTrail->lastTime);
 			lagscale = 1.0f - (lagscale * 3.0f / 200.0f);
 
 			if (lagscale < 0.1f)
 				lagscale = 0.1f;
+
+			if ( !sfxTrailOn ) {
+				// not swinging: the trail's old edge snaps onto the blade, so nothing shows
+				dirlen0 = dirlen1 = 0.0f;
+			} else {
+				float len = Com_Clamp( 0.1f, 4.0f, cg_saberTrailLength.value );
+				dirlen0 *= powf( lagscale, 1.0f / len );
+				dirlen1 *= powf( 0.5f * lagscale, 1.0f / len );
+			}
+			lagscale = 1.0f;	// already folded into the shares above
 
 			VectorNormalize(dir0);
 			VectorNormalize(dir1);
@@ -7723,7 +7746,7 @@ JustDoIt:
 			scolor, renderfx, (qboolean)(client->saber[saberNum].numBlades < 3 && !(client->saber[saberNum].saberFlags2&SFL2_NO_DLIGHT)), cent->currentState.clientNum, saberNum );//rgb -- fix casting?
 	}
 
-	if (sfxSabers && cg.time > saberTrail->inAction)
+	if (sfxSabers && sfxTrailOn && cg.time > saberTrail->inAction)
 	{
 		saberTrail->inAction = cg.time;
 

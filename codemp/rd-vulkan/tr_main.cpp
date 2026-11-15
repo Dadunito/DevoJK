@@ -475,6 +475,12 @@ static void R_SetFarClip( void )
 	float	farthestCornerDistance;
 	int		i;
 
+	// DevoGI near-lamp shadow view: it sees exactly as far as the light reaches
+	if ( DEVO_LAMP_VIEW( tr.viewParms ) ) {
+		tr.viewParms.zFar = tr.viewParms.devoShadowRange;
+		return;
+	}
+
 	// if not rendering the world (icons, menus, etc)
 	// set a 2k far clip plane
 	if ( tr.refdef.rdflags & RDF_NOWORLDMODEL ) {
@@ -520,7 +526,7 @@ static void R_SetFarClip( void )
 	tr.viewParms.zFar = Com_Clamp(2048.0f, tr.distanceCull * (1.732), sqrtf(farthestCornerDistance));
 
 	// DevoGI: the sun's camera is far away on purpose; it must reach everything it sees
-	if ( tr.viewParms.devoShadow )
+	if ( DEVO_SUN_VIEW( tr.viewParms ) )
 		tr.viewParms.zFar = sqrtf( farthestCornerDistance ) + 64.0f;
 }
 
@@ -577,7 +583,8 @@ void R_SetupProjection( viewParms_t *dest, float zProj, qboolean computeFrustum 
 
 	// DevoGI: the sun's shadow views are orthographic - parallel rays, like real sunlight,
 	// over a square of 2 * devoShadowRange around the view's origin
-	if ( dest->devoShadow ) {
+	// (a near lamp's views are ordinary 90 degree perspective ones, set up below)
+	if ( DEVO_SUN_VIEW( *dest ) ) {
 		const float r = dest->devoShadowRange;
 		Com_Memset( dest->projectionMatrix, 0, sizeof( dest->projectionMatrix ) );
 		dest->projectionMatrix[0] = 1.0f / r;
@@ -654,7 +661,7 @@ static void R_SetupProjectionZ( viewParms_t *dest ) {
 #endif
 
 	// DevoGI sun shadow views: orthographic depth, 0 at the near plane .. 1 at the far one
-	if ( dest->devoShadow ) {
+	if ( DEVO_SUN_VIEW( *dest ) ) {
 		dest->projectionMatrix[10] = -1.0f / depth;
 		dest->projectionMatrix[14] = -zNear / depth;
 		return;
@@ -1652,9 +1659,13 @@ R_GenerateDrawSurfs
 */
 static void R_GenerateDrawSurfs( viewParms_t *viewParms, trRefdef_t *refdef )
 {
-	R_AddWorldSurfaces( viewParms, refdef );
+	// DevoGI near-lamp shadow views draw only what moves (the entities): the level's
+	// own shadows from the lamps are baked
+	if ( !DEVO_LAMP_VIEW( *viewParms ) ) {
+		R_AddWorldSurfaces( viewParms, refdef );
 
-	R_AddPolygonSurfaces( refdef );
+		R_AddPolygonSurfaces( refdef );
+	}
 
 	// set the projection matrix with the minimum zfar
 	// now that we have the world bounded

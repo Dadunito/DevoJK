@@ -626,6 +626,15 @@ void RE_RenderScene( const refdef_t *fd ) {
 			if ( tr.drawSurfCmd )	// remember it: the backend draws it before anything else
 				backEndData->devoShadowCmds[backEndData->numDevoShadowCmds++] = tr.drawSurfCmd;
 		}
+		// the near lamps' views of whatever moves around them, into their tiles
+		static viewParms_t lampParms[DEVO_LAMP_SHADOW_MAX * 6];
+		const int lampViews = R_DevoGI_LampShadowViews( lampParms, DEVO_LAMP_SHADOW_MAX * 6 );
+		for ( int i = 0; i < lampViews; i++ ) {
+			tr.drawSurfCmd = NULL;
+			R_RenderView( &lampParms[i] );
+			if ( tr.drawSurfCmd && backEndData->numDevoShadowCmds < (int)ARRAY_LEN( backEndData->devoShadowCmds ) )
+				backEndData->devoShadowCmds[backEndData->numDevoShadowCmds++] = tr.drawSurfCmd;
+		}
 		tr.drawSurfCmd = NULL;		// keep them out of the screen-map copies below
 		tr.numDrawSurfCmds = 0;
 	}

@@ -73,6 +73,9 @@ static cvar_t *r_devoGI_sunShadow;
 static cvar_t *r_devoGI_sunShadowSize;
 static cvar_t *r_devoGI_sunShadowRange;
 static cvar_t *r_devoGI_sunShadowRangeFar;
+static cvar_t *r_devoGI_lampShadows;
+static cvar_t *r_devoGI_lampShadowSize;
+static cvar_t *r_devoGI_lampShadowRange;
 
 void R_DevoGI_Register( void )
 {
@@ -98,6 +101,9 @@ void R_DevoGI_Register( void )
 	r_devoGI_sunShadowSize	= ri.Cvar_Get( "r_devoGI_sunShadowSize",	"2048",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI live lighting: sun shadow map resolution (1024, 2048 or 4096 - sharper but slower)" );
 	r_devoGI_sunShadowRange	= ri.Cvar_Get( "r_devoGI_sunShadowRange",	"768",	CVAR_ARCHIVE, "DevoGI live lighting: reach of the sharp sun shadow map around the player, in game units (256-2048; the coarser one takes over further away)" );
 	r_devoGI_sunShadowRangeFar = ri.Cvar_Get( "r_devoGI_sunShadowRangeFar", "4096", CVAR_ARCHIVE, "DevoGI live lighting: reach of the second, coarser sun shadow map, in game units (up to 8192; beyond it the baked shadows take over)" );
+	r_devoGI_lampShadows	= ri.Cvar_Get( "r_devoGI_lampShadows",	"4",	CVAR_ARCHIVE, "DevoGI live lighting: how many lights right by the player (lamps, sabers, blaster bolts) throw the shadows of moving things - players, weapons, doors (0 = none, up to 4)" );
+	r_devoGI_lampShadowSize	= ri.Cvar_Get( "r_devoGI_lampShadowSize",	"512",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI live lighting: resolution of each near-light shadow view (256, 512 or 1024)" );
+	r_devoGI_lampShadowRange = ri.Cvar_Get( "r_devoGI_lampShadowRange", "1024", CVAR_ARCHIVE, "DevoGI live lighting: lights closer to the camera than this (game units) may throw moving things' shadows" );
 	r_devoGI_liveBounces	= ri.Cvar_Get( "r_devoGI_liveBounces",	"24",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI: light bounces of the bounce-only light that live lighting (r_devoGI_live 1) uses (1-32); the full bake keeps r_devoGI_bounces" );
 	r_devoGI_liveSky		= ri.Cvar_Get( "r_devoGI_liveSky",		"6",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI: sky light in the live layer (r_devoGI_live 1), times r_devoGI_sky: with no sun baked in, the sky all around lights the shade" );
 	r_devoGI_gpu			= ri.Cvar_Get( "r_devoGI_gpu",			"1",	CVAR_ARCHIVE, "DevoGI: trace the bake's rays on the graphics card (much faster, same result; falls back to the CPU when it can't)" );
@@ -260,6 +266,24 @@ static float				gi_shadowMvp[2][16];	// world -> each cascade, as last drawn
 static float				gi_shadowTexelWorld[2];	// size of one shadow-map pixel, in game units
 static bool					gi_shadowValid[2];
 
+/*
+Near-lamp shadows, this frame: the lights chosen for them (R_DevoGI_LampShadowViews,
+front end) and, per cube side, the shadow-map tile it was drawn into (-1 = nothing
+moving on that side, so it wasn't drawn). The backend fills in each tile's matrix
+as it draws it (R_DevoGI_SunShadowDrawn) and the light list picks them up.
+*/
+struct giLampShadow {
+	vec3_t	origin;		// where the light is (matches its entry in the light list)
+	float	reach;
+	int		tile[6];	// +X -X +Y -Y +Z -Z
+};
+static giLampShadow			gi_lampShadow[DEVO_LAMP_SHADOW_MAX];
+static int					gi_numLampShadows;
+static float				gi_lampShadowMvp[DEVO_LAMP_SHADOW_MAX * 6][16];
+static bool					gi_lampShadowValid[DEVO_LAMP_SHADOW_MAX * 6];
+static const float			gi_lampShadowFov = 96.0f;	// a little over 90: the sides overlap,
+														// so soft-edge lookups never run off a tile
+
 // lightmap bytes -> the GPU's lightmap values (the map's overbright shift, as R_LoadLightmaps does)
 static float R_DevoGI_Shift( void ) {
 	return powf( 2.0f, (float)( r_mapOverBrightBits->integer - tr.overbrightBits ) );
@@ -302,6 +326,7 @@ byte *R_DevoGI_Process( const char *mapName, const byte *fileBase, const dheader
 	gi_live = dgLiveLighting();
 	gi_liveAlpha.clear();
 	gi_shadowValid[0] = gi_shadowValid[1] = false;
+	gi_numLampShadows = 0;
 	if ( !r_devoGI || !r_devoGI->integer )
 		return NULL;
 	if ( R_DevoGI_IsRend2Map( mapName ) )
@@ -591,11 +616,11 @@ qboolean R_DevoGI_SunShadowView( const viewParms_t *mainView, viewParms_t *out, 
 	VectorMA( centre, cz, forward, centre );
 
 	Com_Memset( out, 0, sizeof( *out ) );
-	out->viewportX = cascade * size;	// both cascades side by side in one image
-	out->viewportY = 0;
+	out->viewportX = cascade * size;	// both cascades side by side in one image, on top
+	out->viewportY = (int)vk_devoShadow.height - size;	// (viewports count from the bottom)
 	out->viewportWidth = out->viewportHeight = size;
 	out->scissorX = out->viewportX;
-	out->scissorY = 0;
+	out->scissorY = out->viewportY;
 	out->scissorWidth = out->scissorHeight = size;
 	out->portalView = PV_NONE;
 	out->fovX = out->fovY = 90.0f;		// unused: the projection is orthographic
@@ -616,15 +641,180 @@ qboolean R_DevoGI_SunShadowView( const viewParms_t *mainView, viewParms_t *out, 
 // the backend has drawn one of the sun's views: remember how to find a world position in it
 void R_DevoGI_SunShadowDrawn( const viewParms_t *view )
 {
-	const int cascade = view->devoShadow - 1;
-	if ( cascade < 0 || cascade > 1 )
-		return;
 	// the same transform the GPU used to draw the view (see get_mvp_transform)
 	float proj[16];
 	Com_Memcpy( proj, view->projectionMatrix, sizeof( proj ) );
 	proj[5] = -proj[5];
+
+	if ( DEVO_LAMP_VIEW( *view ) ) {	// a side of a near lamp's cube
+		const int tile = view->devoShadow - 3;
+		if ( tile >= DEVO_LAMP_SHADOW_MAX * 6 )
+			return;
+		myGlMultMatrix( view->world.modelViewMatrix, proj, gi_lampShadowMvp[tile] );
+		gi_lampShadowValid[tile] = true;
+		return;
+	}
+
+	const int cascade = view->devoShadow - 1;
+	if ( cascade < 0 || cascade > 1 )
+		return;
 	myGlMultMatrix( view->world.modelViewMatrix, proj, gi_shadowMvp[cascade] );
 	gi_shadowValid[cascade] = true;
+}
+
+/*
+Near-lamp shadows (the third lamp tier). Cheap on purpose: only lights close to the
+camera, only when something that moves - a player (the camera's own included), a
+weapon, a door - is within their reach, and only the sides of the light's cube that
+something moves in. Those views draw just the moving things, a few thousand
+triangles. The level's shadows from the lamps are baked; these add the movers'.
+Lights: the map's lamps that have a baked mask channel (their live light can take
+the baked light back out where a mover blocks it) and the game's own lights -
+sabers, blaster bolts. Fills in 'out' with the views to draw, returns how many.
+*/
+int R_DevoGI_LampShadowViews( viewParms_t *out, int maxViews )
+{
+	gi_numLampShadows = 0;
+	Com_Memset( gi_lampShadowValid, 0, sizeof( gi_lampShadowValid ) );
+	const int wanted = Com_Clampi( 0, DEVO_LAMP_SHADOW_MAX, r_devoGI_lampShadows->integer );
+	if ( !gi_liveActive || !vk_devoShadow.active || !tr.world || wanted <= 0
+		|| ( tr.refdef.rdflags & RDF_NOWORLDMODEL ) )
+		return 0;
+
+	// the things that move: a sphere around each
+	struct mover { vec3_t centre; float radius; };
+	static std::vector<mover> movers;
+	movers.clear();
+	for ( int i = 0; i < tr.refdef.num_entities; i++ ) {
+		const refEntity_t &e = tr.refdef.entities[i].e;
+		if ( e.reType != RT_MODEL || ( e.renderfx & ( RF_FIRST_PERSON | RF_DEPTHHACK | RF_NOSHADOW ) ) )
+			continue;
+		mover m;
+		const model_t *model = R_GetModelByHandle( e.hModel );
+		if ( model && model->type == MOD_BRUSH && model->data.bmodel ) {
+			const bmodel_t *bm = model->data.bmodel;
+			vec3_t mid, half;
+			VectorAdd( bm->bounds[0], bm->bounds[1], mid );
+			VectorScale( mid, 0.5f, mid );
+			VectorSubtract( bm->bounds[1], mid, half );
+			VectorAdd( e.origin, mid, m.centre );
+			m.radius = VectorLength( half );
+		} else {
+			// a player stands on its origin and is about 64 tall; weapons and items are smaller
+			VectorCopy( e.origin, m.centre );
+			m.centre[2] += 16.0f;
+			m.radius = 48.0f;
+		}
+		movers.push_back( m );
+	}
+	if ( movers.empty() )
+		return 0;
+
+	// the lights that may throw shadows, nearest to the camera first
+	struct candidate { float dist; vec3_t origin; float reach; };
+	static std::vector<candidate> cand;
+	cand.clear();
+	const float range = Q_max( 64.0f, r_devoGI_lampShadowRange->value );
+	auto consider = [&]( const vec3_t origin, float reach ) {
+		const float dist = Distance( origin, tr.refdef.vieworg );
+		if ( dist > range + reach || reach < 8.0f )
+			return;
+		if ( !R_inPVS( tr.refdef.vieworg, origin, NULL ) )
+			return;
+		candidate c;
+		c.dist = dist;
+		VectorCopy( origin, c.origin );
+		c.reach = reach;
+		cand.push_back( c );
+	};
+	for ( const dgFixture &fx : gi_live.fixtures ) {
+		if ( gi_live.lampsBaked && fx.maskChannel < 0 )
+			continue;	// a lamp kept baked only: it has no live light to shade
+		consider( fx.origin, fx.reach );
+	}
+	for ( int i = 0; i < tr.refdef.num_dlights; i++ )
+		consider( tr.refdef.dlights[i].origin, tr.refdef.dlights[i].radius );
+	std::sort( cand.begin(), cand.end(), []( const candidate &a, const candidate &b ) { return a.dist < b.dist; } );
+
+	static const vec3_t faceAxis[6] = { { 1, 0, 0 }, { -1, 0, 0 }, { 0, 1, 0 }, { 0, -1, 0 }, { 0, 0, 1 }, { 0, 0, -1 } };
+	const float spread = tanf( DEG2RAD( gi_lampShadowFov * 0.5f ) );
+	const int tile = (int)vk_devoShadow.lampTile;
+	const int perRow = (int)vk_devoShadow.lampTilesPerRow;
+	int views = 0;
+
+	for ( const candidate &c : cand ) {
+		if ( gi_numLampShadows >= wanted )
+			break;
+		// which sides of the light's cube have something moving in them
+		int sides = 0;
+		for ( const mover &m : movers ) {
+			vec3_t d;
+			VectorSubtract( m.centre, c.origin, d );
+			if ( VectorLength( d ) > c.reach + m.radius )
+				continue;
+			for ( int f = 0; f < 6; f++ ) {
+				const float *a = faceAxis[f];
+				const float along = DotProduct( d, a );
+				if ( along < -m.radius )
+					continue;
+				// the other two directions must fit inside the side's 96 degree view
+				bool inside = true;
+				for ( int k = 0; k < 3 && inside; k++ ) {
+					if ( a[k] != 0.0f )
+						continue;
+					if ( fabsf( d[k] ) > Q_max( along, 0.0f ) * spread + m.radius * 1.42f )
+						inside = false;
+				}
+				if ( inside )
+					sides |= 1 << f;
+			}
+		}
+		if ( !sides )
+			continue;
+		int needed = 0;
+		for ( int f = 0; f < 6; f++ )
+			needed += ( sides >> f ) & 1;
+		if ( views + needed > maxViews )
+			break;
+
+		giLampShadow &ls = gi_lampShadow[gi_numLampShadows++];
+		VectorCopy( c.origin, ls.origin );
+		ls.reach = c.reach;
+		for ( int f = 0; f < 6; f++ ) {
+			ls.tile[f] = -1;
+			if ( !( sides & ( 1 << f ) ) )
+				continue;
+			const int t = views;
+			ls.tile[f] = t;
+
+			viewParms_t &v = out[views++];
+			Com_Memset( &v, 0, sizeof( v ) );
+			// the tile, in the rows below the sun's cascades (viewports count from the bottom)
+			const int x = ( t % perRow ) * tile;
+			const int yTop = (int)vk_devoShadow.size + ( t / perRow ) * tile;
+			v.viewportX = x;
+			v.viewportY = (int)vk_devoShadow.height - yTop - tile;
+			v.viewportWidth = v.viewportHeight = tile;
+			v.scissorX = v.viewportX;
+			v.scissorY = v.viewportY;
+			v.scissorWidth = v.scissorHeight = tile;
+			v.portalView = PV_NONE;
+			v.fovX = v.fovY = gi_lampShadowFov;
+			// looking out of the cube's side: forward, left and up as the game uses them
+			vec3_t up = { 0, 0, 1 };
+			if ( f >= 4 )
+				VectorSet( up, 1, 0, 0 );
+			VectorCopy( c.origin, v.ori.origin );
+			VectorCopy( faceAxis[f], v.ori.axis[0] );
+			CrossProduct( up, v.ori.axis[0], v.ori.axis[1] );
+			CrossProduct( v.ori.axis[0], v.ori.axis[1], v.ori.axis[2] );
+			VectorCopy( c.origin, v.pvsOrigin );
+			v.zNear = 2.0f;
+			v.devoShadow = 3 + t;
+			v.devoShadowRange = c.reach;
+		}
+	}
+	return views;
 }
 
 // the lamp shadow masks of lightmap page 'page' (RGBA, size x size), while they
@@ -671,14 +861,63 @@ void R_DevoGI_FillLights( const trRefdef_t *refdef, vkUniformLight_t *u )
 	// lamp tiers: the lamps' light and soft shadows are baked into the live layer, so on
 	// lightmapped surfaces a live lamp only adds its highlights, inside its baked mask
 	u->devo_shadow_offset[3] = gi_live.lampsBaked ? 1.0f : 0.0f;
+	// how much the final gamma pass scales the picture up (overbright), so the shader knows
+	// where on-screen white is and can roll the brightest live light off before it clips
+	u->devo_shadow_offset[2] = (float)( 1 << tr.overbrightBits );
+
+	// one pixel of the shadow image (the sun's cascades and the near-lamp tiles share it)
+	if ( vk_devoShadow.active ) {
+		u->devo_shadow_params[1] = 1.0f / (float)vk_devoShadow.width;
+		u->devo_shadow_params[2] = 1.0f / (float)vk_devoShadow.height;
+	}
+
+	// near-lamp shadows drawn this frame (see R_DevoGI_LampShadowViews): their tiles and
+	// matrices; the lights themselves get their slot in the list further down
+	int lampSlots = 0;
+	if ( vk_devoShadow.active ) {
+		const float tileWorld = 2.0f * tanf( DEG2RAD( gi_lampShadowFov * 0.5f ) ) / (float)vk_devoShadow.lampTile;
+		for ( int k = 0; k < gi_numLampShadows; k++ ) {
+			const giLampShadow &ls = gi_lampShadow[k];
+			float tiles[6];
+			for ( int f = 0; f < 6; f++ ) {
+				const int t = ls.tile[f];
+				tiles[f] = ( t >= 0 && gi_lampShadowValid[t] ) ? (float)t : -1.0f;
+				if ( tiles[f] >= 0.0f )
+					Com_Memcpy( u->devo_lamp_shadow_mvp[t], gi_lampShadowMvp[t], sizeof( gi_lampShadowMvp[t] ) );
+			}
+			float *sides = u->devo_lamp_shadow[k * 2], *more = u->devo_lamp_shadow[k * 2 + 1];
+			sides[0] = tiles[0]; sides[1] = tiles[1]; sides[2] = tiles[2]; sides[3] = tiles[3];
+			more[0] = tiles[4]; more[1] = tiles[5];
+			// lookups pushed off the surface by one and a half shadow pixels, which grow
+			// with the distance from the light
+			more[2] = tileWorld * 1.5f;
+			more[3] = 0.0f;
+		}
+		lampSlots = gi_numLampShadows;
+		u->devo_lamp_shadow_params[0] = (float)lampSlots;
+		u->devo_lamp_shadow_params[1] = (float)vk_devoShadow.lampTile / (float)vk_devoShadow.width;
+		u->devo_lamp_shadow_params[2] = (float)vk_devoShadow.lampTile / (float)vk_devoShadow.height;
+		u->devo_lamp_shadow_params[3] = (float)vk_devoShadow.lampTilesPerRow;
+	}
+	// the slot of the light at 'origin', or -1 (light entries carry it in origin.w)
+	auto lampSlot = [&]( const vec3_t origin ) -> int {
+		for ( int k = 0; k < lampSlots; k++ )
+			if ( DistanceSquared( origin, gi_lampShadow[k].origin ) < 0.01f )
+				return k;
+		return -1;
+	};
+	// the game's own lights (sabers, blaster bolts) are already in the list
+	for ( uint32_t i = 0; i < u->num_lights; i++ ) {
+		const int k = lampSlot( u->light[i].origin );
+		if ( k >= 0 )
+			u->light[i].origin[3] = 100.0f * ( k + 1 );
+	}
 
 	// the sun's real-time shadow maps, when both cascades have been drawn
 	if ( gi_shadowValid[0] && gi_shadowValid[1] && r_devoGI_sunShadow->integer && gi_live.hasSun ) {
 		Com_Memcpy( u->devo_shadow_mvp0, gi_shadowMvp[0], sizeof( gi_shadowMvp[0] ) );
 		Com_Memcpy( u->devo_shadow_mvp1, gi_shadowMvp[1], sizeof( gi_shadowMvp[1] ) );
 		u->devo_shadow_params[0] = 1.0f;
-		u->devo_shadow_params[1] = 1.0f / ( 2.0f * vk_devoShadow.size );	// the image is two cascades wide
-		u->devo_shadow_params[2] = 1.0f / (float)vk_devoShadow.size;
 		u->devo_shadow_params[3] = 0.85f;	// start blending to the next cascade here
 		// push lookups off the surface by about one and a half pixels (no "acne")
 		u->devo_shadow_offset[0] = gi_shadowTexelWorld[0] * 1.5f;
@@ -728,6 +967,10 @@ void R_DevoGI_FillLights( const trRefdef_t *refdef, vkUniformLight_t *u )
 		// lamp tiers: its channel in the baked lamp shadow masks, as type + 10 * ( channel + 1 )
 		if ( gi_live.lampsBaked && fx.maskChannel >= 0 && fx.maskChannel < 4 )
 			e.origin[3] += 10.0f * ( fx.maskChannel + 1 );
+		// near-lamp shadows: its slot, as + 100 * ( slot + 1 )
+		const int slot = lampSlot( fx.origin );
+		if ( slot >= 0 )
+			e.origin[3] += 100.0f * ( slot + 1 );
 		VectorScale( fx.rgb, shift, e.color );
 		e.radius = fx.reach;
 		VectorCopy( fx.normal, e.normal );

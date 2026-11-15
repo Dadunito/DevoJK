@@ -302,8 +302,10 @@ XCVAR_DEF( cg_saberDynamicMarkTime,				"60000",				NULL,					CVAR_NONE )
 XCVAR_DEF( cg_saberModelTraceEffect,			"0",					NULL,					CVAR_NONE )
 XCVAR_DEF( cg_saberTrail,						"1",					NULL,					CVAR_ARCHIVE )
 XCVAR_DEF( cg_saberClash,						"1",					NULL,					CVAR_ARCHIVE )
-XCVAR_DEF( cg_shaderSaberCore,					"0.625",				NULL,					CVAR_NONE )
-XCVAR_DEF( cg_shaderSaberGlow,					"0.625",				NULL,					CVAR_NONE )//1.25?
+XCVAR_DEF( cg_saberTrailLength,					"1",					NULL,					CVAR_ARCHIVE )	// DevoJK: trail length, 1 = stock, 2 = twice as long, 0.5 = half
+XCVAR_DEF( cg_shaderSaberCore,					"0.625",				NULL,					CVAR_ARCHIVE )	// SFX sabers: thickness of the white core
+XCVAR_DEF( cg_shaderSaberGlow,					"0.625",				NULL,					CVAR_ARCHIVE )	// SFX sabers: width of the coloured glow
+XCVAR_DEF( cg_shaderSaberGlowAlpha,				"1",					NULL,					CVAR_ARCHIVE )	// DevoJK: SFX sabers: strength of the glow, lower keeps the core readable on bright ground
 XCVAR_DEF( cg_saberTeamColors,					"1",					NULL,					CVAR_ARCHIVE )
 XCVAR_DEF( cg_noRGBSabers,						"0",					NULL,					CVAR_ARCHIVE )
 XCVAR_DEF( disco,								"0",					NULL,					CVAR_INTERNAL ) //xD

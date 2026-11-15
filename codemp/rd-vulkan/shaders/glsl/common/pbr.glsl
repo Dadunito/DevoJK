@@ -129,8 +129,10 @@
 				return -1.0;
 
 			vec4 params = u_lights.devo_shadow_params;
-			// this cascade's half of the image
-			vec2 uv = vec2( ( ndc.x * 0.5 + 0.5 + cascade ) * 0.5, ndc.y * 0.5 + 0.5 );
+			// this cascade's half of the top rows of the image (the near-lamp shadow
+			// tiles sit below them): the cascades are W/2 pixels tall, params.z = 1 / height
+			vec2 uv = vec2( ( ndc.x * 0.5 + 0.5 + cascade ) * 0.5,
+				( ndc.y * 0.5 + 0.5 ) * ( 0.5 / params.y ) * params.z );
 			float sum = 0.0;
 			for ( int y = 0; y < 4; y++ )
 				for ( int x = 0; x < 4; x++ )
@@ -166,6 +168,58 @@
 			return bakedExact ? min( vis, bakedVis ) : vis;
 		}
 
+		/*
+		DevoGI near-lamp shadows: how much of a light right by the player reaches this
+		spot past the things that move (players, weapons, doors), 0..1. The light looked
+		at them from the middle of a cube, one 90 degree view per side, each in its own
+		tile of the shadow image (only the sides that had something moving in them).
+		The level's own shadows are not in here - they are baked.
+		*/
+		float DevoLampShadow( in int slot, in vec3 position, in vec3 vertexNormal, in vec3 lampOrigin )
+		{
+			vec4 faces = u_lights.devo_lamp_shadow[slot * 2];
+			vec4 more = u_lights.devo_lamp_shadow[slot * 2 + 1];
+			vec3 d = position - lampOrigin;
+			vec3 ad = abs( d );
+			// the side of the cube this spot lies behind
+			float tile;
+			if ( ad.x >= ad.y && ad.x >= ad.z )
+				tile = d.x > 0.0 ? faces.x : faces.y;
+			else if ( ad.y >= ad.z )
+				tile = d.y > 0.0 ? faces.z : faces.w;
+			else
+				tile = d.z > 0.0 ? more.x : more.y;
+			if ( tile < -0.5 )
+				return 1.0;		// nothing moving on that side of the light
+
+			// look a little off the surface and towards the light (no self-shadowing
+			// "acne"): one shadow pixel grows with distance from the light
+			float dist = max( length( d ), 1.0 );
+			float push = more.z * dist + 0.5;
+			vec3 p = position + vertexNormal * push - ( d / dist ) * push;
+			int t = int( tile + 0.5 );
+			vec4 clip = u_lights.devo_lamp_shadow_mvp[t] * vec4( p, 1.0 );
+			if ( clip.w <= 0.0 )
+				return 1.0;
+			vec3 ndc = clip.xyz / clip.w;
+			if ( ndc.z <= 0.0 || ndc.z >= 1.0 )
+				return 1.0;
+
+			vec4 params = u_lights.devo_lamp_shadow_params;
+			vec2 pixel = u_lights.devo_shadow_params.yz;			// one pixel of the image
+			// the tiles start right below the sun's cascades (half the image's width tall)
+			vec2 tileOrigin = vec2( mod( float( t ), params.w ), floor( float( t ) / params.w ) ) * params.yz
+				+ vec2( 0.0, ( 0.5 / pixel.x ) * pixel.y );
+			vec2 lo = tileOrigin + pixel * 1.5, hi = tileOrigin + params.yz - pixel * 1.5;
+			vec2 uv = tileOrigin + clamp( ndc.xy * 0.5 + 0.5, 0.0, 1.0 ) * params.yz;
+			// 3x3 lookups (each smoothed 2x2 by the hardware): soft edges
+			float sum = 0.0;
+			for ( int y = -1; y <= 1; y++ )
+				for ( int x = -1; x <= 1; x++ )
+					sum += texture( devo_shadow_map, vec3( clamp( uv + vec2( x, y ) * pixel, lo, hi ), ndc.z ) );
+			return sum / 9.0;
+		}
+
 		vec3 CalcDynamicLightContribution(
 			in float roughness,
 			in vec3 N,
@@ -193,7 +247,8 @@
 				#endif
 
 				vkUniformLightEntry_t light = u_lights.light[i];
-				bool devoLamp = light.origin.w > 0.5;
+				// origin.w = type + 10 * ( mask channel + 1 ) + 100 * ( shadow slot + 1 )
+				bool devoLamp = mod( light.origin.w, 10.0 ) > 0.5;
 				if ( devoLamp && !devoAllowed ) {
 					continue;	// this surface already has the lamps baked in
 				}
@@ -225,6 +280,12 @@
 
 				L /= sqrt(sqrLightDist);
 
+				// DevoGI near-lamp shadows: the shadows of moving things (see DevoLampShadow)
+				float moverVis = 1.0;
+				float slot = floor( light.origin.w / 100.0 ) - 1.0;
+				if ( slot >= 0.0 && slot < u_lights.devo_lamp_shadow_params.x )
+					moverVis = DevoLampShadow( int( slot ), position, vertexNormal, light.origin.xyz );
+
 				vec3  H  = normalize(L + E);
 				float NL = clamp(dot(N, L), 0.0, 1.0);
 				float LH = clamp(dot(L, H), 0.0, 1.0);
@@ -238,19 +299,24 @@
 				says this spot sees the lamp. A lamp without a mask channel stays baked only.
 				*/
 				if ( devoLamp && devoMaskMode ) {
-					float channel = floor( light.origin.w / 10.0 ) - 1.0;
+					float channel = floor( mod( light.origin.w, 100.0 ) / 10.0 ) - 1.0;
 					if ( channel < 0.0 )
 						continue;
 					float vis = channel < 0.5 ? devoMask.r : ( channel < 1.5 ? devoMask.g : ( channel < 2.5 ? devoMask.b : devoMask.a ) );
 					if ( vis <= 0.0 )
 						continue;
-					outColor += light.color * CalcSpecular(specular, NH, NL, NE, LH, VH, roughness) * ( attenuation * NL * vis );
+					vec3 lit = light.color * ( attenuation * NL * vis );
+					outColor += lit * CalcSpecular(specular, NH, NL, NE, LH, VH, roughness) * moverVis;
+					// where something moving blocks the lamp, take back the lamp's diffuse
+					// light that the bake put into the lightmap (the same amount, see
+					// CalcDevoLampAttenuation): the mover's shadow on the floor and walls
+					outColor -= lit * diffuse * ( 1.0 - moverVis );
 					continue;
 				}
 
 				vec3 reflectance = diffuse + CalcSpecular(specular, NH, NL, NE, LH, VH, roughness);
 
-				outColor += light.color * reflectance * attenuation * NL;
+				outColor += light.color * reflectance * attenuation * NL * moverVis;
 			}
 
 			// DevoGI: the sun, live, with its baked shadow (devoSunVis) until the

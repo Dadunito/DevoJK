@@ -131,6 +131,7 @@ layout (constant_id = 9) const float identity_color = 1.0;
 	layout (set = VK_DESC_PBR_PHYSICAL,	binding = 0) uniform sampler2D physical_texture;
 	layout (set = VK_DESC_PBR_CUBEMAP,	binding = 0) uniform samplerCube env_texture;
 	layout (set = VK_DESC_PBR_DELUXE,	binding = 0) uniform sampler2D deluxe_texture;
+	layout (set = VK_DESC_DEVO_MASK,	binding = 0) uniform sampler2D devo_mask_texture;	// DevoGI lamp shadow masks
 
 	//layout(set = 10, binding = 0) uniform samplerCube irradiance_texture;
 	#include "common/pbr.glsl"
@@ -506,17 +507,19 @@ void main() {
 			
 		#ifdef VK_DLIGHT_GPU
 			// lamp tiers: on lightmapped surfaces the lamps' light is baked; live lamps add
-			// their highlights inside the baked lamp shadow masks (in the deluxemap slot)
+			// their highlights inside the baked lamp shadow masks (their own descriptor set)
 			vec4 devoMask = vec4( 1.0 );
 			bool devoMaskMode = false;
 			#if defined(USE_LIGHTMAP) && defined(USE_TX1)
 				if ( devoLive && u_lights.devo_shadow_offset.w > 0.5 ) {
-					devoMask = texture( deluxe_texture, frag_tex_coord1 );
+					devoMask = texture( devo_mask_texture, frag_tex_coord1 );
 					devoMaskMode = true;
 				}
 			#endif
 			out_color.rgb += CalcDynamicLightContribution(roughness, N, E, u_camera.viewOrigin.xyz, viewDir, NE, diffuse.rgb, specular.rgb, var_Normal.xyz,
 				devoSunVis, devoLive && devoAllowed, devoMask, devoMaskMode);
+			// a moving thing's shadow takes baked lamp light back out: never below black
+			out_color.rgb = max( out_color.rgb, vec3( 0.0 ) );
 		#endif
 
 		// DevoGI live lighting: live sun and lamps come on top of the baked bounce light, so
@@ -529,6 +532,16 @@ void main() {
 			const float knee = 170.0, room = 85.0;
 			if ( incident > knee )
 				out_color.rgb *= ( knee + room * ( 1.0 - exp( -( incident - knee ) / room ) ) ) / incident;
+
+			// ...and the screen itself: the final picture is this colour times the overbright
+			// scale (devo_shadow_offset.z), and anything past 1.0 there clips per channel - a
+			// pale wall in full sun under the bright live sky went flat pale green. So the
+			// colour as it will show is rolled off from 80% of white, all channels together:
+			// the brightest walls keep their texture and hue instead of clipping.
+			float screen = max( out_color.r, max( out_color.g, out_color.b ) ) * u_lights.devo_shadow_offset.z;
+			const float white = 0.8;
+			if ( screen > white )
+				out_color.rgb *= ( white + ( 1.0 - white ) * ( 1.0 - exp( -( screen - white ) / ( 1.0 - white ) ) ) ) / screen;
 		}
 
 		if ( env_texture_set > -1 )

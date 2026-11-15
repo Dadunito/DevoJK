@@ -655,7 +655,7 @@ typedef struct vk_tess_s {
 
 	struct {
 		uint32_t		start, end;
-		VkDescriptorSet	current[VK_DESC_COUNT];			// 0:uniform, 1:color0, 2:color1, 3:color2, 4:fog, 5:brdf lut, 6:normal, 7:physical, 8:prefilterd envmap, !9:irradiance envmap
+		VkDescriptorSet	current[VK_DESC_COUNT];			// 0:uniform, 1:color0, 2:color1, 3:color2, 4:fog, 5:brdf lut, 6:normal, 7:physical, 8:prefilterd envmap, 9:deluxe, 10:DevoGI lamp masks, !11:irradiance envmap
 		uint32_t		offset[VK_DESC_UNIFORM_COUNT];	// 0:data, 1: camera, 2:light 3: entity, 4:ghoul2, 5:global
 	} descriptor_set;
 	
@@ -1399,6 +1399,9 @@ typedef struct {
 	qboolean		active;
 	uint32_t		size;				// pixels per side of each cascade (r_devoGI_sunShadowSize);
 										// the image holds both cascades side by side
+	uint32_t		width, height;		// the whole image: the cascades on top, near-lamp tiles below
+	uint32_t		lampTile;			// pixels per side of a near-lamp shadow tile
+	uint32_t		lampTilesPerRow;
 	VkImage			image;
 	VkDeviceMemory	memory;
 	VkImageView		attachment_view;	// for drawing into

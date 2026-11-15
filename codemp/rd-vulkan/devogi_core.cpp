@@ -328,7 +328,7 @@ static_assert( sizeof( dsurface_t ) == 148, "dsurface_t must match the BSP file"
 #include <vector>
 
 // Bump this whenever the bake changes in a way that should invalidate old .devogi files.
-#define DEVOGI_VERSION		23
+#define DEVOGI_VERSION		24
 
 #define DEVOGI_BSP_LM_SIZE	128			// lightmap page size stored in every Q3/JA BSP
 #define DEVOGI_LM_SIZE		gi_lmSize	// page size we are baking right now (128 * scale)
@@ -1463,6 +1463,21 @@ static void gi_rasterize_tri( giBake &bake, const giTri &t, int style, int page 
 
 			giTexel tx;
 			tx.pos = v[0]->xyz * w0 + v[1]->xyz * w1 + v[2]->xyz * w2;
+			if ( !inside ) {
+				/*
+				A border texel was just clamped onto the triangle's edge - and where a floor
+				meets a wall, that edge lies exactly in the wall's plane. Rays starting right
+				on a wall don't see it, so gi_fix_point never slid the texel away from it and
+				its sun rays went straight through: half the sun from the far side, smoothed
+				into a thin sunlit line along the foot of the wall. A quarter unit inside the
+				triangle the wall is seen like any other.
+				*/
+				const gvec3 centre = ( v[0]->xyz + v[1]->xyz + v[2]->xyz ) * ( 1.0f / 3.0f );
+				const gvec3 in = centre - tx.pos;
+				const float len = sqrtf( gdot( in, in ) );
+				if ( len > 1e-3f )
+					tx.pos += in * ( Q_min( 0.25f, len * 0.5f ) / len );
+			}
 			tx.normal = gnorm( v[0]->normal * w0 + v[1]->normal * w1 + v[2]->normal * w2 );
 			if ( gdot( tx.normal, t.n ) < 0.2f )
 				tx.normal = t.n;	// broken smoothing normals: use the flat face normal
@@ -2492,10 +2507,19 @@ static void gi_direct_point( const giBake &bake, const giLightGrid &grid, const 
 		if ( len < 0.01f )
 			return o;
 		// a spread-out start must not end up inside a wall next to the texel (that would
-		// leak light, or darken the corner): if the way there is blocked, use the centre
+		// leak light, or darken the corner). Nor may it end up just in front of one:
+		// rays ignore whatever they hit within their first DEVOGI_RAY_TMIN units, so a start
+		// half a unit from a wall shot straight through it - the edge texels at the foot of
+		// a wall saw a third of the sun from the far side, a thin sunlit line along the
+		// crease. So the start stays a full ray-start distance (plus a little) clear of any
+		// wall in the way, moving only as far towards it as that allows.
+		const gvec3 dir = off * ( 1.0f / len );
+		const float clear = DEVOGI_RAY_TMIN + 0.5f;
 		giHit h;
-		if ( gi_trace( scene, o, off * ( 1.0f / len ), len + 0.5f, h, true ) )
-			return o;
+		if ( gi_trace( scene, o, dir, len + clear, h, true ) ) {
+			const float keep = Q_min( len, h.t - clear );
+			return keep > 0.01f ? o + dir * keep : o;
+		}
 		return o + off;
 	};
 
@@ -4280,16 +4304,27 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 		const int want = atoi( env );
 		const char *rowEnv = getenv( "DEVOGI_DEBUG_ROW" );
 		const int row = rowEnv ? atoi( rowEnv ) : -1;
+		// DEVOGI_DEBUG_NEAR="x y z r": only the texels within r units of that point
+		const char *nearEnv = getenv( "DEVOGI_DEBUG_NEAR" );
+		float nearP[4] = { 0, 0, 0, -1 };
+		if ( nearEnv )
+			sscanf( nearEnv, "%f %f %f %f", &nearP[0], &nearP[1], &nearP[2], &nearP[3] );
 		int shown = 0;
-		for ( size_t i = 0; i < bake.texels.size() && shown < ( row >= 0 ? 64 : 12 ); i++ ) {
+		for ( size_t i = 0; i < bake.texels.size() && shown < ( row >= 0 || nearP[3] > 0 ? 64 : 12 ); i++ ) {
 			const giTexel &tx = bake.texels[i];
 			if ( tx.surf != want || ( row >= 0 && tx.y != row ) )
 				continue;
+			if ( nearP[3] > 0 ) {
+				const gvec3 d = tx.pos - gvec3( nearP[0], nearP[1], nearP[2] );
+				if ( gdot( d, d ) > nearP[3] * nearP[3] )
+					continue;
+			}
 			const size_t px = ( (size_t)tx.page * DEVOGI_LM_SIZE + tx.y ) * DEVOGI_LM_SIZE + tx.x;
 			dg_print( "DevoGI debug %s: surf %d texel %d,%d pos (%.1f %.1f %.1f) n (%.2f %.2f %.2f) face (%.2f %.2f %.2f) edge %d size %.2f light %.1f\n",
 				when, want, tx.x, tx.y, tx.pos.x, tx.pos.y, tx.pos.z, tx.normal.x, tx.normal.y, tx.normal.z,
 				tx.faceNormal.x, tx.faceNormal.y, tx.faceNormal.z, tx.edge ? 1 : 0, tx.size,
 				bake.light.size() > px * 3 ? bake.light[px * 3] : -1.0f );
+			dg_print( "    buried %d  sunVis %.2f\n", tx.buried ? 1 : 0, i < bake.sunVis.size() ? bake.sunVis[i] : -1.0f );
 			if ( bake.indirect.size() > i * 4 && bake.direct.size() > px * 3 )
 				dg_print( "    direct %.1f %.1f %.1f  bounce %.1f %.1f %.1f  open %.2f\n",
 					bake.direct[px * 3], bake.direct[px * 3 + 1], bake.direct[px * 3 + 2],
@@ -4362,7 +4397,9 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 				bake.sunVis[i] = full > 1e-4f ? Com_Clamp( 0.0f, 1.0f, gi_luma( sun ) / full ) : 0.0f;
 			}
 		}, true );
+		debugSurf( "sun, before smoothing" );
 		gi_world_smooth( bake, texelHash, bake.sunVis, directRadius );
+		debugSurf( "sun, smoothed" );
 
 		// gentle world-space smoothing: soft, anti-aliased shadow edges with no polygon seams
 		gi_world_smooth( bake, texelHash, directLight, directRadius );
@@ -4572,6 +4609,7 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 			copied++;
 		}
 		dg_print( "DevoGI: %d texels under walls take their light from the visible side\n", copied );
+		debugSurf( "buried copied" );
 	}
 
 	// ---- exposure: one factor for the whole map ----

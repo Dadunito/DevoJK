@@ -39,8 +39,9 @@
 #define VK_DESC_PBR_PHYSICAL			7
 #define VK_DESC_PBR_CUBEMAP				8
 #define VK_DESC_PBR_DELUXE				9
-//#define VK_DESC_PBR_IRRADIANCE		10
-#define VK_DESC_COUNT					10	// use 11 for irradiance testing
+#define VK_DESC_DEVO_MASK				10	// DevoJK: DevoGI lamp shadow masks of the lightmap
+//#define VK_DESC_PBR_IRRADIANCE		11
+#define VK_DESC_COUNT					11	// use 12 for irradiance testing
 #else
 #define VK_DESC_COUNT					5
 #endif
@@ -234,12 +235,18 @@ STRUCT (
 
 // light
 #ifdef VK_DLIGHT_GPU
+    // DevoGI near-lamp shadows: how many lights near the player throw the shadows of
+    // moving things at most (each needs up to 6 shadow-map tiles)
+    #define DEVO_LAMP_SHADOW_MAX	4
     #define LIGHT_ENTRY_T(n) vkUniformLightEntry_t n;
 
     // origin.w is the light type: 0 = the game's dynamic lights (q3 falloff),
     // 1 = a DevoGI glowing lamp surface (faces normal.xyz), 2 = a DevoGI lamp that
     // shines everywhere. For DevoGI lamps normal.w softens the light right at the
     // lamp (its area), and the light fades out smoothly before radius.
+    // origin.w carries more, packed as type + 10 * ( mask channel + 1 ) +
+    // 100 * ( shadow slot + 1 ): the lamp's channel in the baked lamp shadow masks and
+    // its near-lamp shadow slot (devo_lamp_shadow), each 0 when it has none.
     STRUCT (  
 	    VEC4				( origin )
 	    VEC3				( color )
@@ -257,11 +264,23 @@ STRUCT (
 	    // DevoGI sun shadow maps (two cascades side by side in one image):
 	    // world -> each cascade's clip space; params: x = 1 when valid,
 	    // y = one texel across the whole image (u), z = one texel (v), w = fade start;
-	    // offset: how far to push each cascade's lookups off the surface
+	    // offset: how far to push each cascade's lookups off the surface (x near, y far),
+	    // z = the final overbright scale (where on-screen white is), w = 1 when lamps are baked
 	    MAT4				( devo_shadow_mvp0 )
 	    MAT4				( devo_shadow_mvp1 )
 	    VEC4				( devo_shadow_params )
 	    VEC4				( devo_shadow_offset )
+	    // DevoGI near-lamp shadows: lights right by the player throw the shadows of
+	    // everything that moves (players, weapons, doors). Each such light has up to six
+	    // views, one per side of a cube around it, drawn into tiles below the sun's
+	    // cascades. A light entry finds its slot in origin.w (see the light list).
+	    // params: x = lights with shadows, y = a tile's width and z = its height in
+	    // the image (0..1), w = tiles per row; lamp[k] = tile of each cube side
+	    // (+X -X +Y -Y, then +Z -Z, -1 = nothing there) and how far to push lookups off
+	    // the surface per unit of distance (z); mvp: world -> each tile's clip space
+	    VEC4				( devo_lamp_shadow_params )
+	    VEC4				( devo_lamp_shadow[DEVO_LAMP_SHADOW_MAX * 2] )
+	    MAT4				( devo_lamp_shadow_mvp[DEVO_LAMP_SHADOW_MAX * 6] )
 	    LIGHT_ENTRY_T		( light[64] )
     , vkUniformLight_t )
 

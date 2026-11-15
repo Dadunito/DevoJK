@@ -13,6 +13,13 @@ the shadow map: if something was in front of it, it is in shadow. Because
 the map is redrawn every frame, players, weapons, doors and everything else
 that moves cast shadows too.
 
+Below the two cascades the same image holds small square tiles for the
+near-lamp shadows: the lights right by the player (lamps, sabers, blaster bolts)
+look at whatever moves around them - one 90 degree view per side of a cube,
+only the sides with something in them - so players, weapons and doors throw
+shadows from them too. The level itself is not drawn there: its lamp shadows
+are baked.
+
 This file owns the GPU side: the depth image, its render pass and
 framebuffer, and the comparison sampler the lighting shader reads it with.
 tr_devogi.cpp decides where the sun's camera goes (R_DevoGI_SunShadowView)
@@ -39,6 +46,15 @@ static uint32_t vk_devo_shadow_size( void )
 		size = 2048;
 	size = Com_Clampi( 512, 4096, size );
 	return (uint32_t)size;
+}
+
+// near-lamp shadow tiles: pixels per side (r_devoGI_lampShadowSize)
+static uint32_t vk_devo_lamp_tile_size( void )
+{
+	int size = ri.Cvar_VariableIntegerValue( "r_devoGI_lampShadowSize" );
+	if ( size <= 0 )
+		size = 512;
+	return (uint32_t)Com_Clampi( 128, 1024, size );
 }
 
 // the depth-only render pass: clears the depth, keeps it for the lighting shader to read
@@ -100,6 +116,14 @@ void vk_devo_shadow_create( void )
 	Com_Memset( &vk_devoShadow, 0, sizeof( vk_devoShadow ) );
 	vk_devoShadow.size = vk_devo_shadow_size();
 	const uint32_t size = vk_devoShadow.size;
+	// the cascades side by side on top, then enough rows of near-lamp tiles for
+	// DEVO_LAMP_SHADOW_MAX lights with all six cube sides each
+	vk_devoShadow.width = size * 2;
+	vk_devoShadow.lampTile = Q_min( vk_devo_lamp_tile_size(), vk_devoShadow.width );
+	vk_devoShadow.lampTilesPerRow = vk_devoShadow.width / vk_devoShadow.lampTile;
+	const uint32_t tiles = DEVO_LAMP_SHADOW_MAX * 6;
+	const uint32_t rows = ( tiles + vk_devoShadow.lampTilesPerRow - 1 ) / vk_devoShadow.lampTilesPerRow;
+	vk_devoShadow.height = size + rows * vk_devoShadow.lampTile;
 
 	// ---- the depth image ----
 	VkImageCreateInfo image;
@@ -107,8 +131,8 @@ void vk_devo_shadow_create( void )
 	image.sType			= VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
 	image.imageType		= VK_IMAGE_TYPE_2D;
 	image.format		= vk.depth_format;
-	image.extent.width	= size * 2;		// cascade 1 on the left, cascade 2 on the right
-	image.extent.height	= size;
+	image.extent.width	= vk_devoShadow.width;	// cascade 1 on the left, cascade 2 on the right
+	image.extent.height	= vk_devoShadow.height;	// and the near-lamp tiles below them
 	image.extent.depth	= 1;
 	image.mipLevels		= 1;
 	image.arrayLayers	= 1;
@@ -155,8 +179,8 @@ void vk_devo_shadow_create( void )
 	fb.renderPass		= vk_devoShadow.render_pass;
 	fb.attachmentCount	= 1;
 	fb.pAttachments		= &vk_devoShadow.attachment_view;
-	fb.width			= size * 2;
-	fb.height			= size;
+	fb.width			= vk_devoShadow.width;
+	fb.height			= vk_devoShadow.height;
 	fb.layers			= 1;
 	VK_CHECK( qvkCreateFramebuffer( vk.device, &fb, NULL, &vk_devoShadow.framebuffer ) );
 
@@ -198,7 +222,7 @@ void vk_devo_shadow_create( void )
 	vk_end_command_buffer( cmd, __func__ );
 
 	vk_devoShadow.active = qtrue;
-	ri.Printf( PRINT_DEVELOPER, "DevoGI: sun shadow map %ux%u\n", size, size );
+	ri.Printf( PRINT_DEVELOPER, "DevoGI: sun shadow map %ux%u, near-lamp tiles %u\n", size, size, vk_devoShadow.lampTile );
 }
 
 void vk_devo_shadow_destroy( void )
@@ -240,8 +264,8 @@ void vk_devo_shadow_write_descriptor( VkDescriptorSet set )
 void vk_devo_shadow_begin_pass( void )
 {
 	vk.renderPassIndex = RENDER_PASS_DEVO_SHADOW;
-	vk.renderWidth = vk_devoShadow.size * 2;
-	vk.renderHeight = vk_devoShadow.size;
+	vk.renderWidth = vk_devoShadow.width;
+	vk.renderHeight = vk_devoShadow.height;
 	vk.renderScaleX = vk.renderScaleY = 1.0f;
 
 	VkClearValue clear;
@@ -253,8 +277,8 @@ void vk_devo_shadow_begin_pass( void )
 	begin.sType						= VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
 	begin.renderPass				= vk_devoShadow.render_pass;
 	begin.framebuffer				= vk_devoShadow.framebuffer;
-	begin.renderArea.extent.width	= vk_devoShadow.size * 2;
-	begin.renderArea.extent.height	= vk_devoShadow.size;
+	begin.renderArea.extent.width	= vk_devoShadow.width;
+	begin.renderArea.extent.height	= vk_devoShadow.height;
 	begin.clearValueCount			= 1;
 	begin.pClearValues				= &clear;
 	qvkCmdBeginRenderPass( vk.cmd->command_buffer, &begin, VK_SUBPASS_CONTENTS_INLINE );

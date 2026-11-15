@@ -180,7 +180,8 @@ void vk_create_pipeline_layout( void )
     set_layouts[7] = vk.set_layout_sampler; // physicalMap
     set_layouts[8] = vk.set_layout_sampler; // prefiltered envmap
     set_layouts[9] = vk.set_layout_sampler; // deluxeMap
-    //set_layouts[10] = vk.set_layout_sampler; // irradiance envmap
+    set_layouts[10] = vk.set_layout_sampler; // DevoJK: DevoGI lamp shadow masks
+    //set_layouts[11] = vk.set_layout_sampler; // irradiance envmap
 
     desc.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     desc.pNext = NULL;
