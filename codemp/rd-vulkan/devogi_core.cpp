@@ -3904,15 +3904,21 @@ static uint64_t gi_bsp_hash( const byte *fileBase, const dheader_t *header ) {
 
 // Bump this when only the live bake (r_devoGI_live 1) changes: its files are baked
 // again, the full bake's stay valid. 2: coloured lamps are no longer baked in.
-#define DEVOGI_LIVE_REVISION	2
+// 3: not even their bounce light; the strong live sky only in the shade; softer masks.
+#define DEVOGI_LIVE_REVISION	3
 
 static uint64_t gi_settings_hash( int scale ) {
-	char buf[320];
+	char buf[512];
 	Com_sprintf( buf, sizeof( buf ), "aa%g sh%g v%d ex%g r%d b%d i%g s%g ls%g lo%d sb%g e%d ao%g aod%g aor%g sat%g x%d rl%d gl%g lh%llx", g_set.aa, g_set.sheen, DEVOGI_VERSION, g_set.exposure,
 		Com_Clampi( 8, 1024, g_set.rays ), Com_Clampi( 1, 16, g_set.bounces ) * 100 + Com_Clampi( 1, 32, g_set.liveBounces ),
 		g_set.intensity, g_set.sky, g_set.liveSky, g_set.liveOnly ? DEVOGI_LIVE_REVISION : 0, g_set.sunBounceBlur, g_set.entityLights,
 		g_set.ao, g_set.aoDirect, g_set.aoDistance, g_set.saturation, scale,
 		g_set.relight, g_set.glow, (unsigned long long)( g_set.relight ? gi_lightsHash : 0 ) );
+	// added later, so files baked without it (boost 1) keep their hash
+	if ( g_set.lampBoost != 1.0f ) {
+		const size_t len = strlen( buf );
+		Com_sprintf( buf + len, sizeof( buf ) - len, " lb%g", g_set.lampBoost );
+	}
 	return gi_fnv( 1469598103934665603ULL, buf, strlen( buf ) );
 }
 
@@ -4479,7 +4485,9 @@ static void gi_build_lamp_masks( const giBake &bake, dgLiveLighting &live ) {
 
 	// 3. how much of each lamp a pixel sees: rays to points spread over the lamp
 	live.lampMask.assign( npix * 4 * dgLiveLighting::maskLayers, 0 );
-	const int S = 8;		// 4 x 2 points over the rectangle (one for a point light)
+	// 4 x 4 points over the rectangle (one for a point light), each traced from a different
+	// texel of the mask pixel's block: soft, anti-aliased mask edges even right by a lamp
+	const int S = 16;
 	const size_t chunkPix = 65536;
 	std::vector<dgGpuRay> rays;
 	std::vector<dgGpuHit> hits;
@@ -4491,8 +4499,23 @@ static void gi_build_lamp_masks( const giBake &bake, dgLiveLighting &live ) {
 		for ( size_t q = a; q < b; q++ ) {
 			if ( rep[q] < 0 )
 				continue;
-			const giTexel &tx = bake.texels[rep[q]];
-			const gvec3 o = tx.pos + tx.faceNormal * 1.0f;
+			// the texels of this mask pixel's block (one when it has only one)
+			gvec3 origins[4];
+			int numOrigins = 0;
+			{
+				const size_t page = q / ( (size_t)bs * bs ), rest = q % ( (size_t)bs * bs );
+				const int y = (int)( rest / bs ), x = (int)( rest % bs );
+				for ( int dy = 0; dy < f && numOrigins < 4; dy++ ) {
+					for ( int dx = 0; dx < f && numOrigins < 4; dx++ ) {
+						const int o = bake.owner[( page * DEVOGI_LM_SIZE + y * f + dy ) * DEVOGI_LM_SIZE + x * f + dx];
+						if ( o >= 0 && !bake.texels[o].buried && bake.texels[o].styleValue == 0
+							&& bake.texels[o].surf == bake.texels[rep[q]].surf )
+							origins[numOrigins++] = bake.texels[o].pos + bake.texels[o].faceNormal * 1.0f;
+					}
+				}
+				if ( !numOrigins )
+					origins[numOrigins++] = bake.texels[rep[q]].pos + bake.texels[rep[q]].faceNormal * 1.0f;
+			}
 			bool written[dgLiveLighting::maskLayers * 4] = {};
 			for ( int k = 0; k < 4; k++ ) {
 				const int li = top[q * 4 + k];
@@ -4509,7 +4532,8 @@ static void gi_build_lamp_masks( const giBake &bake, dgLiveLighting &live ) {
 					gvec3 target = l.c;
 					if ( l.rect )
 						target += l.u * ( ( ( s % 4 ) + 0.5f ) / 4.0f * 2.0f - 1.0f ) * l.hu * 0.9f
-								+ l.v * ( ( ( s / 4 ) + 0.5f ) / 2.0f * 2.0f - 1.0f ) * l.hv * 0.9f;
+								+ l.v * ( ( ( s / 4 ) + 0.5f ) / 4.0f * 2.0f - 1.0f ) * l.hv * 0.9f;
+					const gvec3 &o = origins[( s + ( s / 4 ) ) % numOrigins];
 					gvec3 d = target - o;
 					const float len = sqrtf( gdot( d, d ) );
 					dgGpuRay r;
@@ -4810,6 +4834,14 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 	std::vector<float> groupScale;		// calibrated strength per light group
 	std::vector<gvec3> sunDirect;		// the sun's share of each texel's direct light (calibrated)
 	std::vector<gvec3> coloredDirect;	// the coloured lamps' share (high spec draws them live)
+	// lampBoost stretches the lamps' reach for this bake only; their own radius comes back after
+	struct radiusRestore_t {
+		std::vector<float> saved;
+		~radiusRestore_t() {
+			for ( size_t i = 0; i < saved.size() && i < gi_lights.size(); i++ )
+				gi_lights[i].radius = saved[i];
+		}
+	} radiusRestore;
 	if ( relight ) {
 		gi_build_light_grid( lightGrid );
 		const size_t n = bake.texels.size();
@@ -4822,6 +4854,26 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 
 		gi_progress_stage( "Matching lamp brightness", 0.05f, 0.07f );
 		gi_calibrate( bake, lightGrid, origLuma, groupScale );
+
+		/*
+		lampBoost: the lamps brighter than the original map, and reaching further. The
+		calibration above matched them to the original first; now every lamp group (not
+		the sun) is 'lampBoost' times stronger, and its reach grows by the square root -
+		as far as light that much stronger stays visible - so it isn't cut off early.
+		*/
+		const float lampBoost = Com_Clamp( 0.25f, 4.0f, g_set.lampBoost );
+		if ( lampBoost != 1.0f ) {
+			const float reachScale = sqrtf( lampBoost );
+			radiusRestore.saved.resize( gi_lights.size() );
+			for ( size_t i = 0; i < gi_lights.size(); i++ ) {
+				radiusRestore.saved[i] = gi_lights[i].radius;
+				gi_lights[i].radius *= reachScale;
+			}
+			gi_build_light_grid( lightGrid );
+			for ( size_t g = 0; g < groupScale.size(); g++ )
+				if ( (int)g != gi_sunGroup )
+					groupScale[g] *= lampBoost;
+		}
 
 		gi_progress_stage( "Direct light and soft shadows", 0.12f, 0.33f );
 		std::vector<gvec3> directLight( n );
@@ -5032,9 +5084,19 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 			gi_wide_soften( bake, texelPos, sunBounce, Com_Clamp( 16.0f, 512.0f, g_set.sunBounceBlur ), stride * 4 );
 		}
 
-		// 1. sky and lamps, without the sun
+		// 1. sky and lamps, without the sun - and without the coloured lamps, which high
+		// spec draws entirely live (none of their light, not even its bounce, is baked)
 		bake.direct = fullDirect;
 		addSun( -1.0f, false );
+		for ( size_t i = 0; i < bake.texels.size() && i < coloredDirect.size(); i++ ) {
+			const giTexel &tx = bake.texels[i];
+			if ( tx.styleValue != 0 )
+				continue;
+			float *px = &bake.direct[( ( (size_t)tx.page * DEVOGI_LM_SIZE + tx.y ) * DEVOGI_LM_SIZE + tx.x ) * 3];
+			px[0] = Q_max( 0.0f, px[0] - coloredDirect[i].x );
+			px[1] = Q_max( 0.0f, px[1] - coloredDirect[i].y );
+			px[2] = Q_max( 0.0f, px[2] - coloredDirect[i].z );
+		}
 		gi_sky.scale = fullSkyScale * Q_max( 0.0f, g_set.liveSky );
 		runChain( "Live bounce light", liveBounces, done, total );
 		gi_sky.scale = fullSkyScale;
@@ -5048,9 +5110,14 @@ bool DG_Bake( const char *mapName, const byte *fileBase, const dgSettings &setti
 		const float skyBack = 1.0f / Q_max( 1.0f, g_set.liveSky );
 		std::vector<float> liveLayer = bake.indirect;
 		for ( size_t i = 0; i < bake.texels.size(); i++ ) {
-			liveLayer[i * 4 + 0] += sunBounce[i].x;
-			liveLayer[i * 4 + 1] += sunBounce[i].y;
-			liveLayer[i * 4 + 2] += sunBounce[i].z;
+			// the strong live sky is there to light the shade: a surface open to the whole
+			// sky (a rooftop, the top of a tower) gets the normal sky instead, or it would
+			// come out flat and far too bright with the live sun on top
+			const float open = Com_Clamp( 0.0f, 1.0f, ( bake.indirect[i * 4 + 3] - 0.8f ) / 0.2f );
+			const float skyScale = 1.0f + ( skyBack - 1.0f ) * open * open * ( 3.0f - 2.0f * open );
+			liveLayer[i * 4 + 0] = liveLayer[i * 4 + 0] * skyScale + sunBounce[i].x;
+			liveLayer[i * 4 + 1] = liveLayer[i * 4 + 1] * skyScale + sunBounce[i].y;
+			liveLayer[i * 4 + 2] = liveLayer[i * 4 + 2] * skyScale + sunBounce[i].z;
 			bake.indirect[i * 4 + 0] = bake.indirect[i * 4 + 0] * skyBack + sunBounce[i].x;
 			bake.indirect[i * 4 + 1] = bake.indirect[i * 4 + 1] * skyBack + sunBounce[i].y;
 			bake.indirect[i * 4 + 2] = bake.indirect[i * 4 + 2] * skyBack + sunBounce[i].z;

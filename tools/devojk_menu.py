@@ -94,6 +94,7 @@ DEVOGI = [
     ("r_devoGI_rays", "Rays per sample * (rebake)", "list", [("32", 32), ("64", 64), ("128", 128), ("256", 256), ("512", 512)], "More is smoother bounce light, slower bake."),
     ("r_devoGI_bounces", "Bounces * (rebake)", "list", [("2", 2), ("4", 4), ("8", 8), ("16", 16)], "How often light bounces in low spec mode."),
     ("r_devoGI_liveBounces", "High spec bounces * (rebake)", "list", [("8", 8), ("16", 16), ("24", 24), ("32", 32)], "How often light bounces in high spec mode."),
+    ("r_devoGI_lampBoost", "Light source brightness * (rebake)", "slider", (1.5, 0.5, 4.0), "How much brighter than the original map lamps are. Their reach grows with it."),
     ("r_devoGI_aa", "Shadow smoothing * (rebake)", "slider", (2.0, 0.5, 4.0), "0.5 = crisp shadow edges, 2 = smooth, 4 = very soft."),
     ("r_devoGI_ao", "Ambient occlusion * (rebake)", "slider", (1.6, 0.0, 2.0), "How dark corners and crevices get."),
     ("r_devoGI_aoDistance", "AO reach * (rebake)", "list", [("64", 64), ("128", 128), ("256", 256), ("512", 512)], "How far corner darkening reaches, in game units."),

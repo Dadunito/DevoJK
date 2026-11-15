@@ -1136,11 +1136,29 @@
 		}
 		itemDef
 		{
+			name				dvj_r_devoGI_lampBoost
+			type				ITEM_TYPE_SLIDER
+			group				page_devogi
+			text				"Light source brightness * (rebake)"
+			rect				24 208 290 12
+			textalign			ITEM_ALIGN_RIGHT
+			textalignx			167
+			textaligny			-3
+			font				2
+			textscale			0.55
+			forecolor			1 .682 0 1
+			descText			"How much brighter than the original map lamps are. Their reach grows with it."
+			visible				0
+			cvarfloat			"r_devoGI_lampBoost" 1.5 0.5 4.0
+			action { play "sound/interface/button1.wav" }
+		}
+		itemDef
+		{
 			name				dvj_r_devoGI_aa
 			type				ITEM_TYPE_SLIDER
 			group				page_devogi
 			text				"Shadow smoothing * (rebake)"
-			rect				24 208 290 12
+			rect				24 221 290 12
 			textalign			ITEM_ALIGN_RIGHT
 			textalignx			167
 			textaligny			-3
@@ -1158,7 +1176,7 @@
 			type				ITEM_TYPE_SLIDER
 			group				page_devogi
 			text				"Ambient occlusion * (rebake)"
-			rect				24 221 290 12
+			rect				24 234 290 12
 			textalign			ITEM_ALIGN_RIGHT
 			textalignx			167
 			textaligny			-3
@@ -1176,7 +1194,7 @@
 			type				ITEM_TYPE_MULTI
 			group				page_devogi
 			text				"AO reach * (rebake)"
-			rect				24 234 290 12
+			rect				24 247 290 12
 			textalign			ITEM_ALIGN_RIGHT
 			textalignx			167
 			textaligny			-3
@@ -1195,7 +1213,7 @@
 			type				ITEM_TYPE_SLIDER
 			group				page_devogi
 			text				"Sky light * (rebake)"
-			rect				24 247 290 12
+			rect				24 260 290 12
 			textalign			ITEM_ALIGN_RIGHT
 			textalignx			167
 			textaligny			-3
@@ -1213,7 +1231,7 @@
 			type				ITEM_TYPE_SLIDER
 			group				page_devogi
 			text				"High spec sky light * (rebake)"
-			rect				24 260 290 12
+			rect				24 273 290 12
 			textalign			ITEM_ALIGN_RIGHT
 			textalignx			167
 			textaligny			-3
@@ -1231,7 +1249,7 @@
 			type				ITEM_TYPE_SLIDER
 			group				page_devogi
 			text				"Colour bleeding * (rebake)"
-			rect				24 273 290 12
+			rect				24 286 290 12
 			textalign			ITEM_ALIGN_RIGHT
 			textalignx			167
 			textaligny			-3
@@ -1249,7 +1267,7 @@
 			type				ITEM_TYPE_SLIDER
 			group				page_devogi
 			text				"Sheen * (rebake)"
-			rect				24 286 290 12
+			rect				24 299 290 12
 			textalign			ITEM_ALIGN_RIGHT
 			textalignx			167
 			textaligny			-3
@@ -1267,7 +1285,7 @@
 			type				ITEM_TYPE_SLIDER
 			group				page_devogi
 			text				"Bounce strength * (rebake)"
-			rect				24 299 290 12
+			rect				24 312 290 12
 			textalign			ITEM_ALIGN_RIGHT
 			textalignx			167
 			textaligny			-3

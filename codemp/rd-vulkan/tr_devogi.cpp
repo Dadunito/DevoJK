@@ -74,6 +74,7 @@ static cvar_t *r_devoGI_sunShadowSize;
 static cvar_t *r_devoGI_sunShadowRange;
 static cvar_t *r_devoGI_sunShadowRangeFar;
 static cvar_t *r_devoGI_lampShadows;
+static cvar_t *r_devoGI_lampBoost;
 static cvar_t *r_devoGI_prebake;
 static cvar_t *r_devoGI_prebakeSet;
 static cvar_t *r_devoGI_lampShadowSize;
@@ -105,6 +106,7 @@ void R_DevoGI_Register( void )
 	r_devoGI_sunShadowSize	= ri.Cvar_Get( "r_devoGI_sunShadowSize",	"2048",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI live lighting: sun shadow map resolution (1024, 2048 or 4096 - sharper but slower)" );
 	r_devoGI_sunShadowRange	= ri.Cvar_Get( "r_devoGI_sunShadowRange",	"768",	CVAR_ARCHIVE, "DevoGI live lighting: reach of the sharp sun shadow map around the player, in game units (256-2048; the coarser one takes over further away)" );
 	r_devoGI_sunShadowRangeFar = ri.Cvar_Get( "r_devoGI_sunShadowRangeFar", "4096", CVAR_ARCHIVE, "DevoGI live lighting: reach of the second, coarser sun shadow map, in game units (up to 8192; beyond it the baked shadows take over)" );
+	r_devoGI_lampBoost		= ri.Cvar_Get( "r_devoGI_lampBoost",	"1.5",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI: how much brighter than the original map the light sources are (1 = the same, 1.5 = half again, up to 4); their reach grows with it. Needs a rebake" );
 	r_devoGI_lampShadows	= ri.Cvar_Get( "r_devoGI_lampShadows",	"4",	CVAR_ARCHIVE, "DevoGI live lighting: how many light sources right by the player (the map's lights, sabers, blaster bolts) throw the shadows of moving things - players, weapons, doors (0 = none, up to 4)" );
 	r_devoGI_lampShadowSize	= ri.Cvar_Get( "r_devoGI_lampShadowSize",	"512",	CVAR_ARCHIVE | CVAR_LATCH, "DevoGI live lighting: resolution of each near-light shadow view (256, 512 or 1024)" );
 	r_devoGI_lampShadowRange = ri.Cvar_Get( "r_devoGI_lampShadowRange", "1024", CVAR_ARCHIVE, "DevoGI live lighting: lights closer to the camera than this (game units) may throw moving things' shadows" );
@@ -142,6 +144,7 @@ static dgSettings R_DevoGI_Settings( void )
 	s.gpu			= r_devoGI_gpu->integer;
 	s.liveBounces	= r_devoGI_liveBounces->integer;
 	s.liveSky		= r_devoGI_liveSky->value;
+	s.lampBoost		= r_devoGI_lampBoost->value;
 	s.liveOnly		= r_devoGI_live->integer ? 1 : 0;	// live lighting needs only the live layer
 	return s;
 }

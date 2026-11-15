@@ -33,6 +33,8 @@ struct dgSettings {
 	int		rays		= 128;		// rays per bounce-light sample
 	int		bounces		= 8;		// light bounces
 	int		liveBounces	= 24;		// light bounces of the bounce-only light used by live lighting (1-32)
+	float	lampBoost	= 1.5f;		// lamps this many times stronger than the original map, reaching
+								// further by its square root (the sun stays as it is)
 	float	liveSky		= 6.0f;		// sky light in the live layer, times 'sky': with no sun baked in,
 									// the sky all around is what lights the shade (like a skylight)
 	int		liveOnly	= 0;		// 1: bake only what live lighting (r_devoGI_live 1) uses - the live

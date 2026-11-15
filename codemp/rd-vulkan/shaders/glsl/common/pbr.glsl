@@ -101,8 +101,10 @@
 			float type = mod( light.origin.w, 10.0 );
 			if ( type < 1.5 || ( type > 3.5 && type < 4.5 ) ) {
 				cosE = -dot( light.normal.xyz, L );
-				if ( cosE <= 0.0 )
-					return 0.0;		// behind the glowing surface
+				// behind the glowing surface - or on it: a lamp must not light its own face,
+				// where the angle is a hair either side of flat and the light flickered
+				if ( cosE * sqrt( sqrLightDist ) < 1.5 )
+					return 0.0;
 			}
 			float fade = 1.0 - ( sqrLightDist * sqrLightDist ) / ( radiusSqr * radiusSqr );
 			return cosE * fade * fade / ( sqrLightDist + light.normal.w );

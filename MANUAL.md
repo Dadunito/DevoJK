@@ -68,6 +68,7 @@ These are the defaults, and what DevoJK was tuned with.
 |---|---|---|
 | Performance mode | Low spec on older PCs, High spec on a decent graphics card | |
 | Lightmap detail | 12x | Use 4x on a PC with less than 16 GB of RAM |
+| Light source brightness | 1.5 | 1 matches the original map; higher makes indoor light brighter and reach further |
 | Bounces | 16 (low spec), 24 (high spec) | |
 | Rays per sample | 128 | |
 | Shadow smoothing | 2 | |
@@ -98,6 +99,7 @@ For the console or an autoexec.
 | `r_devoGI_prebakeSet` | 0 | 0 current mode, 1 high spec too, 2 low spec too, 3 both |
 | `r_devoGI_scale` | 12 | Lightmap detail, 1 to 16 |
 | `r_devoGI_rays` | 128 | Rays per bounce-light sample |
+| `r_devoGI_lampBoost` | 1.5 | Light sources this much brighter than the original map, reaching further too |
 | `r_devoGI_bounces` | 16 | Light bounces, low spec |
 | `r_devoGI_liveBounces` | 24 | Light bounces, high spec |
 | `r_devoGI_aa` | 2 | Shadow smoothing, 0.5 to 4 |
